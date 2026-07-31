@@ -1,4 +1,5 @@
 import pytest
+import sqlalchemy as sa
 
 from sontrader.config import Settings
 
@@ -20,3 +21,13 @@ def settings(tmp_path):
         paper=True,
         token_cache=tmp_path / "token.json",
     )
+
+
+@pytest.fixture
+def db_engine():
+    """SQLite in-memory engine with FK enforcement on, mirroring PostgreSQL."""
+    engine = sa.create_engine("sqlite+pysqlite:///:memory:")
+    sa.event.listen(
+        engine, "connect", lambda dbapi_conn, _: dbapi_conn.execute("PRAGMA foreign_keys=ON")
+    )
+    return engine

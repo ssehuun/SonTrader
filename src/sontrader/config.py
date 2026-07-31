@@ -32,6 +32,16 @@ class Settings:
         return PAPER_BASE_URL if self.paper else REAL_BASE_URL
 
 
+def load_database_url() -> str | None:
+    """PostgreSQL URL for trading state, independent of KIS credentials.
+
+    Kept separate from ``load_settings`` so DB-only commands (e.g. migrate)
+    don't demand KIS keys, and KIS-only commands don't demand a database.
+    """
+    load_dotenv()
+    return os.environ.get("DATABASE_URL") or None
+
+
 def load_settings() -> Settings:
     load_dotenv()
     try:

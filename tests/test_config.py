@@ -1,10 +1,12 @@
 import pytest
 
-from sontrader.config import PAPER_BASE_URL, REAL_BASE_URL, load_settings
+from sontrader.config import PAPER_BASE_URL, REAL_BASE_URL, load_database_url, load_settings
 
 
 @pytest.fixture
 def env(monkeypatch, tmp_path):
+    # 개발 머신의 실제 .env가 테스트에 새어 들어오지 않도록 dotenv를 무력화한다.
+    monkeypatch.setattr("sontrader.config.load_dotenv", lambda: None)
     monkeypatch.setenv("KIS_APP_KEY", "key")
     monkeypatch.setenv("KIS_APP_SECRET", "secret")
     monkeypatch.setenv("KIS_ACCOUNT_NO", "12345678-01")
@@ -42,3 +44,13 @@ def test_malformed_account_number_raises(env):
     env.setenv("KIS_ACCOUNT_NO", "1234-5")
     with pytest.raises(RuntimeError, match="KIS_ACCOUNT_NO"):
         load_settings()
+
+
+def test_database_url_defaults_to_none(env):
+    env.delenv("DATABASE_URL", raising=False)
+    assert load_database_url() is None
+
+
+def test_database_url_is_read_from_env(env):
+    env.setenv("DATABASE_URL", "postgresql+psycopg2://u:p@localhost:5432/trading")
+    assert load_database_url() == "postgresql+psycopg2://u:p@localhost:5432/trading"

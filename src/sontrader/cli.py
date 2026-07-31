@@ -6,7 +6,39 @@ import argparse
 import sys
 
 from sontrader.client import KisClient, KisError
-from sontrader.config import load_settings
+from sontrader.config import load_database_url, load_settings
+
+
+def _run_migrate() -> int:
+    # KIS-only commands must not pay for (or depend on) SQLAlchemy, so the
+    # DB stack is imported only when the migrate command actually runs.
+    from sqlalchemy.exc import ArgumentError, SQLAlchemyError
+
+    from sontrader.data.db import get_engine, migrate
+
+    database_url = load_database_url()
+    if not database_url:
+        print("error: DATABASE_URL is not set. See env.example.", file=sys.stderr)
+        return 2
+    try:
+        engine = get_engine(database_url)
+    except ArgumentError:
+        # Never echo the URL back: it can embed the database password.
+        print("error: DATABASE_URL is not a valid SQLAlchemy URL.", file=sys.stderr)
+        return 2
+    try:
+        actions = migrate(engine)
+    except SQLAlchemyError as exc:
+        detail = str(exc).split("\n", 1)[0]
+        print(f"error: migration failed: {type(exc).__name__}: {detail}", file=sys.stderr)
+        return 1
+    finally:
+        engine.dispose()
+    for action in actions:
+        print(action)
+    if not actions:
+        print("schema up to date — nothing to do")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -20,6 +52,8 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("balance", help="계좌 잔고 조회")
 
+    sub.add_parser("migrate", help="DB 스키마 생성/확장 (매매 상태 테이블 + 수정주가 컬럼)")
+
     for side, korean in (("buy", "매수"), ("sell", "매도")):
         order = sub.add_parser(side, help=f"{korean} 주문")
         order.add_argument("code", help="6-digit ticker")
@@ -29,6 +63,10 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     args = parser.parse_args(argv)
+
+    if args.command == "migrate":
+        return _run_migrate()
+
     try:
         settings = load_settings()
     except RuntimeError as exc:
