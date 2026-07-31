@@ -48,6 +48,28 @@ def test_migrate_without_legacy_tables_skips_alter(db_engine):
     assert all("stock_candles_1d" not in a for a in actions)
 
 
+def test_migrate_syncs_columns_and_indexes_of_existing_tables(db_engine):
+    # norm_key 이전 버전 스키마를 흉내: 컬럼도 인덱스도 없는 events 테이블.
+    with db_engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                "CREATE TABLE events ("
+                "event_id VARCHAR(32) PRIMARY KEY, "
+                "symbol VARCHAR(20), corp_code VARCHAR(20), event_type VARCHAR(50), "
+                "title TEXT, published_at TIMESTAMP NOT NULL, "
+                "ingested_at TIMESTAMP NOT NULL, raw_json JSON)"
+            )
+        )
+
+    actions = db.migrate(db_engine)
+
+    assert "added column events.norm_key" in actions
+    assert "created index ix_events_norm_key" in actions
+    index_names = {ix["name"] for ix in sa.inspect(db_engine).get_indexes("events")}
+    assert {"ix_events_norm_key", "ix_events_symbol", "ix_events_ingested_at"} <= index_names
+    assert db.migrate(db_engine) == []
+
+
 def test_migrate_adds_missing_columns_to_owned_tables(db_engine):
     # 과거 버전 스키마(컬럼 하나 부족)를 흉내 내면, migrate가 그 컬럼을 채워야 한다.
     # 테이블이 이미 존재한다는 이유로 조용히 건너뛰면 스키마 드리프트가 된다.

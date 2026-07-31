@@ -17,6 +17,7 @@ uv run ruff check .                            # lint
 uv run ruff format .                           # format
 uv run sontrader quote 005930                  # CLI (needs .env with KIS credentials)
 uv run sontrader migrate                       # create/extend trading-state DB schema (needs DATABASE_URL)
+uv run sontrader collect-dart                  # ingest today's DART disclosures (needs DART_API_KEY too)
 ```
 
 ## Architecture
@@ -39,6 +40,10 @@ Three layers, each in one module under `src/sontrader/`:
   llm_judgments, orders, fills, positions, approvals) in the PostgreSQL DB shared with the
   legacy kis_trading collectors (`DATABASE_URL`). Also adds adjusted-price columns to the
   legacy `stock_candles_1d`. Schema tests run on SQLite in-memory — no DB server needed.
+- `data/dart.py` — OpenDART 공시 수집기: `DartClient.list_disclosures()` (list.json, paginated,
+  유가/코스닥 only) + `ingest()` (append-only into `events`, idempotent via ON CONFLICT,
+  dual timestamps published_at/ingested_at, `norm_key` strips 정정 prefixes). CLI:
+  `sontrader collect-dart [--date YYYYMMDD] [--interval N]`.
 
 KIS API responses put data in `output` / `output1` / `output2` keys with all values as strings
 (e.g. prices come back as `"71000"`).

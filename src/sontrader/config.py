@@ -32,14 +32,22 @@ class Settings:
         return PAPER_BASE_URL if self.paper else REAL_BASE_URL
 
 
-def load_database_url() -> str | None:
-    """PostgreSQL URL for trading state, independent of KIS credentials.
-
-    Kept separate from ``load_settings`` so DB-only commands (e.g. migrate)
-    don't demand KIS keys, and KIS-only commands don't demand a database.
-    """
+def _optional_env(name: str) -> str | None:
+    """Optional setting, kept separate from ``load_settings`` so commands
+    only demand the credentials they actually use (DB-only commands don't
+    need KIS keys and vice versa)."""
     load_dotenv()
-    return os.environ.get("DATABASE_URL") or None
+    return os.environ.get(name) or None
+
+
+def load_dart_api_key() -> str | None:
+    """OpenDART API key (https://opendart.fss.or.kr)."""
+    return _optional_env("DART_API_KEY")
+
+
+def load_database_url() -> str | None:
+    """PostgreSQL URL for trading state."""
+    return _optional_env("DATABASE_URL")
 
 
 def load_settings() -> Settings:

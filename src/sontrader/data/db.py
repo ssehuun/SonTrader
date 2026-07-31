@@ -51,6 +51,12 @@ events = Table(
     Column("symbol", String(20), index=True, comment="종목코드 (비상장 관계사 공시 등은 NULL)"),
     Column("corp_code", String(20), comment="DART 고유번호"),
     Column("event_type", String(50), comment="공시 유형 (실적/유상증자/... 정규화된 분류)"),
+    Column(
+        "norm_key",
+        String(200),
+        index=True,
+        comment="정정 접두어를 제거한 정규화 키 — 동일 이벤트 재진입 차단용",
+    ),
     Column("title", Text),
     Column("published_at", DateTime, nullable=False, comment="공시 게시 시각 (KST)"),
     Column(
@@ -173,6 +179,13 @@ def migrate(engine: Engine) -> list[str]:
                 if col.name not in existing_cols:
                     ddl_type = col.type.compile(engine.dialect)
                     actions.append(_add_column(conn, table.name, col.name, ddl_type))
+            # 인덱스도 동기화한다 — 컬럼만 추가하면 신규 DB(인덱스 포함 생성)와
+            # 기존 DB(컬럼만 추가됨)의 스키마가 갈라진다.
+            existing_idx = {ix["name"] for ix in inspector.get_indexes(table.name)}
+            for index in table.indexes:
+                if index.name not in existing_idx:
+                    index.create(conn)
+                    actions.append(f"created index {index.name}")
 
         if CANDLES_1D_TABLE in before:
             existing_cols = {c["name"] for c in inspector.get_columns(CANDLES_1D_TABLE)}
