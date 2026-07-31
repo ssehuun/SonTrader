@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import quote_plus
 
 from dotenv import load_dotenv
 
@@ -46,8 +47,25 @@ def load_dart_api_key() -> str | None:
 
 
 def load_database_url() -> str | None:
-    """PostgreSQL URL for trading state."""
-    return _optional_env("DATABASE_URL")
+    """PostgreSQL URL for trading state.
+
+    DATABASE_URL wins when set. Otherwise the URL is composed from the same
+    POSTGRES_* variables the kis_trading collectors use, with the credentials
+    URL-escaped — so passwords may contain @, :, / etc. without hand-encoding.
+    """
+    url = _optional_env("DATABASE_URL")
+    if url:
+        return url
+    parts = {
+        name: _optional_env(f"POSTGRES_{name}")
+        for name in ("USER", "PASSWORD", "HOST", "PORT", "DB")
+    }
+    if not all(parts.values()):
+        return None
+    return (
+        f"postgresql+psycopg2://{quote_plus(parts['USER'])}:{quote_plus(parts['PASSWORD'])}"
+        f"@{parts['HOST']}:{parts['PORT']}/{parts['DB']}"
+    )
 
 
 def load_settings() -> Settings:

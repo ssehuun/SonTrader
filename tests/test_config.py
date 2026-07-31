@@ -48,9 +48,34 @@ def test_malformed_account_number_raises(env):
 
 def test_database_url_defaults_to_none(env):
     env.delenv("DATABASE_URL", raising=False)
+    for name in ("USER", "PASSWORD", "HOST", "PORT", "DB"):
+        env.delenv(f"POSTGRES_{name}", raising=False)
     assert load_database_url() is None
 
 
 def test_database_url_is_read_from_env(env):
     env.setenv("DATABASE_URL", "postgresql+psycopg2://u:p@localhost:5432/trading")
     assert load_database_url() == "postgresql+psycopg2://u:p@localhost:5432/trading"
+
+
+def test_database_url_composed_from_postgres_vars_escapes_credentials(env):
+    env.delenv("DATABASE_URL", raising=False)
+    env.setenv("POSTGRES_USER", "trader")
+    env.setenv("POSTGRES_PASSWORD", "p@ss:w/rd")  # 특수문자가 그대로 들어가면 URL이 깨진다
+    env.setenv("POSTGRES_HOST", "localhost")
+    env.setenv("POSTGRES_PORT", "5432")
+    env.setenv("POSTGRES_DB", "kis_trading")
+
+    assert (
+        load_database_url()
+        == "postgresql+psycopg2://trader:p%40ss%3Aw%2Frd@localhost:5432/kis_trading"
+    )
+
+
+def test_partial_postgres_vars_yield_none(env):
+    env.delenv("DATABASE_URL", raising=False)
+    for name in ("USER", "PASSWORD", "HOST", "PORT", "DB"):
+        env.delenv(f"POSTGRES_{name}", raising=False)
+    env.setenv("POSTGRES_USER", "trader")
+
+    assert load_database_url() is None
