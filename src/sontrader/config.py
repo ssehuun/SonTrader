@@ -87,7 +87,9 @@ def load_settings() -> Settings:
         )
 
     paper = os.environ.get("KIS_PAPER", "true").strip().lower() not in ("false", "0", "no")
-    token_cache = Path(os.environ.get("SONTRADER_TOKEN_CACHE", DEFAULT_TOKEN_CACHE))
+    # expanduser: .env의 "~/..."가 확장되지 않으면 리포지토리 안에 "~" 디렉토리가
+    # 생겨 토큰이 저장소에 커밋될 뻔한 사고가 실제로 있었다.
+    token_cache = Path(os.environ.get("SONTRADER_TOKEN_CACHE", DEFAULT_TOKEN_CACHE)).expanduser()
     return Settings(
         app_key=app_key,
         app_secret=app_secret,

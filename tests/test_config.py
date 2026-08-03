@@ -46,6 +46,14 @@ def test_malformed_account_number_raises(env):
         load_settings()
 
 
+def test_token_cache_tilde_is_expanded(env):
+    # "~"가 그대로 남으면 리포지토리 안에 '~' 디렉토리가 생겨 토큰이 저장소에 노출된다.
+    env.setenv("SONTRADER_TOKEN_CACHE", "~/danger/token.json")
+    settings = load_settings()
+    assert "~" not in str(settings.token_cache)
+    assert str(settings.token_cache).startswith("/")
+
+
 def test_database_url_defaults_to_none(env):
     env.delenv("DATABASE_URL", raising=False)
     for name in ("USER", "PASSWORD", "HOST", "PORT", "DB"):

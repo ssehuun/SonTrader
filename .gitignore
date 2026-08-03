@@ -13,3 +13,6 @@ build/
 .pytest_cache/
 .ruff_cache/
 uv.lock.orig
+
+# Never track a stray "~" dir (unexpanded tilde artifacts)
+/~/
