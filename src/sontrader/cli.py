@@ -13,6 +13,20 @@ def _first_line(exc: Exception) -> str:
     return f"{type(exc).__name__}: {str(exc).split(chr(10), 1)[0]}"
 
 
+def _now_kst():
+    # 저장 시각은 naive KST 통일 (스키마 규약).
+    from datetime import datetime, timedelta, timezone
+
+    return datetime.now(timezone(timedelta(hours=9))).replace(tzinfo=None)
+
+
+def _parse_date_arg(date_str: str):
+    """--date 값(YYYYMMDD) → date. 형식이 틀리면 ValueError."""
+    from datetime import datetime
+
+    return datetime.strptime(date_str, "%Y%m%d").date()
+
+
 def _open_engine():
     """Load DATABASE_URL and build an engine; print + return None on failure.
 
@@ -61,7 +75,6 @@ def _run_migrate() -> int:
 def _run_collect_dart(date_str: str | None, interval: int | None) -> int:
     # DB/DART-only command: no KIS credentials, lazy heavy imports (see _run_migrate).
     import time as time_module
-    from datetime import datetime, timedelta, timezone
 
     import httpx
     from sqlalchemy.exc import SQLAlchemyError
@@ -77,7 +90,7 @@ def _run_collect_dart(date_str: str | None, interval: int | None) -> int:
     fixed_day = None
     if date_str:
         try:
-            fixed_day = datetime.strptime(date_str, "%Y%m%d").date()
+            fixed_day = _parse_date_arg(date_str)
         except ValueError:
             print(f"error: --date must be YYYYMMDD, got {date_str!r}", file=sys.stderr)
             return 2
@@ -85,11 +98,7 @@ def _run_collect_dart(date_str: str | None, interval: int | None) -> int:
         print("error: --interval must be >= 1 (seconds).", file=sys.stderr)
         return 2
 
-    kst = timezone(timedelta(hours=9))
-
-    def now_kst() -> datetime:
-        # 저장 시각은 naive KST 통일 (스키마 규약).
-        return datetime.now(kst).replace(tzinfo=None)
+    now_kst = _now_kst
 
     engine = _open_engine()
     if engine is None:
@@ -136,6 +145,150 @@ def _run_collect_dart(date_str: str | None, interval: int | None) -> int:
         engine.dispose()
 
 
+def _run_collect_master() -> int:
+    import httpx
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from sontrader.data.db import migrate
+    from sontrader.data.master import MASTER_URLS, fetch_master, upsert_master
+
+    engine = _open_engine()
+    if engine is None:
+        return 2
+    try:
+        for action in migrate(engine):
+            print(action)
+        now = _now_kst()
+        for market in MASTER_URLS:
+            rows = fetch_master(market)
+            count, removed = upsert_master(engine, rows, updated_at=now)
+            note = f", 상장폐지 정리 {removed}종목" if removed else ""
+            print(f"{market}: {count}종목 갱신{note}")
+        return 0
+    except httpx.HTTPError as exc:
+        print(f"error: master download failed: {exc}", file=sys.stderr)
+        return 1
+    except SQLAlchemyError as exc:
+        print(f"error: DB write failed: {_first_line(exc)}", file=sys.stderr)
+        return 1
+    finally:
+        engine.dispose()
+
+
+def _run_collect_prices(limit: int | None, pace: float | None, lookback_days: int) -> int:
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from sontrader.data.db import migrate
+    from sontrader.data.master import load_stock_symbols
+    from sontrader.data.prices import collect_daily_all
+
+    try:
+        settings = load_settings()
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    engine = _open_engine()
+    if engine is None:
+        return 2
+    try:
+        for action in migrate(engine):
+            print(action)
+        symbols = load_stock_symbols(engine)
+        if not symbols:
+            print(
+                "error: symbol_master is empty — run `sontrader collect-master` first.",
+                file=sys.stderr,
+            )
+            return 2
+        if limit is not None:
+            symbols = symbols[:limit]
+        # 유량 한도: 모의 초당 2건 / 실전 초당 20건 — 기본 간격을 여유 있게 잡는다.
+        pace_seconds = pace if pace is not None else (0.5 if settings.paper else 0.06)
+
+        def on_progress(index: int, total: int) -> None:
+            if index % 100 == 0 or index == total:
+                print(f"  {index}/{total}", flush=True)
+
+        with KisClient(settings) as client:
+            results, failures = collect_daily_all(
+                engine,
+                client,
+                symbols,
+                today=_now_kst().date(),
+                lookback_days=lookback_days,
+                pace_seconds=pace_seconds,
+                on_progress=on_progress,
+            )
+        full_count = sum(1 for r in results if r.full)
+        print(f"수집 완료: {len(results)}종목 (전체수집 {full_count}, 실패 {len(failures)})")
+        for symbol, exc in failures[:5]:
+            print(f"  실패 {symbol}: {_first_line(exc)}", file=sys.stderr)
+        return 1 if failures else 0
+    except SQLAlchemyError as exc:
+        print(f"error: DB access failed: {_first_line(exc)}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("중단됨 — 지금까지 수집분은 저장되어 있고, 재실행하면 이어서 수집합니다.")
+        return 0
+    finally:
+        engine.dispose()
+
+
+def _run_build_universe(
+    date_str: str | None, min_trade_value: int, lookback: int, skip: int
+) -> int:
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from sontrader.data.db import migrate
+    from sontrader.data.universe import UniverseError, build_snapshot
+
+    as_of = None
+    if date_str:
+        try:
+            as_of = _parse_date_arg(date_str)
+        except ValueError:
+            print(f"error: --date must be YYYYMMDD, got {date_str!r}", file=sys.stderr)
+            return 2
+    if lookback < 2 or skip < 0 or skip >= lookback:
+        print(
+            f"error: require 0 <= --skip < --lookback (got skip={skip}, lookback={lookback}).",
+            file=sys.stderr,
+        )
+        return 2
+    engine = _open_engine()
+    if engine is None:
+        return 2
+    try:
+        for action in migrate(engine):
+            print(action)
+        result = build_snapshot(
+            engine,
+            as_of=as_of or _now_kst().date(),
+            lookback=lookback,
+            skip=skip,
+            min_avg_trade_value=min_trade_value,
+        )
+        if result.as_of != result.requested:
+            gap = (result.requested - result.as_of).days
+            note = " — 수집이 밀렸는지 확인 필요" if gap > 3 else ""
+            print(f"주의: 최신 일봉 기준으로 스냅샷을 {result.as_of}에 기록 ({gap}일 이전){note}")
+        print(
+            f"{result.as_of}: 후보 {result.candidates}종목 → 점수 산출 {result.scored}종목"
+            f" → 워치리스트 {len(result.entries)}종목"
+        )
+        for entry in result.entries[:10]:
+            print(f"  {entry.rank:>3}. {entry.symbol}  {entry.score:+.2%}")
+        return 0
+    except UniverseError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except SQLAlchemyError as exc:
+        print(f"error: DB access failed: {_first_line(exc)}", file=sys.stderr)
+        return 1
+    finally:
+        engine.dispose()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="sontrader", description="Korean stock trading via the KIS open API"
@@ -155,6 +308,30 @@ def main(argv: list[str] | None = None) -> int:
         "--interval", type=int, default=None, help="초 단위 폴링 루프; 생략하면 1회 실행"
     )
 
+    sub.add_parser("collect-master", help="KOSPI/KOSDAQ 종목 마스터 수집 → symbol_master")
+
+    prices = sub.add_parser("collect-prices", help="일봉 수집 (수정주가, 증분+자가치유)")
+    prices.add_argument("--limit", type=int, default=None, help="상위 N종목만 (테스트용)")
+    prices.add_argument(
+        "--pace", type=float, default=None, help="API 호출 간격 초 (기본: 모의 0.5)"
+    )
+    prices.add_argument(
+        "--lookback-days", type=int, default=420, help="최초 수집 시 소급 일수 (달력일)"
+    )
+
+    universe = sub.add_parser(
+        "build-universe", help="모멘텀 워치리스트 산출 + 일별 스냅샷 저장 (히스테리시스 50/70)"
+    )
+    universe.add_argument("--date", help="기준일 YYYYMMDD (기본: 오늘)")
+    universe.add_argument(
+        "--min-trade-value",
+        type=int,
+        default=1_000_000_000,
+        help="최근 20거래일 평균 거래대금 하한 (KRW, 기본 10억)",
+    )
+    universe.add_argument("--lookback", type=int, default=252, help="모멘텀 룩백 (거래일)")
+    universe.add_argument("--skip", type=int, default=21, help="모멘텀 스킵 (거래일)")
+
     for side, korean in (("buy", "매수"), ("sell", "매도")):
         order = sub.add_parser(side, help=f"{korean} 주문")
         order.add_argument("code", help="6-digit ticker")
@@ -169,6 +346,12 @@ def main(argv: list[str] | None = None) -> int:
         return _run_migrate()
     if args.command == "collect-dart":
         return _run_collect_dart(args.date, args.interval)
+    if args.command == "collect-master":
+        return _run_collect_master()
+    if args.command == "collect-prices":
+        return _run_collect_prices(args.limit, args.pace, args.lookback_days)
+    if args.command == "build-universe":
+        return _run_build_universe(args.date, args.min_trade_value, args.lookback, args.skip)
 
     try:
         settings = load_settings()

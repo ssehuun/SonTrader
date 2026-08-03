@@ -1,9 +1,11 @@
 """Trading-state schema and migration (구현 계획 1단계).
 
-The system state lives in PostgreSQL, shared with the legacy kis_trading
-collectors. This module owns the new tables from the implementation plan
-(02-코드-구조.md §4) and applies additive adjusted-price columns to the
-legacy ``stock_candles_1d`` table (0단계 검증에서 확인된 수정주가 결손 대응).
+The system state lives in PostgreSQL (dedicated ``sontrader-db``; a legacy
+kis_trading database also works — tables converge via additive sync). This
+module owns the trading-state tables from the implementation plan
+(02-코드-구조.md §4) plus the market-data tables the universe builder needs
+(``symbol_master``, ``stock_candles_1d`` — 수정주가 컬럼 포함, 0단계 검증에서
+확인된 수정주가 결손 대응).
 
 Schema principles from the plan:
 
@@ -25,7 +27,9 @@ from __future__ import annotations
 
 import sqlalchemy as sa
 from sqlalchemy import (
+    BigInteger,
     Column,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -134,19 +138,107 @@ approvals = Table(
     Column("expires_at", DateTime, nullable=False, comment="TTL — 만료 시 폐기"),
 )
 
-# 레거시 일봉 테이블(kis_trading 소유)에 추가할 수정주가 관련 컬럼.
-# 값 채우기는 2~3단계(수집기 보완)에서 한다; 여기서는 자리만 만든다.
-CANDLES_1D_TABLE = "stock_candles_1d"
-_CANDLES_1D_NEW_COLUMNS: dict[str, str] = {
-    "flng_cls_code": "VARCHAR(2)",  # 락 구분 코드 (KIS flng_cls_code)
-    "prtt_rate": "DOUBLE PRECISION",  # 분할 비율 (KIS prtt_rate)
-    "mod_yn": "VARCHAR(1)",  # 변경 여부 (KIS mod_yn)
-    "adj_factor": "DOUBLE PRECISION",  # 누적 수정계수 (자체 산출)
-}
+# KOSPI/KOSDAQ 종목 마스터 (.mst 파일에서 적재). 플래그는 원본 문자
+# ('Y'/'N' 등)를 그대로 보존한다 — 해석은 유니버스 필터(core)의 몫.
+symbol_master = Table(
+    "symbol_master",
+    metadata,
+    Column("symbol", String(20), primary_key=True),
+    Column("name", String(100), nullable=False),
+    Column("market", String(10), nullable=False, comment="KOSPI | KOSDAQ"),
+    Column("group_code", String(2), comment="증권그룹 코드 (ST=주권)"),
+    Column("cap_scale_code", String(1), comment="시가총액 규모 코드 ('0'=미분류)"),
+    Column("low_liquidity_yn", String(1), comment="저유동성종목 여부"),
+    Column("spac_yn", String(1), comment="SPAC(기업인수목적회사) 여부"),
+    Column("pref_share_code", String(1), comment="우선주 구분 코드 ('0'=보통주)"),
+    Column("base_price", Integer, comment="기준가"),
+    Column("suspended_yn", String(1), comment="거래정지 여부"),
+    Column("liquidation_yn", String(1), comment="정리매매 여부"),
+    Column("managed_yn", String(1), comment="관리종목 여부"),
+    Column("market_warning_code", String(2), comment="시장경고 코드 (''/'0'/'00'=정상)"),
+    Column("unfaithful_yn", String(1), comment="불성실공시 여부"),
+    Column("prev_volume", BigInteger, comment="전일 거래량"),
+    Column("op_profit", BigInteger, comment="영업이익 (원본 단위 그대로)"),
+    Column("market_cap", BigInteger, comment="시가총액 (억)"),
+    Column("updated_at", DateTime, nullable=False),
+)
+
+# 워치리스트 일별 스냅샷 — append-only point-in-time 기록 (설계 2.3절).
+# 백테스트는 "그날의 워치리스트"를 이 테이블에서 읽는다 (재계산 금지).
+watchlist_snapshots = Table(
+    "watchlist_snapshots",
+    metadata,
+    Column("date", Date, primary_key=True),
+    Column("symbol", String(20), primary_key=True),
+    Column("score", Float, nullable=False, comment="모멘텀 점수"),
+    Column("rank", Integer, nullable=False, comment="전체 후보 중 순위 (1이 최고)"),
+)
+
+# 일봉. 수정주가로 수집한다 (0단계에서 확인한 레거시 수집기의 원주가 문제 대응).
+# 기업행위 발생 시 과거분이 소급 수정되므로 수집기가 겹침 구간을 대조해
+# 불일치 시 전체 재수집한다 (data/prices.py). 레거시 kis_trading DB를 쓰는
+# 경우에도 아래 정의 기준으로 컬럼이 additive 동기화된다.
+stock_candles_1d = Table(
+    "stock_candles_1d",
+    metadata,
+    Column("symbol", String(20), primary_key=True),
+    Column("date", Date, primary_key=True),
+    Column("open", Integer),
+    Column("high", Integer),
+    Column("low", Integer),
+    Column("close", Integer),
+    Column("volume", BigInteger),
+    Column("trade_value", BigInteger, comment="누적 거래대금"),
+    # 레거시 kis_trading 수집기와 같은 DB를 쓸 때 그쪽 INSERT가 깨지지 않도록
+    # 레거시 컬럼도 정의해 둔다 (우리는 쓰지 않음).
+    Column("prdy_vrss", Integer, comment="전일 대비 (레거시 호환)"),
+    Column("prdy_ctrt", Float, comment="전일 대비율 (레거시 호환)"),
+    Column("flng_cls_code", String(2), comment="락 구분 코드"),
+    Column("prtt_rate", Float, comment="분할 비율"),
+    Column("mod_yn", String(1), comment="변경 여부"),
+    Column("adj_factor", Float, comment="누적 수정계수 — 수정주가 수집이라 현재 미사용(NULL)"),
+)
 
 
 def get_engine(database_url: str) -> Engine:
     return sa.create_engine(database_url, pool_pre_ping=True)
+
+
+def upsert_rows(
+    conn: Connection,
+    table: Table,
+    rows: list[dict],
+    *,
+    key_cols: tuple[str, ...],
+    ignore_conflicts: bool = False,
+) -> None:
+    """Dialect-aware chunked upsert, shared by all collectors.
+
+    Chunk size is derived from the column count so a statement never exceeds
+    SQLite's ~999 bind-parameter limit. ``ignore_conflicts=True`` keeps
+    existing rows (ON CONFLICT DO NOTHING — append-only ingestion);
+    otherwise conflicting rows are updated in place.
+    """
+    if not rows:
+        return
+    if conn.dialect.name == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert
+    else:
+        from sqlalchemy.dialects.sqlite import insert
+
+    chunk_size = max(1, 900 // len(table.columns))
+    for start in range(0, len(rows), chunk_size):
+        stmt = insert(table).values(rows[start : start + chunk_size])
+        if ignore_conflicts:
+            stmt = stmt.on_conflict_do_nothing(index_elements=list(key_cols))
+        else:
+            update_cols = {
+                c.name: getattr(stmt.excluded, c.name)
+                for c in table.columns
+                if c.name not in key_cols
+            }
+            stmt = stmt.on_conflict_do_update(index_elements=list(key_cols), set_=update_cols)
+        conn.execute(stmt)
 
 
 def migrate(engine: Engine) -> list[str]:
@@ -186,12 +278,6 @@ def migrate(engine: Engine) -> list[str]:
                 if index.name not in existing_idx:
                     index.create(conn)
                     actions.append(f"created index {index.name}")
-
-        if CANDLES_1D_TABLE in before:
-            existing_cols = {c["name"] for c in inspector.get_columns(CANDLES_1D_TABLE)}
-            for name, ddl_type in _CANDLES_1D_NEW_COLUMNS.items():
-                if name not in existing_cols:
-                    actions.append(_add_column(conn, CANDLES_1D_TABLE, name, ddl_type))
 
     return actions
 

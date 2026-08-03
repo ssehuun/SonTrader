@@ -8,7 +8,17 @@ import sqlalchemy as sa
 
 from sontrader.data import db
 
-NEW_TABLES = {"events", "llm_judgments", "orders", "fills", "positions", "approvals"}
+NEW_TABLES = {
+    "events",
+    "llm_judgments",
+    "orders",
+    "fills",
+    "positions",
+    "approvals",
+    "symbol_master",
+    "stock_candles_1d",
+    "watchlist_snapshots",
+}
 
 
 def test_migrate_creates_all_new_tables(db_engine):
@@ -25,11 +35,14 @@ def test_migrate_is_idempotent(db_engine):
 
 
 def test_legacy_candles_gain_adjustment_columns(db_engine):
+    # kis_trading이 만들어 둔 기존 일봉 테이블 (수정주가 컬럼 없음)을 흉내낸다.
     with db_engine.begin() as conn:
         conn.execute(
             sa.text(
                 "CREATE TABLE stock_candles_1d ("
-                "symbol VARCHAR(20), date DATE, close INTEGER, "
+                "symbol VARCHAR(20), date DATE, open INTEGER, high INTEGER, "
+                "low INTEGER, close INTEGER, volume BIGINT, trade_value BIGINT, "
+                "prdy_vrss INTEGER, prdy_ctrt FLOAT, "
                 "PRIMARY KEY (symbol, date))"
             )
         )
@@ -40,12 +53,6 @@ def test_legacy_candles_gain_adjustment_columns(db_engine):
     assert {"flng_cls_code", "prtt_rate", "mod_yn", "adj_factor"} <= cols
     assert sum("stock_candles_1d" in a for a in actions) == 4
     assert db.migrate(db_engine) == []  # 재실행 시 컬럼 중복 추가 없음
-
-
-def test_migrate_without_legacy_tables_skips_alter(db_engine):
-    actions = db.migrate(db_engine)
-
-    assert all("stock_candles_1d" not in a for a in actions)
 
 
 def test_migrate_syncs_columns_and_indexes_of_existing_tables(db_engine):

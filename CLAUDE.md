@@ -18,6 +18,9 @@ uv run ruff format .                           # format
 uv run sontrader quote 005930                  # CLI (needs .env with KIS credentials)
 uv run sontrader migrate                       # create/extend trading-state DB schema (needs DATABASE_URL)
 uv run sontrader collect-dart                  # ingest today's DART disclosures (needs DART_API_KEY too)
+uv run sontrader collect-master                # KOSPI/KOSDAQ symbol master → symbol_master
+uv run sontrader collect-prices                # daily candles, 수정주가 (incremental + self-healing)
+uv run sontrader build-universe                # momentum watchlist + daily snapshot (hysteresis 50/70)
 ```
 
 ## Architecture
@@ -44,6 +47,14 @@ Three layers, each in one module under `src/sontrader/`:
   유가/코스닥 only) + `ingest()` (append-only into `events`, idempotent via ON CONFLICT,
   dual timestamps published_at/ingested_at, `norm_key` strips 정정 prefixes). CLI:
   `sontrader collect-dart [--date YYYYMMDD] [--interval N]`.
+- `data/master.py` — KOSPI/KOSDAQ .mst 종목 마스터 다운로드·고정폭 파싱 (kis_trading 명세
+  포팅, pandas 없이) → `symbol_master` upsert. Flags stay raw ('Y'/'N') — 해석은 core 필터.
+- `data/prices.py` — 일봉 수집기: 수정주가(FID_ORG_ADJ_PRC="0"), 100일 창 페이징, 증분 수집,
+  겹침 구간 종가 대조로 기업행위 감지 시 종목 전체 재수집 (자가치유), 일시 오류 재시도.
+- `data/universe.py` — 워치리스트 스냅샷 빌더: 마스터 필터 → 유동성(20일 평균 거래대금) →
+  모멘텀 → 히스테리시스 → `watchlist_snapshots` (같은 날 재실행 시 동일 결과).
+- `core/` — 순수 함수만, 부작용 없음 (momentum.py, watchlist.py 히스테리시스 50/70,
+  filters.py 방어 필터). DB/네트워크/시각 접근 금지 — 백테스트와 실전이 같은 코드를 쓰는 전제.
 
 KIS API responses put data in `output` / `output1` / `output2` keys with all values as strings
 (e.g. prices come back as `"71000"`).

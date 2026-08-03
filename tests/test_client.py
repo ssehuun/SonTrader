@@ -37,6 +37,33 @@ def test_get_quote(settings):
     assert quote["stck_prpr"] == "71000"
 
 
+def test_get_daily_candles_requests_adjusted_prices(settings):
+    from datetime import date
+
+    def responder(request):
+        assert request.url.path == "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice"
+        assert request.headers["tr_id"] == "FHKST03010100"
+        assert request.url.params["FID_ORG_ADJ_PRC"] == "0"  # 수정주가
+        assert request.url.params["FID_INPUT_DATE_1"] == "20260701"
+        assert request.url.params["FID_INPUT_DATE_2"] == "20260731"
+        return httpx.Response(
+            200,
+            json={
+                "rt_cd": "0",
+                "output1": {"hts_kor_isnm": "삼성전자"},
+                "output2": [
+                    {"stck_bsop_date": "20260731", "stck_clpr": "71000"},
+                    {},  # KIS는 빈 dict로 패딩할 수 있다
+                ],
+            },
+        )
+
+    with make_client(settings, responder) as client:
+        rows = client.get_daily_candles("005930", date(2026, 7, 1), date(2026, 7, 31))
+    assert len(rows) == 1
+    assert rows[0]["stck_clpr"] == "71000"
+
+
 def test_market_buy_order_uses_paper_tr_id(settings):
     def responder(request):
         assert request.url.path == "/uapi/domestic-stock/v1/trading/order-cash"

@@ -214,10 +214,6 @@ def norm_key(disclosure: Disclosure) -> str:
 # --- 적재 -----------------------------------------------------------------
 
 
-# SQLite 구버전의 바인드 변수 한도(999) 안에 들어가는 배치 크기.
-_INSERT_CHUNK = 100
-
-
 def ingest(engine: Engine, disclosures: list[Disclosure], ingested_at: datetime) -> int:
     """Append new disclosures to events; returns how many were new.
 
@@ -231,22 +227,11 @@ def ingest(engine: Engine, disclosures: list[Disclosure], ingested_at: datetime)
     unique = {d.rcept_no: d for d in disclosures}
     if not unique:
         return 0
-    if engine.dialect.name == "postgresql":
-        from sqlalchemy.dialects.postgresql import insert
-    else:
-        from sqlalchemy.dialects.sqlite import insert
-
     rows = [_event_row(d, ingested_at) for d in unique.values()]
     count_stmt = sa.select(sa.func.count()).select_from(db.events)
     with engine.begin() as conn:
         before = conn.execute(count_stmt).scalar_one()
-        for start in range(0, len(rows), _INSERT_CHUNK):
-            stmt = (
-                insert(db.events)
-                .values(rows[start : start + _INSERT_CHUNK])
-                .on_conflict_do_nothing(index_elements=["event_id"])
-            )
-            conn.execute(stmt)
+        db.upsert_rows(conn, db.events, rows, key_cols=("event_id",), ignore_conflicts=True)
         after = conn.execute(count_stmt).scalar_one()
     return after - before
 

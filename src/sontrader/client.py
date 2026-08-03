@@ -7,6 +7,7 @@ in _TR_IDS. API reference: https://apiportal.koreainvestment.com
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Any
 
 import httpx
@@ -17,6 +18,7 @@ from sontrader.config import Settings
 # endpoint key -> (real tr_id, paper tr_id)
 _TR_IDS = {
     "quote": ("FHKST01010100", "FHKST01010100"),
+    "daily": ("FHKST03010100", "FHKST03010100"),
     "balance": ("TTTC8434R", "VTTC8434R"),
     "buy": ("TTTC0802U", "VTTC0802U"),
     "sell": ("TTTC0801U", "VTTC0801U"),
@@ -54,6 +56,29 @@ class KisClient:
             params={"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": code},
         )
         return data["output"]
+
+    def get_daily_candles(
+        self, code: str, start: date, end: date, adjusted: bool = True
+    ) -> list[dict[str, Any]]:
+        """일봉 (국내주식기간별시세). 한 호출에 최대 100건 — 페이징은 호출자 몫.
+
+        ``adjusted=True``면 수정주가(FID_ORG_ADJ_PRC="0") 기준이다. KIS는
+        output2를 빈 dict로 패딩할 수 있어 영업일 행만 돌려준다.
+        """
+        data = self._request(
+            "GET",
+            "/uapi/domestic-stock/v1/quotations/inquire-daily-itemchartprice",
+            tr="daily",
+            params={
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_INPUT_ISCD": code,
+                "FID_INPUT_DATE_1": start.strftime("%Y%m%d"),
+                "FID_INPUT_DATE_2": end.strftime("%Y%m%d"),
+                "FID_PERIOD_DIV_CODE": "D",
+                "FID_ORG_ADJ_PRC": "0" if adjusted else "1",
+            },
+        )
+        return [row for row in data["output2"] if row.get("stck_bsop_date")]
 
     def get_balance(self) -> dict[str, Any]:
         """계좌 잔고: returns {"holdings": [...], "summary": {...}}."""
