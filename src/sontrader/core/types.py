@@ -322,6 +322,11 @@ class Context:
     judgments: Mapping[str, Judgment] = field(default_factory=dict)  # event_id → 판단
     cash: int = 0
     equity: int = 0  # 총 평가금액 — 목표 비중을 수량으로 환산하는 기준
+    # 이미 진입에 쓴 이벤트. 청산된 포지션까지 포함해야 동일 이벤트 재진입을
+    # 막을 수 있다 (설계 2.5절) — 보유분만 보면 청산 직후 재진입이 뚫린다.
+    used_event_ids: frozenset[str] = frozenset()
+    # 종목 → 마지막 청산 시각. 게이트의 시간 기반 쿨다운 판정 근거.
+    last_exit_at: Mapping[str, datetime] = field(default_factory=dict)
 
     def position(self, symbol: str) -> Position | None:
         for pos in self.positions:
