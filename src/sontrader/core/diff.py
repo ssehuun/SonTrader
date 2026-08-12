@@ -42,6 +42,7 @@ NEXT_OPEN 진입의 실제 체결가는 다음 시가이므로 수량은 근사�
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 
 from sontrader.core.types import Context, Order, OrderType, Side, Target, Urgency
 
@@ -68,7 +69,6 @@ def to_orders(target: Target, ctx: Context, config: DiffConfig | None = None) ->
     목록 자체도 같은 순서로 두어야 로그와 승인 알림을 읽기 쉽다.
     """
     cfg = config or DiffConfig()
-    cycle_ts = ctx.now.isoformat()
 
     exits: list[Order] = []
     rest: list[Order] = []
@@ -86,7 +86,7 @@ def to_orders(target: Target, ctx: Context, config: DiffConfig | None = None) ->
                 side=Side.SELL,
                 qty=pos.qty,
                 urgency=urgency,
-                cycle_ts=cycle_ts,
+                now=ctx.now,
                 event_id=pos.event_id,
             )
         )
@@ -125,7 +125,7 @@ def to_orders(target: Target, ctx: Context, config: DiffConfig | None = None) ->
                 side=Side.BUY if delta > 0 else Side.SELL,
                 qty=abs(delta),
                 urgency=item.urgency,
-                cycle_ts=cycle_ts,
+                now=ctx.now,
                 event_id=item.event_id,
             )
         )
@@ -139,17 +139,18 @@ def _order(
     side: Side,
     qty: int,
     urgency: Urgency,
-    cycle_ts: str,
+    now: datetime,
     event_id: str | None,
 ) -> Order:
     # 진입도 청산도 시장가다. 차이는 타이밍(urgency)뿐이며, 그 해석은 집행기가
     # 한다 — IMMEDIATE는 장중 즉시, NEXT_OPEN은 다음 개장 시가 (설계 1.3절).
     return Order(
-        idempotency_key=f"{symbol}:{side.value}:{cycle_ts}",
+        idempotency_key=f"{symbol}:{side.value}:{now.isoformat()}",
         symbol=symbol,
         side=side,
         qty=qty,
         order_type=OrderType.MARKET,
         urgency=urgency,
+        ts=now,
         event_id=event_id,
     )

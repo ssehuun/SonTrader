@@ -87,6 +87,7 @@ def test_new_entry_sizes_from_equity_and_last_close():
     assert order.qty == 200  # 1,000만 × 20% / 10,000원
     assert order.order_type is OrderType.MARKET
     assert order.urgency is Urgency.NEXT_OPEN
+    assert order.ts == NOW  # broker_sim이 "다음 봉"을 찾는 기준 (5단계)
 
 
 def test_quantity_floors_to_whole_shares():

@@ -170,6 +170,7 @@ def test_limit_order_requires_a_price():
             qty=10,
             order_type=OrderType.LIMIT,
             urgency=Urgency.NEXT_OPEN,
+            ts=datetime(2026, 3, 10, 9, 30),
         )
 
 
@@ -182,6 +183,7 @@ def test_order_qty_must_be_positive():
             qty=0,
             order_type=OrderType.MARKET,
             urgency=Urgency.IMMEDIATE,
+            ts=datetime(2026, 3, 10, 9, 30),
         )
 
 

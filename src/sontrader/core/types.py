@@ -239,6 +239,11 @@ class Order:
 
     `idempotency_key`가 중복 주문 차단의 1차 방어선이고, DB의 UNIQUE 제약이
     2차 방어선이다 (설계 2.6절).
+
+    `ts`는 이 주문을 만든 사이클의 시각이다 (`Context.now`). 체결 시뮬레이터
+    (`adapters/broker_sim.py`, 5단계)가 "이 주문 다음 봉"을 찾는 기준이 된다 —
+    신호가 발생한 봉의 가격으로 즉시 체결하면 look-ahead이므로, 체결은 항상
+    이 시각 이후의 봉에서 일어나야 한다(01문서 §4.1).
     """
 
     idempotency_key: str
@@ -247,6 +252,7 @@ class Order:
     qty: int
     order_type: OrderType
     urgency: Urgency
+    ts: datetime
     limit_price: int | None = None
     event_id: str | None = None
     order_id: str | None = None
