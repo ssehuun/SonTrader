@@ -16,12 +16,15 @@ from sontrader.auth import TokenManager
 from sontrader.config import Settings
 
 # endpoint key -> (real tr_id, paper tr_id)
+# https://apiportal.koreainvestment.com/apiservice-apiservice?/uapi/domestic-stock/v1/trading/order-cash
 _TR_IDS = {
     "quote": ("FHKST01010100", "FHKST01010100"),
     "daily": ("FHKST03010100", "FHKST03010100"),
     "balance": ("TTTC8434R", "VTTC8434R"),
-    "buy": ("TTTC0802U", "VTTC0802U"),
-    "sell": ("TTTC0801U", "VTTC0801U"),
+    "buy": ("TTTC0012U", "VTTC0012U"),
+    "sell": ("TTTC0011U", "VTTC0011U"),
+    # 주식일별주문체결조회, 3개월 이내 기준. docs/api/주식일별주문체결조회[v1_국내주식-005].xlsx
+    "daily_ccld": ("TTTC0081R", "VTTC0081R"),
 }
 
 ORDER_DVSN_LIMIT = "00"  # 지정가
@@ -81,7 +84,11 @@ class KisClient:
         return [row for row in data["output2"] if row.get("stck_bsop_date")]
 
     def get_balance(self) -> dict[str, Any]:
-        """계좌 잔고: returns {"holdings": [...], "summary": {...}}."""
+        """계좌 잔고: returns {"holdings": [...], "summary": {...}}.
+
+        ``INQR_DVSN="01"``(대출일별) — 문서(주식잔고조회 v1_국내주식-006)에
+        정의된 값이 이것 하나뿐이다.
+        """
         data = self._request(
             "GET",
             "/uapi/domestic-stock/v1/trading/inquire-balance",
@@ -91,7 +98,7 @@ class KisClient:
                 "ACNT_PRDT_CD": self._settings.acnt_prdt_cd,
                 "AFHR_FLPR_YN": "N",
                 "OFL_YN": "",
-                "INQR_DVSN": "02",
+                "INQR_DVSN": "01",
                 "UNPR_DVSN": "01",
                 "FUND_STTL_ICLD_YN": "N",
                 "FNCG_AMT_AUTO_RDPT_YN": "N",
@@ -102,6 +109,47 @@ class KisClient:
         )
         summary = data["output2"][0] if data["output2"] else {}
         return {"holdings": data["output1"], "summary": summary}
+
+    def get_daily_executions(
+        self,
+        start: date,
+        end: date,
+        *,
+        symbol: str | None = None,
+        broker_order_no: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """주식일별주문체결조회. 최근 3개월 이내 기준(TTTC0081R/VTTC0081R) —
+        그 이전 체결은 별도 TR_ID(CTSC9215R 계열)가 필요하며 여기서는 다루지
+        않는다(자가 매매 상태 확인용이라 항상 최근 주문만 조회하면 된다).
+
+        ``broker_order_no``(ODNO)를 넘기면 그 주문 하나로 좁혀진다. 한 번의
+        호출에 최대 100건(모의 15건)까지 오고 그 이상은 연속조회가 필요한데,
+        지금은 페이지네이션을 구현하지 않는다 — ODNO로 좁힌 조회는 결과가
+        한 건뿐이라 필요 없다.
+        """
+        data = self._request(
+            "GET",
+            "/uapi/domestic-stock/v1/trading/inquire-daily-ccld",
+            tr="daily_ccld",
+            params={
+                "CANO": self._settings.cano,
+                "ACNT_PRDT_CD": self._settings.acnt_prdt_cd,
+                "INQR_STRT_DT": start.strftime("%Y%m%d"),
+                "INQR_END_DT": end.strftime("%Y%m%d"),
+                "SLL_BUY_DVSN_CD": "00",
+                "PDNO": symbol or "",
+                "ORD_GNO_BRNO": "",
+                "ODNO": broker_order_no or "",
+                "CCLD_DVSN": "00",
+                "INQR_DVSN": "00",
+                "INQR_DVSN_1": "",
+                "INQR_DVSN_3": "00",
+                "EXCG_ID_DVSN_CD": "KRX",
+                "CTX_AREA_FK100": "",
+                "CTX_AREA_NK100": "",
+            },
+        )
+        return data["output1"]
 
     def order(
         self, side: str, code: str, quantity: int, price: int | None = None

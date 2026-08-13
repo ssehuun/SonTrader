@@ -67,7 +67,7 @@ def test_get_daily_candles_requests_adjusted_prices(settings):
 def test_market_buy_order_uses_paper_tr_id(settings):
     def responder(request):
         assert request.url.path == "/uapi/domestic-stock/v1/trading/order-cash"
-        assert request.headers["tr_id"] == "VTTC0802U"  # paper buy
+        assert request.headers["tr_id"] == "VTTC0012U"  # paper buy
         body = json.loads(request.content)
         assert body["PDNO"] == "005930"
         assert body["ORD_DVSN"] == "01"  # market order
@@ -82,7 +82,7 @@ def test_market_buy_order_uses_paper_tr_id(settings):
 
 def test_limit_sell_order(settings):
     def responder(request):
-        assert request.headers["tr_id"] == "VTTC0801U"  # paper sell
+        assert request.headers["tr_id"] == "VTTC0011U"  # paper sell
         body = json.loads(request.content)
         assert body["ORD_DVSN"] == "00"  # limit order
         assert body["ORD_UNPR"] == "70000"
@@ -90,6 +90,46 @@ def test_limit_sell_order(settings):
 
     with make_client(settings, responder) as client:
         client.order("sell", "005930", 5, price=70000)
+
+
+def test_get_daily_executions_queries_by_date_range(settings):
+    from datetime import date
+
+    def responder(request):
+        assert request.url.path == "/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
+        assert request.headers["tr_id"] == "VTTC0081R"  # paper, 3개월 이내
+        assert request.url.params["INQR_STRT_DT"] == "20260301"
+        assert request.url.params["INQR_END_DT"] == "20260310"
+        assert request.url.params["ODNO"] == ""
+        return httpx.Response(
+            200,
+            json={
+                "rt_cd": "0",
+                "output1": [{"odno": "0000117057", "tot_ccld_qty": "10", "avg_prvs": "71000"}],
+                "output2": {},
+            },
+        )
+
+    with make_client(settings, responder) as client:
+        rows = client.get_daily_executions(date(2026, 3, 1), date(2026, 3, 10))
+    assert rows == [{"odno": "0000117057", "tot_ccld_qty": "10", "avg_prvs": "71000"}]
+
+
+def test_get_daily_executions_filters_by_order_number(settings):
+    from datetime import date
+
+    def responder(request):
+        assert request.url.params["ODNO"] == "0000117057"
+        assert request.url.params["PDNO"] == "005930"
+        return httpx.Response(200, json={"rt_cd": "0", "output1": [], "output2": {}})
+
+    with make_client(settings, responder) as client:
+        client.get_daily_executions(
+            date(2026, 3, 1),
+            date(2026, 3, 10),
+            symbol="005930",
+            broker_order_no="0000117057",
+        )
 
 
 def test_api_level_failure_raises_kis_error(settings):

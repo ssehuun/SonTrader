@@ -111,6 +111,23 @@ def record_fills(engine: Engine, order_id: str, fills: Sequence[Fill]) -> None:
         conn.execute(db.fills.insert(), rows)
 
 
+def set_fill_snapshot(engine: Engine, order_id: str, fill: Fill) -> None:
+    """이 주문의 체결 상태를 `fill` 하나로 완전히 대체한다.
+
+    KIS 일별주문체결조회(`adapters/broker_kis.py`)는 개별 체결 이벤트가
+    아니라 누적 체결수량·평균단가만 준다 — 그래서 여러 번 조회해도
+    "지금까지 누적된 체결"이라는 스냅샷 하나만 표현할 수 있다.
+    `record_fills()`처럼 계속 추가(append)하면 조회할 때마다 중복
+    합산되므로, 여기서는 기존 체결 기록을 지우고 최신 스냅샷 하나로
+    교체한다.
+    """
+    with engine.begin() as conn:
+        conn.execute(sa.delete(db.fills).where(db.fills.c.order_id == order_id))
+        conn.execute(
+            db.fills.insert().values(order_id=order_id, price=fill.price, qty=fill.qty, ts=fill.ts)
+        )
+
+
 def load_fills(engine: Engine, order_id: str) -> list[Fill]:
     columns = db.fills.c
     with engine.connect() as conn:
