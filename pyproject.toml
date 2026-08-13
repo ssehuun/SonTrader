@@ -5,6 +5,7 @@ description = "Korean stock trading bot built on the Korea Investment & Securiti
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "anthropic>=0.70",
     "httpx>=0.27",
     "psycopg2-binary>=2.9",
     "python-dotenv>=1.0",

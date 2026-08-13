@@ -46,6 +46,16 @@ def load_dart_api_key() -> str | None:
     return _optional_env("DART_API_KEY")
 
 
+def load_anthropic_api_key() -> str | None:
+    """Claude API key for the LLM 판단 계층 (6단계)."""
+    return _optional_env("ANTHROPIC_API_KEY")
+
+
+def load_openai_api_key() -> str | None:
+    """OpenAI(호환) API key — LLM 판단 계층의 대체 백엔드 (6단계)."""
+    return _optional_env("OPENAI_API_KEY")
+
+
 def load_database_url() -> str | None:
     """PostgreSQL URL for trading state.
 

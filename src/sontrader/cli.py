@@ -289,7 +289,42 @@ def _run_build_universe(
         engine.dispose()
 
 
-def _run_backtest(start_str: str, end_str: str, initial_cash: int) -> int:
+def _build_llm_backend(provider: str, model: str | None, base_url: str | None):
+    """--llm-provider에 맞는 LLMBackend를 구성한다. 실패 시 (None, 종료코드)."""
+    from sontrader.config import load_anthropic_api_key, load_openai_api_key
+
+    if provider == "anthropic":
+        from sontrader.llm.anthropic_backend import AnthropicBackend
+
+        api_key = load_anthropic_api_key()
+        if not api_key:
+            print("error: ANTHROPIC_API_KEY is not set. See env.example.", file=sys.stderr)
+            return None, 2
+        kwargs = {"model": model} if model else {}
+        return AnthropicBackend(api_key, **kwargs), 0
+
+    from sontrader.llm.openai_backend import OpenAICompatibleBackend
+
+    api_key = load_openai_api_key()
+    if not api_key:
+        print("error: OPENAI_API_KEY is not set. See env.example.", file=sys.stderr)
+        return None, 2
+    if not model:
+        print("error: --llm-model is required with --llm-provider openai", file=sys.stderr)
+        return None, 2
+    kwargs = {"base_url": base_url} if base_url else {}
+    return OpenAICompatibleBackend(api_key, model=model, **kwargs), 0
+
+
+def _run_backtest(
+    start_str: str,
+    end_str: str,
+    initial_cash: int,
+    use_llm: bool,
+    llm_provider: str,
+    llm_model: str | None,
+    llm_base_url: str | None,
+) -> int:
     from sqlalchemy.exc import SQLAlchemyError
 
     from sontrader.apps.backtest import BacktestError, run_backtest
@@ -306,16 +341,26 @@ def _run_backtest(start_str: str, end_str: str, initial_cash: int) -> int:
         print("error: --start must be <= --end", file=sys.stderr)
         return 2
 
+    backend = None
+    if use_llm:
+        backend, err = _build_llm_backend(llm_provider, llm_model, llm_base_url)
+        if backend is None:
+            return err
+
     engine = _open_engine()
     if engine is None:
         return 2
     try:
         for action in migrate(engine):
             print(action)
-        # judge를 지정하지 않으므로 LLM 판단 계층(6단계) 없이는 신규 진입이 절대
-        # 나오지 않는다 — 지금은 청산·게이트·체결 경로 검증용이다.
-        result = run_backtest(engine, start=start, end=end, initial_cash=initial_cash)
-        print("주의: LLM 판단 계층 미착수 — 이번 실행은 신규 진입 없이 청산 로직만 검증합니다.")
+        judge = None
+        if backend is not None:
+            from sontrader.llm.judge import CachingJudge
+
+            judge = CachingJudge(engine, backend).judge
+        else:
+            print("주의: --llm 미지정 — 이번 실행은 신규 진입 없이 청산 로직만 검증합니다.")
+        result = run_backtest(engine, start=start, end=end, initial_cash=initial_cash, judge=judge)
         final_equity = result.equity_curve[-1][1] if result.equity_curve else initial_cash
         print(f"{start} ~ {end}: 사이클 {len(result.equity_curve)}일, 체결 {len(result.fills)}건")
         print(
@@ -402,13 +447,32 @@ def main(argv: list[str] | None = None) -> int:
     universe.add_argument("--lookback", type=int, default=252, help="모멘텀 룩백 (거래일)")
     universe.add_argument("--skip", type=int, default=21, help="모멘텀 스킵 (거래일)")
 
-    backtest = sub.add_parser(
-        "backtest", help="백테스트 실행 (LLM 판단 계층 미착수 — 청산/게이트/체결 로직 검증용)"
-    )
+    backtest = sub.add_parser("backtest", help="백테스트 실행")
     backtest.add_argument("--start", required=True, help="시작일 YYYYMMDD")
     backtest.add_argument("--end", required=True, help="종료일 YYYYMMDD")
     backtest.add_argument(
         "--initial-cash", type=int, default=10_000_000, help="초기 자본 KRW (기본 1,000만원)"
+    )
+    backtest.add_argument(
+        "--llm",
+        action="store_true",
+        help="LLM으로 진입 판단; 생략하면 신규 진입 없이 청산 로직만 검증",
+    )
+    backtest.add_argument(
+        "--llm-provider",
+        choices=["anthropic", "openai"],
+        default="anthropic",
+        help="LLM 제공자 (기본 anthropic; openai는 Azure OpenAI·Ollama 등 호환 서버도 포함)",
+    )
+    backtest.add_argument(
+        "--llm-model",
+        default=None,
+        help="모델 ID (anthropic 생략 시 claude-opus-5; openai는 필수)",
+    )
+    backtest.add_argument(
+        "--llm-base-url",
+        default=None,
+        help="--llm-provider openai용 API 베이스 URL (Azure/로컬 서버 지정 시)",
     )
 
     for side, korean in (("buy", "매수"), ("sell", "매도")):
@@ -432,7 +496,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "build-universe":
         return _run_build_universe(args.date, args.min_trade_value, args.lookback, args.skip)
     if args.command == "backtest":
-        return _run_backtest(args.start, args.end, args.initial_cash)
+        return _run_backtest(
+            args.start,
+            args.end,
+            args.initial_cash,
+            args.llm,
+            args.llm_provider,
+            args.llm_model,
+            args.llm_base_url,
+        )
 
     try:
         settings = load_settings()
