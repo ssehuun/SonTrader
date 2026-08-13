@@ -170,6 +170,28 @@ def test_sell_tax_reduces_proceeds():
     assert broker.pending_settlement == 1_000_000 - 2_000  # 매도금 - 세금
 
 
+def test_total_costs_accumulates_commission_and_tax_across_both_legs():
+    config = SimBrokerConfig(commission_rate=0.001, tax_rate=0.002, slippage_bps=0.0)
+    broker = SimBroker({"100": FEE_SERIES}, initial_cash=10_000_000, config=config)
+    assert broker.total_costs == 0
+
+    broker.submit([make_order("100", Side.BUY, 100, FEE_BAR0.ts)], now=FEE_BAR0.ts)
+    assert broker.total_costs == 1_000  # 매수 수수료만 (1,000,000 × 0.1%)
+
+    broker.submit([make_order("100", Side.SELL, 100, FEE_BAR1.ts)], now=FEE_BAR1.ts)
+    # 매도 수수료 1,000 + 세금 2,000이 더해진다.
+    assert broker.total_costs == 1_000 + 1_000 + 2_000
+
+
+def test_total_costs_excludes_slippage():
+    config = SimBrokerConfig(commission_rate=0.0, tax_rate=0.0, slippage_bps=100.0)
+    broker = SimBroker({"100": FEE_SERIES}, initial_cash=10_000_000, config=config)
+
+    broker.submit([make_order("100", Side.BUY, 100, FEE_BAR0.ts)], now=FEE_BAR0.ts)
+
+    assert broker.total_costs == 0
+
+
 # --- 미수 방지 (현금 클램핑) -----------------------------------------------------
 
 

@@ -94,6 +94,7 @@ class SimBroker:
         self._cash = initial_cash
         self._positions: dict[str, BrokerPosition] = {}
         self._pending: list[tuple[date, int]] = []  # (정산일, 입금액)
+        self._total_costs = 0  # 누적 수수료 + 증권거래세 (report.py의 "총 거래비용 비중")
 
     def submit(self, orders: list[Order], *, now: datetime) -> list[OrderResult]:
         self._settle(now.date())
@@ -109,6 +110,13 @@ class SimBroker:
     def pending_settlement(self) -> int:
         """D+정산 대기 중인 금액 합계 — 테스트·디버깅용 조회."""
         return sum(amount for _, amount in self._pending)
+
+    @property
+    def total_costs(self) -> int:
+        """지금까지 낸 수수료 + 증권거래세 합계 (슬리피지는 제외 — 그건 체결가에
+        이미 녹아 있어 "비용"과 "가격" 경계가 다르다). `apps/report.py`의 총
+        거래비용 비중 계산 입력."""
+        return self._total_costs
 
     # --- 내부 ---------------------------------------------------------------
 
@@ -143,16 +151,17 @@ class SimBroker:
     def _fill_buy(self, order: Order, bar: Bar) -> OrderResult:
         price = bar.open * (1.0 + self._config.slippage_bps / 10_000)
         qty = order.qty
-        total = _order_cost(price, qty, self._config.commission_rate)
+        total, commission = _order_cost(price, qty, self._config.commission_rate)
 
         if total > self._cash:
             # 미수를 만들지 않는다 — 살 수 있는 만큼만 산다.
             qty = int(self._cash / (price * (1.0 + self._config.commission_rate)))
             if qty <= 0:
                 return OrderResult(order=order, status=OrderStatus.REJECTED)
-            total = _order_cost(price, qty, self._config.commission_rate)
+            total, commission = _order_cost(price, qty, self._config.commission_rate)
 
         self._cash -= total
+        self._total_costs += commission
         self._add_position(order.symbol, qty, price)
         status = OrderStatus.FILLED if qty == order.qty else OrderStatus.PARTIAL
         fill = _fill(order, price, qty, bar.ts)
@@ -174,6 +183,7 @@ class SimBroker:
         tax = _round(gross * self._config.tax_rate)
         proceeds = gross - commission - tax
 
+        self._total_costs += commission + tax
         self._remove_position(order.symbol, order.qty)
         settle_date = bar.ts.date() + timedelta(days=self._config.settlement_days)
         self._pending.append((settle_date, proceeds))
@@ -201,10 +211,11 @@ class SimBroker:
             )
 
 
-def _order_cost(price: float, qty: int, commission_rate: float) -> int:
+def _order_cost(price: float, qty: int, commission_rate: float) -> tuple[int, int]:
+    """(총 지불액, 수수료) — 호출자가 수수료를 누적 비용에 더로 쓴다."""
     cost = _round(price * qty)
     commission = _round(cost * commission_rate)
-    return cost + commission
+    return cost + commission, commission
 
 
 def _fill(order: Order, price: float, qty: int, ts: datetime) -> Fill:

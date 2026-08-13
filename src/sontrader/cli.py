@@ -289,6 +289,76 @@ def _run_build_universe(
         engine.dispose()
 
 
+def _run_backtest(start_str: str, end_str: str, initial_cash: int) -> int:
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from sontrader.apps.backtest import BacktestError, run_backtest
+    from sontrader.apps.report import build_report
+    from sontrader.data.db import migrate
+
+    try:
+        start = _parse_date_arg(start_str)
+        end = _parse_date_arg(end_str)
+    except ValueError:
+        print("error: --start/--end must be YYYYMMDD", file=sys.stderr)
+        return 2
+    if start > end:
+        print("error: --start must be <= --end", file=sys.stderr)
+        return 2
+
+    engine = _open_engine()
+    if engine is None:
+        return 2
+    try:
+        for action in migrate(engine):
+            print(action)
+        # judge를 지정하지 않으므로 LLM 판단 계층(6단계) 없이는 신규 진입이 절대
+        # 나오지 않는다 — 지금은 청산·게이트·체결 경로 검증용이다.
+        result = run_backtest(engine, start=start, end=end, initial_cash=initial_cash)
+        print("주의: LLM 판단 계층 미착수 — 이번 실행은 신규 진입 없이 청산 로직만 검증합니다.")
+        final_equity = result.equity_curve[-1][1] if result.equity_curve else initial_cash
+        print(f"{start} ~ {end}: 사이클 {len(result.equity_curve)}일, 체결 {len(result.fills)}건")
+        print(
+            f"최종 현금 {result.final_cash:,}원, 보유 {len(result.final_positions)}종목,"
+            f" 최종 평가자산 {final_equity:,}원"
+        )
+        if result.rejections:
+            print(f"거부 {len(result.rejections)}건 (슬롯/중복이벤트/쿨다운 등)")
+
+        report = build_report(result, initial_cash=initial_cash)
+        _print_report(report)
+        return 0
+    except BacktestError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except SQLAlchemyError as exc:
+        print(f"error: DB access failed: {_first_line(exc)}", file=sys.stderr)
+        return 1
+    finally:
+        engine.dispose()
+
+
+def _pct(value: float | None) -> str:
+    return "N/A" if value is None else f"{value:+.2%}"
+
+
+def _num(value: float | None, suffix: str = "") -> str:
+    return "N/A" if value is None else f"{value:.2f}{suffix}"
+
+
+def _print_report(report) -> None:
+    from sontrader.apps.report import MIN_TRADE_SAMPLE
+
+    print(f"CAGR {_pct(report.cagr)}  샤프 {_num(report.sharpe)}  MDD {report.mdd:.2%}")
+    print(
+        f"승률 {_pct(report.win_rate)}  손익비 {_num(report.profit_factor)}"
+        f"  평균보유 {_num(report.avg_holding_days, '일')}"
+    )
+    print(f"거래 {report.trade_count}건  총거래비용비중 {report.cost_ratio:.2%}")
+    if report.sample_warning:
+        print(f"주의: 거래 표본이 {MIN_TRADE_SAMPLE}건 미만 — 지표 신뢰 구간 밖 (01문서 §5.1).")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="sontrader", description="Korean stock trading via the KIS open API"
@@ -332,6 +402,15 @@ def main(argv: list[str] | None = None) -> int:
     universe.add_argument("--lookback", type=int, default=252, help="모멘텀 룩백 (거래일)")
     universe.add_argument("--skip", type=int, default=21, help="모멘텀 스킵 (거래일)")
 
+    backtest = sub.add_parser(
+        "backtest", help="백테스트 실행 (LLM 판단 계층 미착수 — 청산/게이트/체결 로직 검증용)"
+    )
+    backtest.add_argument("--start", required=True, help="시작일 YYYYMMDD")
+    backtest.add_argument("--end", required=True, help="종료일 YYYYMMDD")
+    backtest.add_argument(
+        "--initial-cash", type=int, default=10_000_000, help="초기 자본 KRW (기본 1,000만원)"
+    )
+
     for side, korean in (("buy", "매수"), ("sell", "매도")):
         order = sub.add_parser(side, help=f"{korean} 주문")
         order.add_argument("code", help="6-digit ticker")
@@ -352,6 +431,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_collect_prices(args.limit, args.pace, args.lookback_days)
     if args.command == "build-universe":
         return _run_build_universe(args.date, args.min_trade_value, args.lookback, args.skip)
+    if args.command == "backtest":
+        return _run_backtest(args.start, args.end, args.initial_cash)
 
     try:
         settings = load_settings()
