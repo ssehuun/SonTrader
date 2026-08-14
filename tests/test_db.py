@@ -18,6 +18,7 @@ NEW_TABLES = {
     "kill_switch",
     "symbol_master",
     "stock_candles_1d",
+    "stock_candles_1m",
     "watchlist_snapshots",
 }
 

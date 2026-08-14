@@ -214,6 +214,21 @@ stock_candles_1d = Table(
     Column("adj_factor", Float, comment="누적 수정계수 — 수정주가 수집이라 현재 미사용(NULL)"),
 )
 
+# 1분봉 — 웹소켓 실시간체결가(adapters/live_ws.py)가 집계해 채운다.
+# stock_candles_1d와 별개 테이블이다: PK가 date가 아니라 ts(분 단위)이고,
+# 재연결 시 같은 분이 다시 집계될 수 있어 upsert로 쓴다(data/live_bars.py).
+stock_candles_1m = Table(
+    "stock_candles_1m",
+    metadata,
+    Column("symbol", String(20), primary_key=True),
+    Column("ts", DateTime, primary_key=True),
+    Column("open", Integer, nullable=False),
+    Column("high", Integer, nullable=False),
+    Column("low", Integer, nullable=False),
+    Column("close", Integer, nullable=False),
+    Column("volume", BigInteger, nullable=False),
+)
+
 
 def get_engine(database_url: str) -> Engine:
     return sa.create_engine(database_url, pool_pre_ping=True)
