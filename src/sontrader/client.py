@@ -7,7 +7,7 @@ in _TR_IDS. API reference: https://apiportal.koreainvestment.com
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 import httpx
@@ -25,6 +25,9 @@ _TR_IDS = {
     "sell": ("TTTC0011U", "VTTC0011U"),
     # 주식일별주문체결조회, 3개월 이내 기준. docs/api/주식일별주문체결조회[v1_국내주식-005].xlsx
     "daily_ccld": ("TTTC0081R", "VTTC0081R"),
+    # 주식일별분봉조회(과거 분봉, 최대 1년 보관). 모의투자 미지원 —
+    # get_intraday_candles()가 호출 전에 막는다. docs/api/주식일별분봉조회[국내주식-213].xlsx
+    "intraday": ("FHKST03010230", ""),
 }
 
 ORDER_DVSN_LIMIT = "00"  # 지정가
@@ -79,6 +82,34 @@ class KisClient:
                 "FID_INPUT_DATE_2": end.strftime("%Y%m%d"),
                 "FID_PERIOD_DIV_CODE": "D",
                 "FID_ORG_ADJ_PRC": "0" if adjusted else "1",
+            },
+        )
+        return [row for row in data["output2"] if row.get("stck_bsop_date")]
+
+    def get_intraday_candles(self, code: str, reference: datetime) -> list[dict[str, Any]]:
+        """주식일별분봉조회 — ``reference`` 시각부터 과거로 최대 120건(최대 1년 보관).
+
+        모의투자를 지원하지 않는다(TR_ID FHKST03010230는 실전 전용) — 호출
+        전에 명확히 실패시킨다. 조용히 넘기면 KIS가 애매한 오류로 답한다.
+
+        응답(output2)은 최신이 먼저인 **내림차순**이다(``get_daily_candles``와
+        반대). 120건을 넘는 과거 데이터가 필요하면, 이 응답의 가장 오래된
+        행의 날짜·시각을 다음 호출의 ``reference``로 넘겨 페이징한다
+        (호출자 몫 — ``get_daily_candles``의 "페이징은 호출자 몫"과 같은 이유).
+        """
+        if self._settings.paper:
+            raise KisError("주식일별분봉조회(FHKST03010230)는 모의투자를 지원하지 않습니다")
+        data = self._request(
+            "GET",
+            "/uapi/domestic-stock/v1/quotations/inquire-time-dailychartprice",
+            tr="intraday",
+            params={
+                "FID_COND_MRKT_DIV_CODE": "J",
+                "FID_INPUT_ISCD": code,
+                "FID_INPUT_DATE_1": reference.strftime("%Y%m%d"),
+                "FID_INPUT_HOUR_1": reference.strftime("%H%M%S"),
+                "FID_PW_DATA_INCU_YN": "Y",
+                "FID_FAKE_TICK_INCU_YN": "",
             },
         )
         return [row for row in data["output2"] if row.get("stck_bsop_date")]

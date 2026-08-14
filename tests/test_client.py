@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 
 import httpx
 import pytest
@@ -62,6 +63,51 @@ def test_get_daily_candles_requests_adjusted_prices(settings):
         rows = client.get_daily_candles("005930", date(2026, 7, 1), date(2026, 7, 31))
     assert len(rows) == 1
     assert rows[0]["stck_clpr"] == "71000"
+
+
+def test_get_intraday_candles_requests_real_tr_id_and_reference_time(settings):
+    from datetime import datetime
+
+    real_settings = replace(settings, paper=False)
+
+    def responder(request):
+        assert request.url.path == "/uapi/domestic-stock/v1/quotations/inquire-time-dailychartprice"
+        assert request.headers["tr_id"] == "FHKST03010230"
+        assert request.url.params["FID_INPUT_ISCD"] == "005930"
+        assert request.url.params["FID_INPUT_DATE_1"] == "20241108"
+        assert request.url.params["FID_INPUT_HOUR_1"] == "140000"
+        assert request.url.params["FID_PW_DATA_INCU_YN"] == "Y"
+        return httpx.Response(
+            200,
+            json={
+                "rt_cd": "0",
+                "output1": {"hts_kor_isnm": "삼성전자"},
+                "output2": [
+                    {
+                        "stck_bsop_date": "20241108",
+                        "stck_cntg_hour": "140000",
+                        "stck_prpr": "57300",
+                    },
+                    {},  # KIS는 빈 dict로 패딩할 수 있다
+                ],
+            },
+        )
+
+    with make_client(real_settings, responder) as client:
+        rows = client.get_intraday_candles("005930", datetime(2024, 11, 8, 14, 0, 0))
+    assert len(rows) == 1
+    assert rows[0]["stck_prpr"] == "57300"
+
+
+def test_get_intraday_candles_rejects_paper_trading_before_any_request(settings):
+    from datetime import datetime
+
+    def responder(request):  # pragma: no cover - must never be reached
+        raise AssertionError("paper trading must not call KIS for this endpoint")
+
+    with make_client(settings, responder) as client:
+        with pytest.raises(KisError, match="모의투자"):
+            client.get_intraday_candles("005930", datetime(2024, 11, 8, 14, 0, 0))
 
 
 def test_market_buy_order_uses_paper_tr_id(settings):
