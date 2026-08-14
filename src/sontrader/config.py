@@ -17,6 +17,7 @@ REAL_BASE_URL = "https://openapi.koreainvestment.com:9443"
 PAPER_BASE_URL = "https://openapivts.koreainvestment.com:29443"
 
 DEFAULT_TOKEN_CACHE = Path.home() / ".cache" / "sontrader" / "token.json"
+DEFAULT_APPROVAL_KEY_CACHE = Path.home() / ".cache" / "sontrader" / "approval_key.json"
 
 
 @dataclass(frozen=True)
@@ -27,6 +28,7 @@ class Settings:
     acnt_prdt_cd: str  # 계좌상품코드: 2 digits after the dash
     paper: bool = True
     token_cache: Path = field(default=DEFAULT_TOKEN_CACHE)
+    approval_key_cache: Path = field(default=DEFAULT_APPROVAL_KEY_CACHE)
 
     @property
     def base_url(self) -> str:
@@ -110,6 +112,9 @@ def load_settings() -> Settings:
     # expanduser: .env의 "~/..."가 확장되지 않으면 리포지토리 안에 "~" 디렉토리가
     # 생겨 토큰이 저장소에 커밋될 뻔한 사고가 실제로 있었다.
     token_cache = Path(os.environ.get("SONTRADER_TOKEN_CACHE", DEFAULT_TOKEN_CACHE)).expanduser()
+    approval_key_cache = Path(
+        os.environ.get("SONTRADER_APPROVAL_KEY_CACHE", DEFAULT_APPROVAL_KEY_CACHE)
+    ).expanduser()
     return Settings(
         app_key=app_key,
         app_secret=app_secret,
@@ -117,4 +122,5 @@ def load_settings() -> Settings:
         acnt_prdt_cd=acnt_prdt_cd,
         paper=paper,
         token_cache=token_cache,
+        approval_key_cache=approval_key_cache,
     )

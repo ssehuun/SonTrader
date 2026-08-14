@@ -20,6 +20,7 @@ def settings(tmp_path):
         acnt_prdt_cd="01",
         paper=True,
         token_cache=tmp_path / "token.json",
+        approval_key_cache=tmp_path / "approval_key.json",
     )
 
 
