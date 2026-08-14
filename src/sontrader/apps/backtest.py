@@ -52,7 +52,7 @@ DB에 저장된 일봉(`stock_candles_1d`)과 워치리스트 스냅샷
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time
 
 import sqlalchemy as sa
@@ -167,6 +167,14 @@ def replay(
     dates = sorted(watchlists)
     if not dates:
         raise BacktestError("no cycle dates to replay")
+
+    # 백테스트는 사람이 없다 — 결정적이어야 하므로 승인 큐를 거치면 안 된다
+    # (engine/loop.py 참고). 호출자가 별도 cycle_config를 넘겨도 이 값은
+    # 유지한다: 백테스트에서 승인 큐를 켜면 Deps.engine이 없어 즉시 에러이거나,
+    # 있어도 사람 없이는 영원히 승인되지 않아 매매가 멈춘다.
+    cycle_config = cycle_config or CycleConfig()
+    if cycle_config.require_approval:
+        cycle_config = replace(cycle_config, require_approval=False)
 
     judge = judge or (lambda _event: None)
     bar_view = InMemoryBarView(bars)

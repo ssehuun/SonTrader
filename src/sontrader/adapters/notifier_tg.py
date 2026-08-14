@@ -32,12 +32,24 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Protocol
 
 import httpx
 from sqlalchemy.engine import Engine
 
 from sontrader.engine import approval, killswitch
+
+
+class Notifier(Protocol):
+    """`engine/loop.py`가 필요로 하는 만큼만 — 알림 발송 두 가지.
+
+    구현체는 `TelegramNotifier` 하나뿐이지만, `engine/loop.py`가 이 어댑터
+    모듈에 직접 묶이지 않도록(엔진 계층이 구체 구현이 아니라 프로토콜에
+    의존하도록) 여기 별도로 둔다.
+    """
+
+    def send_message(self, text: str) -> None: ...
+    def send_approval_request(self, proposal: approval.Proposal) -> None: ...
 
 
 class TelegramError(RuntimeError):

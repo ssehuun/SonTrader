@@ -4,6 +4,10 @@ strategy → gate → diff → broker.submit이 실제로 이어지는지, 그�
 거부(rejections)가 CycleResult까지 살아서 전달되는지를 확인한다. 각 단계
 자체의 규칙(청산 경계값, 슬롯 상한 등)은 이미 core 쪽 테스트가 다루므로
 여기서는 조립만 본다.
+
+승인 큐(6단계)는 `require_approval=False`로 꺼둔다 — 이 파일은 승인 큐
+없이도 성립하는 기본 배선만 본다. 승인 큐 자체의 동작은
+tests/test_engine_loop_approval.py가 다룬다.
 """
 
 from datetime import datetime, timedelta
@@ -24,6 +28,7 @@ from sontrader.engine.loop import CycleConfig, Deps, run_cycle
 
 NOW = datetime(2026, 3, 5, 9, 30)
 ENTRY_TS = datetime(2026, 3, 1, 0, 0)
+NO_APPROVAL = CycleConfig(require_approval=False)
 
 
 class StubBars:
@@ -125,7 +130,7 @@ def test_new_entry_reaches_the_broker_as_a_buy_order():
     )
     broker = StubBroker()
 
-    result = run_cycle(ctx, Deps(broker=broker))
+    result = run_cycle(ctx, Deps(broker=broker), NO_APPROVAL)
 
     assert len(result.orders) == 1
     assert result.orders[0].symbol == "100"
@@ -138,7 +143,7 @@ def test_broker_is_called_with_now_even_when_there_are_no_orders():
     ctx = make_ctx()
     broker = StubBroker()
 
-    result = run_cycle(ctx, Deps(broker=broker))
+    result = run_cycle(ctx, Deps(broker=broker), NO_APPROVAL)
 
     assert result.orders == ()
     assert broker.calls == [([], NOW)]
@@ -150,7 +155,7 @@ def test_exit_signal_reaches_the_broker_as_a_sell_order():
     ctx = make_ctx(bars=StubBars({"100": bars}), positions=(position,))
     broker = StubBroker()
 
-    result = run_cycle(ctx, Deps(broker=broker))
+    result = run_cycle(ctx, Deps(broker=broker), NO_APPROVAL)
 
     assert len(result.orders) == 1
     assert result.orders[0].symbol == "100"
@@ -170,7 +175,7 @@ def test_cycle_result_target_is_the_gated_target_not_the_raw_strategy_output():
     )
     broker = StubBroker()
 
-    result = run_cycle(ctx, Deps(broker=broker))
+    result = run_cycle(ctx, Deps(broker=broker), NO_APPROVAL)
 
     # 5슬롯이 이미 다 찼으므로 신규 진입은 최종 target에 없다.
     assert result.target.get("999") is None
@@ -193,7 +198,7 @@ def test_rejections_from_the_gate_propagate_to_the_cycle_result():
     )
     broker = StubBroker()
 
-    result = run_cycle(ctx, Deps(broker=broker))
+    result = run_cycle(ctx, Deps(broker=broker), NO_APPROVAL)
 
     # held 5종목은 목표 비중과 현재 비중이 일치해 주문이 없고, 신규는 슬롯이
     # 없어 거부된다 — 그래서 이번 사이클엔 주문이 하나도 나가지 않는다.
@@ -212,7 +217,7 @@ def test_custom_gate_config_is_applied_through_cycle_config():
     bars = StubBars({"100": make_bars("100", [10_000]), "200": make_bars("200", [10_000])})
     ctx = make_ctx(bars=bars, watchlist=("100", "200"), new_events=events, judgments=judgments)
     broker = StubBroker()
-    config = CycleConfig(gate=GateConfig(max_positions=1))
+    config = CycleConfig(gate=GateConfig(max_positions=1), require_approval=False)
 
     result = run_cycle(ctx, Deps(broker=broker), config)
 
@@ -237,7 +242,7 @@ def test_order_results_correspond_one_to_one_with_orders():
     )
     broker = StubBroker()
 
-    result = run_cycle(ctx, Deps(broker=broker))
+    result = run_cycle(ctx, Deps(broker=broker), NO_APPROVAL)
 
     assert len(result.orders) == len(result.order_results)
     assert result.order_results[0].order == result.orders[0]
