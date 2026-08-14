@@ -9,7 +9,7 @@ diff는 순수(core)고, 마지막 한 줄만 부작용이다(브로커 제출).
 
 ## `Deps`가 `broker` 하나뿐인 이유
 
-`LLMJudge`, `Notifier`, `ApprovalQueue`는 각각 6/6/8단계 항목이라 아직
+`LLMJudge`는 4단계, `Notifier`/`ApprovalQueue`는 6단계 항목이라 아직
 없다. 지금은 진입 판단이 이미 `Context.judgments`에 채워져 있다고
 가정한다 — 전략은 그걸 조회만 한다(`core/strategy.py` 참고, core는 LLM을
 직접 호출하지 않는다). 그 어댑터들이 생기면 `Deps`에 필드가 늘어나겠지만,

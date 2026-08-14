@@ -56,6 +56,16 @@ def load_openai_api_key() -> str | None:
     return _optional_env("OPENAI_API_KEY")
 
 
+def load_telegram_bot_token() -> str | None:
+    """텔레그램 봇 토큰 — 승인 요청·알림·킬 스위치 (6단계). @BotFather로 발급."""
+    return _optional_env("TELEGRAM_BOT_TOKEN")
+
+
+def load_telegram_chat_id() -> str | None:
+    """알림을 보낼 대상 채팅 ID (6단계). kis_trading 레포와 같은 변수명을 쓴다."""
+    return _optional_env("TELEGRAM_CHAT_ID")
+
+
 def load_database_url() -> str | None:
     """PostgreSQL URL for trading state.
 

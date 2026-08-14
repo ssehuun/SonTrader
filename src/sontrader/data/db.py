@@ -134,8 +134,23 @@ approvals = Table(
     metadata,
     Column("proposal_id", String(36), primary_key=True),
     Column("payload_json", _JSON, nullable=False),
-    Column("status", String(10), nullable=False, comment="pending/approved/rejected/expired"),
+    Column(
+        "status",
+        String(10),
+        nullable=False,
+        comment="pending/approved/rejected/expired/consumed",
+    ),
     Column("expires_at", DateTime, nullable=False, comment="TTL — 만료 시 폐기"),
+)
+
+# 킬 스위치 — 계좌가 하나뿐이라 전역 온/오프 단일 행이면 충분하다(id는 항상
+# 'singleton'). 재시작 후에도 유지돼야 하므로 DB에 둔다(설계 2.5절).
+kill_switch = Table(
+    "kill_switch",
+    metadata,
+    Column("id", String(10), primary_key=True, comment="항상 'singleton'"),
+    Column("engaged", sa.Boolean, nullable=False),
+    Column("updated_at", DateTime, nullable=False),
 )
 
 # KOSPI/KOSDAQ 종목 마스터 (.mst 파일에서 적재). 플래그는 원본 문자

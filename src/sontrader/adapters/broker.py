@@ -9,7 +9,7 @@
 조건(`ExitRule`)이나 어느 이벤트로 들어왔는지(`event_id`)를 모른다 — 그건
 우리 DB에만 있는 상태다. 브로커가 아는 것(수량·평단가)과 우리 DB에 저장된
 전략 상태를 합쳐 `core.types.Position`을 재구성하는 일은
-`engine/reconcile.py`(9단계, 미착수)의 몫이다.
+`engine/reconcile.py`의 몫이다.
 """
 
 from __future__ import annotations

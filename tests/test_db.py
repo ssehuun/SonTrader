@@ -15,6 +15,7 @@ NEW_TABLES = {
     "fills",
     "positions",
     "approvals",
+    "kill_switch",
     "symbol_master",
     "stock_candles_1d",
     "watchlist_snapshots",
