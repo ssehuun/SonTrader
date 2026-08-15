@@ -9,8 +9,12 @@
 아직 일봉만 쓴다(`engine/live_context.py`의 결정 사항 참고 — 분봉 기준
 ExitRule 파라미터가 검증되지 않았다).
 
-장 운영시간 캘린더는 없다(01문서 §8 미확정 파라미터) — 사이클을 계속
-돌리되, 장외 시간에는 새 일봉이 없어 자연히 신규 주문이 안 나간다.
+장 운영시간 캘린더는 국내휴장일조회(`data/calendar.py`, CTCA0903R)를
+쓴다 — 모의투자는 미지원이라 `settings.paper`면 이 확인 자체를
+건너뛴다(장외에도 새 일봉이 없어 자연히 신규 주문은 안 나간다). 실전
+계좌에서 휴장일로 확인되면 그날은 매매 사이클(reconcile·주문)을
+건너뛰고 텔레그램으로 하루에 한 번만 알린다 — 텔레그램 폴링은 휴장일
+에도 계속한다(킬 스위치·상태 조회 명령은 살아 있어야 한다).
 
 포지션 불일치(01문서 §6.5)는 기동 시뿐 아니라 매 사이클 확인한다 —
 장중에 계좌 밖에서 수동 거래가 발생하는 등, 부팅 이후에도 같은 위험이
@@ -40,7 +44,7 @@ from sontrader.config import (
     load_telegram_bot_token,
     load_telegram_chat_id,
 )
-from sontrader.data import db, live_bars
+from sontrader.data import calendar, db, live_bars
 from sontrader.engine import reconcile as reconcile_mod
 from sontrader.engine.live_context import JudgeFn, build_context
 from sontrader.engine.loop import Deps, run_cycle
@@ -72,16 +76,26 @@ def main() -> None:
             notifier.send_message("SonTrader 기동 완료")
 
         offset: int | None = None
+        notified_holiday: date | None = None
         while not stop.is_set():
             if notifier is not None:
                 offset = _poll_telegram(notifier, offset)
+
+            now = RealClock().now()
+            if not settings.paper:
+                calendar.refresh_if_needed(engine, client, today=now.date())
+                if calendar.is_open(engine, now.date()) is False:
+                    if notifier is not None and notified_holiday != now.date():
+                        notifier.send_message(f"{now:%Y-%m-%d} 휴장일 — 매매를 쉽니다.")
+                        notified_holiday = now.date()
+                    stop.wait(CYCLE_INTERVAL)
+                    continue
 
             report = reconcile_mod.reconcile(engine, broker)
             if report.halt:
                 _halt(notifier, report)
                 return
 
-            now = RealClock().now()
             ctx = build_context(
                 engine,
                 now=now,

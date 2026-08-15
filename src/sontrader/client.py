@@ -28,6 +28,8 @@ _TR_IDS = {
     # 주식일별분봉조회(과거 분봉, 최대 1년 보관). 모의투자 미지원 —
     # get_intraday_candles()가 호출 전에 막는다. docs/api/주식일별분봉조회[국내주식-213].xlsx
     "intraday": ("FHKST03010230", ""),
+    # 국내휴장일조회. 모의투자 미지원. docs/api/국내휴장일조회[국내주식-040].xlsx
+    "holidays": ("CTCA0903R", ""),
 }
 
 ORDER_DVSN_LIMIT = "00"  # 지정가
@@ -113,6 +115,33 @@ class KisClient:
             },
         )
         return [row for row in data["output2"] if row.get("stck_bsop_date")]
+
+    def get_market_holidays(self, reference: date) -> list[dict[str, Any]]:
+        """국내휴장일조회 — ``reference``부터 몇 주치 영업일 정보를 한 번에 돌려준다.
+
+        모의투자를 지원하지 않는다(TR_ID CTCA0903R는 실전 전용) — 호출 전에
+        명확히 실패시킨다.
+
+        KIS 문서가 "원장서비스와 연관돼 있어 가급적 1일 1회 호출"을 명시적으로
+        요청한다 — 이 메서드 자체는 그 제약을 강제하지 않는다(단순 REST
+        래퍼). 캐시해서 호출 빈도를 낮추는 일은 ``data/calendar.py``의 몫이다.
+
+        각 행의 ``opnd_yn``이 "개장일여부"다 — 문서: "주문을 넣고자 할 경우
+        개장일여부(opnd_yn)를 사용".
+        """
+        if self._settings.paper:
+            raise KisError("국내휴장일조회(CTCA0903R)는 모의투자를 지원하지 않습니다")
+        data = self._request(
+            "GET",
+            "/uapi/domestic-stock/v1/quotations/chk-holiday",
+            tr="holidays",
+            params={
+                "BASS_DT": reference.strftime("%Y%m%d"),
+                "CTX_AREA_NK": "",
+                "CTX_AREA_FK": "",
+            },
+        )
+        return data["output"]
 
     def get_balance(self) -> dict[str, Any]:
         """계좌 잔고: returns {"holdings": [...], "summary": {...}}.

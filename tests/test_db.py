@@ -19,6 +19,7 @@ NEW_TABLES = {
     "symbol_master",
     "stock_candles_1d",
     "stock_candles_1m",
+    "market_calendar",
     "watchlist_snapshots",
 }
 

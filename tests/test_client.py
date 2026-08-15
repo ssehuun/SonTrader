@@ -110,6 +110,49 @@ def test_get_intraday_candles_rejects_paper_trading_before_any_request(settings)
             client.get_intraday_candles("005930", datetime(2024, 11, 8, 14, 0, 0))
 
 
+def test_get_market_holidays_requests_real_tr_id_and_reference_date(settings):
+    from datetime import date
+
+    real_settings = replace(settings, paper=False)
+
+    def responder(request):
+        assert request.url.path == "/uapi/domestic-stock/v1/quotations/chk-holiday"
+        assert request.headers["tr_id"] == "CTCA0903R"
+        assert request.url.params["BASS_DT"] == "20221227"
+        return httpx.Response(
+            200,
+            json={
+                "rt_cd": "0",
+                "output": [
+                    {
+                        "bass_dt": "20221227",
+                        "wday_dvsn_cd": "03",
+                        "bzdy_yn": "Y",
+                        "tr_day_yn": "Y",
+                        "opnd_yn": "Y",
+                        "sttl_day_yn": "Y",
+                    }
+                ],
+            },
+        )
+
+    with make_client(real_settings, responder) as client:
+        rows = client.get_market_holidays(date(2022, 12, 27))
+    assert len(rows) == 1
+    assert rows[0]["opnd_yn"] == "Y"
+
+
+def test_get_market_holidays_rejects_paper_trading_before_any_request(settings):
+    from datetime import date
+
+    def responder(request):  # pragma: no cover - must never be reached
+        raise AssertionError("paper trading must not call KIS for this endpoint")
+
+    with make_client(settings, responder) as client:
+        with pytest.raises(KisError, match="모의투자"):
+            client.get_market_holidays(date(2022, 12, 27))
+
+
 def test_market_buy_order_uses_paper_tr_id(settings):
     def responder(request):
         assert request.url.path == "/uapi/domestic-stock/v1/trading/order-cash"

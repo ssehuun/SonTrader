@@ -229,6 +229,21 @@ stock_candles_1m = Table(
     Column("volume", BigInteger, nullable=False),
 )
 
+# 국내휴장일조회(CTCA0903R) 캐시 — KIS가 "가급적 1일 1회 호출"을 명시
+# 요청해서(원장서비스 영향) 매번 조회하지 않고 여기 저장해 재사용한다
+# (data/calendar.py).
+market_calendar = Table(
+    "market_calendar",
+    metadata,
+    Column("date", Date, primary_key=True),
+    Column(
+        "open_yn", String(1), nullable=False, comment="개장일여부(opnd_yn) — 주문 가능 여부 기준"
+    ),
+    Column("business_day_yn", String(1), nullable=False, comment="영업일여부(bzdy_yn)"),
+    Column("trading_day_yn", String(1), nullable=False, comment="거래일여부(tr_day_yn)"),
+    Column("settlement_day_yn", String(1), nullable=False, comment="결제일여부(sttl_day_yn)"),
+)
+
 
 def get_engine(database_url: str) -> Engine:
     return sa.create_engine(database_url, pool_pre_ping=True)
