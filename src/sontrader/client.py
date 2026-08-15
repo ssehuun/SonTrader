@@ -12,7 +12,7 @@ from typing import Any
 
 import httpx
 
-from sontrader.auth import TokenManager
+from sontrader.auth import KisError, TokenManager, raise_for_kis_error
 from sontrader.config import Settings
 
 # endpoint key -> (real tr_id, paper tr_id)
@@ -36,8 +36,7 @@ ORDER_DVSN_LIMIT = "00"  # 지정가
 ORDER_DVSN_MARKET = "01"  # 시장가
 
 
-class KisError(RuntimeError):
-    """KIS answered with rt_cd != 0 (API-level failure)."""
+__all__ = ["KisClient", "KisError"]
 
 
 class KisClient:
@@ -250,28 +249,7 @@ class KisClient:
             "custtype": "P",
         }
         response = self._http.request(method, path, headers=headers, params=params, json=json)
-        # KIS는 자신이 진단한 오류도 HTTP 500과 함께 rt_cd/msg_cd/msg1 본문으로
-        # 돌려준다(예: EGW02007 "해당 앱키는 모의투자용 앱키가 아닙니다").
-        # raise_for_status()를 먼저 부르면 그 메시지가 통째로 사라지고, 대신
-        # httpx 예외 메시지에 CANO가 들어간 전체 URL이 로그로 새어 나간다.
-        # 그래서 본문을 먼저 본다 — 상태 코드는 KIS의 진단보다 정보가 적다.
-        data = self._error_payload(response)
-        if data is not None:
-            raise KisError(f"{data.get('msg_cd')}: {data.get('msg1', '').strip()}")
+        # 상태 코드보다 본문을 먼저 본다 — 이유는 raise_for_kis_error() 참고.
+        raise_for_kis_error(response)
         response.raise_for_status()
         return response.json()
-
-    @staticmethod
-    def _error_payload(response: httpx.Response) -> dict[str, Any] | None:
-        """KIS가 rt_cd로 실패를 알린 경우 그 본문을, 아니면 None을 돌려준다.
-
-        rt_cd가 없는 응답(게이트웨이 HTML 오류 등)은 KIS가 만든 것이 아니므로
-        판단하지 않고 호출자가 raise_for_status()로 처리하게 둔다.
-        """
-        try:
-            payload = response.json()
-        except ValueError:
-            return None
-        if not isinstance(payload, dict) or "rt_cd" not in payload:
-            return None
-        return payload if payload["rt_cd"] != "0" else None

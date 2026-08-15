@@ -20,6 +20,40 @@ _EXPIRY_MARGIN = timedelta(minutes=10)
 _EXPIRY_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
+class KisError(RuntimeError):
+    """KIS가 본문으로 거절 사유를 알린 요청 (API-level failure).
+
+    ``client.py``에서 재노출한다 — 호출자 대부분은 클라이언트만 알면 되고,
+    여기 있는 이유는 인증 계층이 클라이언트를 import할 수 없어서다.
+    """
+
+
+def raise_for_kis_error(response: httpx.Response) -> None:
+    """KIS가 본문에 담아 보낸 실패를 ``KisError``로 올린다.
+
+    KIS는 자신이 진단한 오류도 HTTP 4xx/5xx와 함께 본문에 실어 보낸다.
+    ``raise_for_status()``를 먼저 부르면 그 진단이 통째로 사라지고, 대신
+    httpx 예외 메시지에 CANO가 든 전체 URL이 로그로 새어 나간다.
+
+    본문 형식이 엔드포인트마다 다르다 — 토큰·접속키 발급은
+    ``error_code``/``error_description``, 나머지 업무 API는
+    ``rt_cd``/``msg_cd``/``msg1``을 쓴다. 둘 다 아닌 응답(게이트웨이가 만든
+    HTML 오류 등)은 KIS가 만든 것이 아니므로 판단하지 않고 그냥 돌아간다 —
+    호출자가 ``raise_for_status()``로 처리한다.
+    """
+    try:
+        payload = response.json()
+    except ValueError:
+        return
+    if not isinstance(payload, dict):
+        return
+    if payload.get("error_code"):
+        description = str(payload.get("error_description", "")).strip()
+        raise KisError(f"{payload['error_code']}: {description}")
+    if payload.get("rt_cd", "0") != "0":
+        raise KisError(f"{payload.get('msg_cd')}: {str(payload.get('msg1', '')).strip()}")
+
+
 class TokenManager:
     def __init__(self, settings: Settings, http: httpx.Client):
         self._settings = settings
@@ -52,6 +86,7 @@ class TokenManager:
                 "appsecret": self._settings.app_secret,
             },
         )
+        raise_for_kis_error(response)
         response.raise_for_status()
         payload = response.json()
         token = payload["access_token"]
@@ -120,6 +155,7 @@ class ApprovalKeyManager:
                 "secretkey": self._settings.app_secret,
             },
         )
+        raise_for_kis_error(response)
         response.raise_for_status()
         key = response.json()["approval_key"]
         self._write_cache(key)

@@ -1,8 +1,9 @@
 import json
 
 import httpx
+import pytest
 
-from sontrader.auth import ApprovalKeyManager, TokenManager
+from sontrader.auth import ApprovalKeyManager, KisError, TokenManager
 from tests.conftest import TOKEN_RESPONSE
 
 
@@ -125,3 +126,52 @@ def test_approval_key_cache_from_other_environment_is_ignored(settings):
 
     assert manager.get_key() == "test-approval-key"
     assert len(calls) == 1
+
+
+def test_token_issuance_error_body_survives_403(settings):
+    """토큰 발급 유량 제한(1분 1회)에 걸리면 KIS는 403 + error_code로 답한다.
+
+    실전 전환 직후 캐시를 지우고 재발급을 시도했을 때 실제로 이 응답을
+    받았고, 당시엔 raise_for_status()가 먼저 터져 원인이 보이지 않았다.
+    발급 실패는 진단이 가장 필요한 지점이다 — 유량 제한인지, 앱키가
+    틀렸는지, 시크릿이 만료됐는지에 따라 대응이 완전히 다르다.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            403,
+            json={
+                "error_code": "EGW00133",
+                "error_description": "접근토큰 발급 잠시 후 다시 시도하세요(1분당 1회)",
+            },
+        )
+
+    http = httpx.Client(base_url=settings.base_url, transport=httpx.MockTransport(handler))
+    manager = TokenManager(settings, http)
+
+    with pytest.raises(KisError, match="EGW00133"):
+        manager.get_token()
+
+
+def test_approval_key_issuance_error_body_survives(settings):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            403, json={"error_code": "EGW00133", "error_description": "잠시 후 다시 시도하세요"}
+        )
+
+    http = httpx.Client(base_url=settings.base_url, transport=httpx.MockTransport(handler))
+
+    with pytest.raises(KisError, match="EGW00133"):
+        ApprovalKeyManager(settings, http).get_key()
+
+
+def test_non_kis_http_error_still_raises_http_status_error(settings):
+    """error_code도 rt_cd도 없는 응답은 KIS가 만든 것이 아니다."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(502, text="<html>bad gateway</html>")
+
+    http = httpx.Client(base_url=settings.base_url, transport=httpx.MockTransport(handler))
+
+    with pytest.raises(httpx.HTTPStatusError):
+        TokenManager(settings, http).get_token()
