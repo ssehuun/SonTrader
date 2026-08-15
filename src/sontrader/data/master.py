@@ -11,15 +11,17 @@ KIS가 배포하는 .mst 마스터 파일을 내려받아 ``symbol_master``에 u
 
 from __future__ import annotations
 
+import dataclasses
 import io
 import zipfile
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import date, datetime
 
 import httpx
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
+from sontrader.core.filters import StructuralInfo, is_collectable
 from sontrader.data import db
 
 MASTER_URLS = {
@@ -91,8 +93,22 @@ _FIELD_MAP = {
     "prev_volume": "전일거래량",
     "op_profit": "영업이익",
     "market_cap": "시가총액",
+    "listing_date": "상장일자",
+    "shares_outstanding": "상장주수",
+    "sector_large": "지수업종대분류",
+    "sector_mid": "지수업종중분류",
+    "sector_small": "지수업종소분류",
+    "trading_unit": "매매수량단위",
 }
-_INT_COLUMNS = {"base_price", "prev_volume", "op_profit", "market_cap"}
+_INT_COLUMNS = {
+    "base_price",
+    "prev_volume",
+    "op_profit",
+    "market_cap",
+    "shares_outstanding",
+    "trading_unit",
+}
+_DATE_COLUMNS = {"listing_date"}
 
 
 @dataclass(frozen=True)
@@ -114,6 +130,12 @@ class MasterRow:
     prev_volume: int | None
     op_profit: int | None
     market_cap: int | None
+    listing_date: date | None
+    shares_outstanding: int | None
+    sector_large: str
+    sector_mid: str
+    sector_small: str
+    trading_unit: int | None
 
 
 def _field_slices(widths: list[int], names: list[str]) -> dict[str, slice]:
@@ -146,7 +168,12 @@ def parse_master(text: str, market: str) -> list[MasterRow]:
         values: dict[str, object] = {}
         for column, field_name in _FIELD_MAP.items():
             raw = tail[slices[field_name]].strip()
-            values[column] = _to_int(raw) if column in _INT_COLUMNS else raw
+            if column in _INT_COLUMNS:
+                values[column] = _to_int(raw)
+            elif column in _DATE_COLUMNS:
+                values[column] = _to_date(raw)
+            else:
+                values[column] = raw
         rows.append(MasterRow(symbol=symbol, name=name, market=market, **values))
     return rows
 
@@ -154,6 +181,14 @@ def parse_master(text: str, market: str) -> list[MasterRow]:
 def _to_int(raw: str) -> int | None:
     try:
         return int(raw)
+    except ValueError:
+        return None
+
+
+def _to_date(raw: str) -> date | None:
+    """YYYYMMDD → date. 미상장·불량 값은 None (필터가 fail-closed로 처리한다)."""
+    try:
+        return datetime.strptime(raw, "%Y%m%d").date()
     except ValueError:
         return None
 
@@ -199,12 +234,19 @@ def upsert_master(engine: Engine, rows: list[MasterRow], updated_at: datetime) -
     return len(rows), len(stale)
 
 
-def load_stock_symbols(engine: Engine) -> list[str]:
-    """일봉 수집 대상: 주권(group_code='ST')만. ETF/ELW 등은 제외."""
+def load_stock_symbols(engine: Engine, *, today: date) -> list[str]:
+    """일봉 수집 대상. `core.filters.is_collectable()`이 판정한다 —
+    구조적 속성만 보므로 백테스트에 편향이 들어가지 않는다(그 함수의
+    모듈 독스트링 참고). 시변 상태(관리종목·거래정지 등)로 거르는 것은
+    유니버스 산출 시점의 `is_tradeable()` 몫이다.
+
+    컬럼 목록은 StructuralInfo 필드에서 파생 — 둘이 어긋날 수 없다.
+    """
+    columns = [db.symbol_master.c[field.name] for field in dataclasses.fields(StructuralInfo)]
     with engine.connect() as conn:
-        result = conn.execute(
-            sa.select(db.symbol_master.c.symbol)
-            .where(db.symbol_master.c.group_code == "ST")
-            .order_by(db.symbol_master.c.symbol)
-        )
-        return [row.symbol for row in result]
+        rows = conn.execute(sa.select(*columns).order_by(db.symbol_master.c.symbol))
+        return [
+            row.symbol
+            for row in rows
+            if is_collectable(StructuralInfo(**row._mapping), today=today)
+        ]

@@ -193,7 +193,8 @@ def _run_collect_prices(limit: int | None, pace: float | None, lookback_days: in
     try:
         for action in migrate(engine):
             print(action)
-        symbols = load_stock_symbols(engine)
+        today = _now_kst().date()
+        symbols = load_stock_symbols(engine, today=today)
         if not symbols:
             print(
                 "error: symbol_master is empty — run `sontrader collect-master` first.",
@@ -214,7 +215,7 @@ def _run_collect_prices(limit: int | None, pace: float | None, lookback_days: in
                 engine,
                 client,
                 symbols,
-                today=_now_kst().date(),
+                today=today,
                 lookback_days=lookback_days,
                 pace_seconds=pace_seconds,
                 on_progress=on_progress,

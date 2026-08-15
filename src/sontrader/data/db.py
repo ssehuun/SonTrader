@@ -175,6 +175,14 @@ symbol_master = Table(
     Column("prev_volume", BigInteger, comment="전일 거래량"),
     Column("op_profit", BigInteger, comment="영업이익 (원본 단위 그대로)"),
     Column("market_cap", BigInteger, comment="시가총액 (억)"),
+    # --- 구조적(시간 불변) 속성. 시변 플래그와 달리 과거 시점에 대해서도
+    # 유효해서, 수집 단계 필터에 써도 생존/전방 편향이 생기지 않는다.
+    Column("listing_date", Date, comment="상장일자 — 모멘텀 최소 이력 판정용"),
+    Column("shares_outstanding", BigInteger, comment="상장주수"),
+    Column("sector_large", String(4), comment="지수업종 대분류"),
+    Column("sector_mid", String(4), comment="지수업종 중분류"),
+    Column("sector_small", String(4), comment="지수업종 소분류"),
+    Column("trading_unit", Integer, comment="매매수량단위 — 주문 수량이 이 배수여야 한다"),
     Column("updated_at", DateTime, nullable=False),
 )
 

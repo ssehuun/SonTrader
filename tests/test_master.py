@@ -2,7 +2,7 @@
 
 import io
 import zipfile
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 import httpx
 import sqlalchemy as sa
@@ -34,7 +34,14 @@ SAMSUNG_FIELDS = dict(
     전일거래량="12345678",
     영업이익="651977",
     시가총액="4200000",
+    상장일자="19750611",
+    상장주수="5969782550",
+    지수업종대분류="0001",
+    매매수량단위="00001",
 )
+
+# 오늘. 상장일자 필터가 날짜에 의존하므로 테스트는 시각을 주입한다.
+TODAY = date(2026, 8, 16)
 
 
 def test_parse_kospi_master_extracts_fields():
@@ -49,6 +56,18 @@ def test_parse_kospi_master_extracts_fields():
     assert row.suspended_yn == "N"
     assert row.prev_volume == 12345678
     assert row.market_cap == 4200000
+    assert row.listing_date == date(1975, 6, 11)
+    assert row.shares_outstanding == 5969782550
+    assert row.sector_large == "0001"
+    assert row.trading_unit == 1
+
+
+def test_parse_tolerates_missing_listing_date():
+    """상장일자가 비어 있어도 파싱은 성공하고 None이 된다 — 판정은 필터 몫."""
+    fields = {**SAMSUNG_FIELDS, "상장일자": "        "}
+    (row,) = master.parse_master(build_line("KOSPI", "005930", "삼성전자", **fields), "KOSPI")
+
+    assert row.listing_date is None
 
 
 def test_parse_kosdaq_master_uses_same_field_names():
@@ -143,13 +162,42 @@ def test_upsert_master_prunes_delisted_symbols_of_same_market(db_engine):
     assert remaining == {"005930", "247540"}  # 다른 시장(KOSDAQ)은 건드리지 않는다
 
 
-def test_load_stock_symbols_returns_only_common_stocks(db_engine):
-    db.migrate(db_engine)
-    stock = master.parse_master(
-        build_line("KOSPI", "005930", "삼성전자", **SAMSUNG_FIELDS), "KOSPI"
-    )[0]
-    etf_fields = {**SAMSUNG_FIELDS, "그룹코드": "EF"}
-    etf = master.parse_master(build_line("KOSPI", "069500", "KODEX200", **etf_fields), "KOSPI")[0]
-    master.upsert_master(db_engine, [stock, etf], updated_at=datetime(2026, 8, 3))
+def _row(symbol, name, **overrides):
+    fields = {**SAMSUNG_FIELDS, **overrides}
+    return master.parse_master(build_line("KOSPI", symbol, name, **fields), "KOSPI")[0]
 
-    assert master.load_stock_symbols(db_engine) == ["005930"]
+
+def test_load_stock_symbols_applies_structural_filter(db_engine):
+    """수집 대상은 구조적 속성으로만 걸러진다 — 시변 상태는 보지 않는다.
+
+    관리종목은 오늘 값일 뿐 과거엔 정상이었을 수 있으므로, 수집 단계에서
+    빼면 백테스트에 생존 편향이 들어간다. 그래서 여기서는 통과해야 한다.
+    """
+    db.migrate(db_engine)
+    rows = [
+        _row("005930", "삼성전자"),
+        _row("069500", "KODEX200", 그룹코드="EF"),
+        _row("005935", "삼성전자우", 우선주="1"),
+        _row("123456", "교보18호스팩", SPAC="Y"),
+        _row("234567", "신규상장사", 상장일자="20260301"),  # 상장 400일 미만
+        _row("345678", "상장일불명", 상장일자="        "),
+        _row("456789", "관리종목이지만수집", 관리종목="Y"),
+    ]
+    master.upsert_master(db_engine, rows, updated_at=datetime(2026, 8, 3))
+
+    assert master.load_stock_symbols(db_engine, today=TODAY) == ["005930", "456789"]
+
+
+def test_load_stock_symbols_boundary_of_listing_age(db_engine):
+    """상장 400일 경계: 정확히 400일이면 통과, 399일이면 제외."""
+    db.migrate(db_engine)
+    master.upsert_master(
+        db_engine,
+        [
+            _row("111111", "딱400일", 상장일자=(TODAY - timedelta(days=400)).strftime("%Y%m%d")),
+            _row("222222", "399일", 상장일자=(TODAY - timedelta(days=399)).strftime("%Y%m%d")),
+        ],
+        updated_at=datetime(2026, 8, 3),
+    )
+
+    assert master.load_stock_symbols(db_engine, today=TODAY) == ["111111"]

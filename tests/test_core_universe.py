@@ -1,8 +1,16 @@
 """core 순수 함수 테스트 — 모멘텀, 히스테리시스, 방어 필터."""
 
+import dataclasses
+from datetime import date, timedelta
+
 import pytest
 
-from sontrader.core.filters import SecurityInfo, is_tradeable
+from sontrader.core.filters import (
+    SecurityInfo,
+    StructuralInfo,
+    is_collectable,
+    is_tradeable,
+)
 from sontrader.core.momentum import momentum_score
 from sontrader.core.watchlist import build_watchlist
 
@@ -126,3 +134,58 @@ def test_null_safety_flags_fail_closed():
     assert is_tradeable(make_info(suspended_yn=None)) is False
     assert is_tradeable(make_info(managed_yn=None)) is False
     assert is_tradeable(make_info(liquidation_yn=None)) is False
+
+
+# --- is_collectable (구조적 필터) --------------------------------------------
+
+TODAY = date(2026, 8, 16)
+
+
+def structural(**overrides):
+    base = dict(
+        symbol="005930",
+        name="삼성전자",
+        group_code="ST",
+        pref_share_code="0",
+        spac_yn="N",
+        listing_date=date(1975, 6, 11),
+    )
+    return StructuralInfo(**{**base, **overrides})
+
+
+def test_collectable_accepts_ordinary_long_listed_stock():
+    assert is_collectable(structural(), today=TODAY) is True
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"group_code": "EF"},  # ETF
+        {"group_code": "EN"},  # ETN
+        {"pref_share_code": "1"},  # 우선주
+        {"spac_yn": "Y"},
+        {"name": "교보18호스팩"},
+        {"listing_date": None},  # 상장일 불명 → fail-closed
+        {"listing_date": date(2026, 3, 1)},  # 상장 400일 미만
+    ],
+)
+def test_collectable_rejects_structural_exclusions(overrides):
+    assert is_collectable(structural(**overrides), today=TODAY) is False
+
+
+@pytest.mark.parametrize("days,expected", [(400, True), (399, False)])
+def test_collectable_listing_age_boundary(days, expected):
+    info = structural(listing_date=TODAY - timedelta(days=days))
+    assert is_collectable(info, today=TODAY) is expected
+
+
+def test_collectable_ignores_time_varying_state():
+    """관리종목·거래정지 같은 시변 상태는 StructuralInfo에 아예 없다.
+
+    수집 단계에서 그것들로 거르면 백테스트에 생존 편향이 들어가기 때문이다
+    (filters.py 모듈 독스트링 참고). 타입으로 실수를 막는다.
+    """
+    fields = {f.name for f in dataclasses.fields(StructuralInfo)}
+    assert fields.isdisjoint(
+        {"managed_yn", "suspended_yn", "market_warning_code", "op_profit", "cap_scale_code"}
+    )
