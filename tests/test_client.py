@@ -239,3 +239,37 @@ def test_invalid_side_is_rejected_before_any_request(settings):
     with make_client(settings, responder) as client:
         with pytest.raises(ValueError, match="side"):
             client.order("short", "005930", 1)
+
+
+def test_kis_error_body_survives_http_500(settings):
+    """KIS는 자신의 진단(EGW02007 등)을 HTTP 500 본문에 담아 보낸다.
+
+    실제로 모의투자 도메인에 실전 앱키로 잔고를 조회했을 때 이 응답을
+    받았고, 당시에는 raise_for_status()가 먼저 터지면서 원인 메시지 대신
+    계좌번호가 박힌 URL만 남았다.
+    """
+
+    def responder(request):
+        return httpx.Response(
+            500,
+            json={
+                "rt_cd": "1",
+                "msg_cd": "EGW02007",
+                "msg1": "해당 앱키는 모의투자용 앱키가 아닙니다.",
+            },
+        )
+
+    with make_client(settings, responder) as client:
+        with pytest.raises(KisError, match="EGW02007: 해당 앱키는 모의투자용 앱키가 아닙니다."):
+            client.get_balance()
+
+
+def test_non_kis_http_error_still_raises_http_status_error(settings):
+    """rt_cd가 없는 응답은 KIS가 만든 것이 아니다 — 판단하지 않고 넘긴다."""
+
+    def responder(request):
+        return httpx.Response(502, text="<html>gateway timeout</html>")
+
+    with make_client(settings, responder) as client:
+        with pytest.raises(httpx.HTTPStatusError):
+            client.get_quote("005930")
