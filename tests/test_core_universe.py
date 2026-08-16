@@ -8,6 +8,7 @@ import pytest
 from sontrader.core.filters import (
     SecurityInfo,
     StructuralInfo,
+    has_recent_halt,
     is_collectable,
     is_tradeable,
 )
@@ -189,3 +190,38 @@ def test_collectable_ignores_time_varying_state():
     assert fields.isdisjoint(
         {"managed_yn", "suspended_yn", "market_warning_code", "op_profit", "cap_scale_code"}
     )
+
+
+# --- has_recent_halt (거래정지 필터) -----------------------------------------
+
+
+def test_halt_filter_accepts_uninterrupted_trading():
+    assert has_recent_halt([1000] * 20, bars=20) is False
+
+
+@pytest.mark.parametrize("position", [0, 10, 19])
+def test_halt_filter_rejects_any_zero_volume_in_window(position):
+    """창 안 어디에 있든 정지일 하나면 제외한다 — fail-closed."""
+    volumes = [1000] * 20
+    volumes[position] = 0
+    assert has_recent_halt(volumes, bars=20) is True
+
+
+def test_halt_filter_ignores_halts_outside_the_window():
+    """정지 후 창 길이만큼 정상 거래하면 복귀한다."""
+    volumes = [0] * 5 + [1000] * 20
+    assert has_recent_halt(volumes, bars=20) is False
+
+
+def test_halt_filter_rejects_missing_volume():
+    """수집 누락(None)을 정상으로 보지 않는다."""
+    assert has_recent_halt([1000] * 19 + [None], bars=20) is True
+
+
+def test_halt_filter_rejects_empty_series():
+    assert has_recent_halt([], bars=20) is True
+
+
+def test_halt_filter_uses_only_the_tail():
+    """창보다 짧은 이력은 있는 만큼만 본다 (신규 상장은 모멘텀이 따로 거른다)."""
+    assert has_recent_halt([1000, 1000], bars=20) is False

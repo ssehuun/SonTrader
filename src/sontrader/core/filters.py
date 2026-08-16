@@ -26,10 +26,17 @@ KOSPI는 영업이익 양수 요구(KOSDAQ은 성장주 특성상 미적용), �
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
 
 MIN_BASE_PRICE = 1000  # 동전주 제외 하한 (KRW)
+
+# 거래정지 판정 창 (거래일). 유동성 필터와 같은 20으로 맞춘다 — "최근 20거래일이
+# 정상적으로 거래됐는가"라는 한 가지 질문을 두 각도(정지 여부·거래대금)에서
+# 보는 것이라, 창이 다르면 통과 기준이 어긋난다. 정지 해제 직후는 변동성이
+# 크므로 바로 복귀시키지 않는 효과도 있다. 설계 8절 미확정 파라미터.
+HALT_LOOKBACK_BARS = 20
 
 # 모멘텀이 요구하는 이력은 `lookback + 1` = 253 거래일이다 — skip은 룩백 창
 # 안쪽 시점이라 더해지지 않는다(`momentum.momentum_score` 참고). 거래일은 연
@@ -100,6 +107,29 @@ def is_collectable(
     if info.listing_date is None:
         return False
     return (today - info.listing_date).days >= min_listing_days
+
+
+def has_recent_halt(volumes: Sequence[int | None], *, bars: int = HALT_LOOKBACK_BARS) -> bool:
+    """최근 `bars`개 봉에 거래정지일이 섞여 있는가.
+
+    KIS 일별시세는 거래정지일에도 봉을 준다 — **거래량 0, OHLC는 전부 직전
+    종가**로 채워서. 그래서 "봉이 없으면 정지"라는 판정은 성립하지 않고,
+    신선도 게이트(마지막 봉이 오래됐는지)도 영원히 발동하지 않는다. 실측:
+    전체 봉의 3.2%, 2,463종목 중 433종목에 이런 봉이 있다.
+
+    거래량 0을 판별자로 쓰는 이유는 그것이 **그날의 사실**이기 때문이다.
+    `symbol_master.suspended_yn`은 오늘 값뿐이라 과거 시점에 대해 거짓이고,
+    수집·백테스트에 쓰면 생존 편향이 들어간다(모듈 상단 참고).
+
+    유동성 필터만으로는 부족하다 — 20일 중 1~2일 정지는 평균 거래대금을
+    10%쯤 낮출 뿐이라 하한을 통과한다.
+
+    값이 None이면(수집 누락) 정상으로 보지 않는다 — fail-closed.
+    """
+    recent = list(volumes[-bars:])
+    if not recent:
+        return True
+    return any(v is None or v <= 0 for v in recent)
 
 
 def is_tradeable(info: SecurityInfo, *, min_base_price: int = MIN_BASE_PRICE) -> bool:

@@ -30,6 +30,17 @@
   파라미터라 아직 없다 — 실제 거래일 캘린더가 정해지면 이 근사를 교체해야
   한다(휴장일이 껴 있으면 실제보다 정산이 하루이틀 빨리 잡힐 수 있다).
 
+## 거래정지일에는 체결하지 않는다
+
+KIS 일별시세는 거래정지일에도 봉을 준다 — **거래량 0, OHLC는 전부 직전
+종가**. 그 시가에 체결시키면 현실에서 불가능한 거래가 성과로 잡히고, 정지 중
+스톱이 발동하면 하락이 반영되기 전 가격에 팔려 손실이 과소평가된다. 그래서
+`_next_bar()`가 거래량 0인 봉을 건너뛰고 재개 봉을 찾는다 — 정지 중에 낸
+시장가 주문이 재개 시점에 집행되는 현실과 같다.
+
+진입 쪽은 `data/universe.py`의 거래정지 필터가 먼저 막지만, 이미 보유 중인
+종목이 정지되는 경우는 여기서만 처리할 수 있다.
+
 ## 다루지 않는 것
 
 - **지정가 주문.** `core/diff.py`는 시장가만 만든다(진입도 청산도 시장가 —
@@ -143,10 +154,28 @@ class SimBroker:
         return self._fill_sell(order, next_bar)
 
     def _next_bar(self, symbol: str, after: datetime) -> Bar | None:
+        """`after` 이후 첫 **거래 가능한** 봉.
+
+        거래량 0인 봉은 건너뛴다. KIS 일별시세는 거래정지일에도 봉을 주는데
+        (거래량 0, OHLC는 전부 직전 종가) 그 시가에 체결시키면 현실에서
+        불가능한 거래가 성과로 잡힌다. 실측으로 전체 봉의 3.2%가 이런 봉이고,
+        2,463종목 중 433종목에 정지 이력이 있다(평균 61일, 최대 334일).
+
+        건너뛴 결과는 "재개일 시가에 체결"이 되는데, 이게 현실과 맞다 — 정지
+        중에 낸 시장가 주문은 재개 시점에 집행된다. 정지 중 스톱이 발동해도
+        정지 직전 가격이 아니라 재개가로 팔린다는 뜻이고, 그래서 백테스트가
+        손실을 과소평가하지 않는다.
+
+        재개 봉이 끝내 없으면(상장폐지·데이터 끝) None → 호출자가 UNKNOWN.
+        """
         timestamps = self._timestamps.get(symbol, [])
-        idx = bisect.bisect_right(timestamps, after)
         bars = self._bars.get(symbol, [])
-        return bars[idx] if idx < len(bars) else None
+        idx = bisect.bisect_right(timestamps, after)
+        while idx < len(bars):
+            if bars[idx].volume > 0:
+                return bars[idx]
+            idx += 1
+        return None
 
     def _fill_buy(self, order: Order, bar: Bar) -> OrderResult:
         price = bar.open * (1.0 + self._config.slippage_bps / 10_000)

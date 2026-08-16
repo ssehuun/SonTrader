@@ -18,7 +18,9 @@ DAY0 = datetime(2026, 3, 2)
 ZERO_COST = SimBrokerConfig(commission_rate=0.0, tax_rate=0.0, slippage_bps=0.0)
 
 
-def make_bar(symbol: str, day_offset: int, *, open: int, close: int) -> Bar:  # noqa: A002
+def make_bar(  # noqa: A002
+    symbol: str, day_offset: int, *, open: int, close: int, volume: int = 1_000
+) -> Bar:
     ts = DAY0 + timedelta(days=day_offset)
     return Bar(
         symbol=symbol,
@@ -27,8 +29,13 @@ def make_bar(symbol: str, day_offset: int, *, open: int, close: int) -> Bar:  # 
         high=max(open, close),
         low=min(open, close),
         close=close,
-        volume=1_000,
+        volume=volume,
     )
+
+
+def halted_bar(symbol: str, day_offset: int, *, close: int) -> Bar:
+    """거래정지일 봉 — KIS가 실제로 주는 모양(거래량 0, OHLC 전부 직전 종가)."""
+    return make_bar(symbol, day_offset, open=close, close=close, volume=0)
 
 
 def make_order(
@@ -359,3 +366,89 @@ def test_invalid_config_is_rejected(kwargs):
 def test_negative_initial_cash_is_rejected():
     with pytest.raises(ValueError):
         SimBroker({SYMBOL: SERIES}, initial_cash=-1)
+
+
+# --- 거래정지 (거래량 0인 봉) -------------------------------------------------
+
+
+def test_halted_bars_are_not_filled_at_and_execution_waits_for_resumption():
+    """정지 중 청산은 정지 직전 가격이 아니라 **재개가**에 체결된다.
+
+    이게 어긋나면 백테스트가 손실을 구조적으로 과소평가한다 — 정지는 보통
+    악재로 걸리고 재개 시 급락하는데, 정지일 봉의 시가는 하락 반영 전
+    직전 종가이기 때문이다.
+    """
+    bars = {
+        SYMBOL: [
+            make_bar(SYMBOL, 0, open=1_000, close=1_000),
+            make_bar(SYMBOL, 1, open=1_000, close=1_000),
+            halted_bar(SYMBOL, 2, close=1_000),
+            halted_bar(SYMBOL, 3, close=1_000),
+            make_bar(SYMBOL, 4, open=600, close=600),  # 재개 — 급락
+        ]
+    }
+    broker = SimBroker(bars=bars, initial_cash=1_000_000, config=ZERO_COST)
+    broker.submit([make_order(SYMBOL, Side.BUY, 10, DAY0)], now=DAY0)
+
+    ts = DAY0 + timedelta(days=1)
+    (result,) = broker.submit([make_order(SYMBOL, Side.SELL, 10, ts)], now=ts)
+
+    assert result.status is OrderStatus.FILLED
+    assert result.fills[0].price == 600  # 정지 직전 1,000이 아니라 재개가
+    assert result.fills[0].ts == DAY0 + timedelta(days=4)
+
+
+def test_buy_also_waits_for_resumption():
+    bars = {
+        SYMBOL: [
+            make_bar(SYMBOL, 0, open=1_000, close=1_000),
+            halted_bar(SYMBOL, 1, close=1_000),
+            make_bar(SYMBOL, 2, open=1_200, close=1_200),
+        ]
+    }
+    broker = SimBroker(bars=bars, initial_cash=1_000_000, config=ZERO_COST)
+
+    (result,) = broker.submit([make_order(SYMBOL, Side.BUY, 10, DAY0)], now=DAY0)
+
+    assert result.fills[0].price == 1_200
+
+
+def test_settlement_is_scheduled_from_the_resumption_bar():
+    """정산일도 재개일 기준이어야 한다 — 정지 중에 대금이 들어오면 안 된다."""
+    bars = {
+        SYMBOL: [
+            make_bar(SYMBOL, 0, open=1_000, close=1_000),
+            halted_bar(SYMBOL, 1, close=1_000),
+            halted_bar(SYMBOL, 2, close=1_000),
+            make_bar(SYMBOL, 3, open=900, close=900),
+        ]
+    }
+    broker = SimBroker(bars=bars, initial_cash=1_000_000, config=ZERO_COST)
+    broker.submit([make_order(SYMBOL, Side.BUY, 10, DAY0)], now=DAY0)
+    cash_after_buy = broker.cash()
+
+    broker.submit([make_order(SYMBOL, Side.SELL, 10, DAY0)], now=DAY0)
+    assert broker.pending_settlement == 9_000
+
+    # 재개일(D+3) + 2일 = D+5에 정산. D+4에는 아직 안 들어온다.
+    broker.submit([], now=DAY0 + timedelta(days=4))
+    assert broker.cash() == cash_after_buy
+    broker.submit([], now=DAY0 + timedelta(days=5))
+    assert broker.cash() == cash_after_buy + 9_000
+
+
+def test_permanent_halt_yields_unknown_and_keeps_the_position():
+    """재개 봉이 끝내 없으면(상장폐지·데이터 끝) 체결을 지어내지 않는다."""
+    bars = {
+        SYMBOL: [
+            make_bar(SYMBOL, 0, open=1_000, close=1_000),
+            halted_bar(SYMBOL, 1, close=1_000),
+            halted_bar(SYMBOL, 2, close=1_000),
+        ]
+    }
+    broker = SimBroker(bars=bars, initial_cash=1_000_000, config=ZERO_COST)
+    broker.submit([make_order(SYMBOL, Side.BUY, 10, DAY0)], now=DAY0)
+    assert broker.positions() == []  # 매수도 체결 못 함 — 재개 봉이 없다
+
+    (result,) = broker.submit([make_order(SYMBOL, Side.BUY, 10, DAY0)], now=DAY0)
+    assert result.status is OrderStatus.UNKNOWN

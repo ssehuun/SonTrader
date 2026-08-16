@@ -8,14 +8,23 @@
    날짜). 벽시계 날짜가 아니라 데이터 날짜로 기록해야 주말/휴장일 실행이
    point-in-time 기록을 오염시키지 않고, 수집이 밀린 날은 밀린 날짜로
    정직하게 남는다.
-3. stock_candles_1d에서 기준일 이하의 종가·거래대금 로드 (룩백 하한까지만)
+3. stock_candles_1d에서 기준일 이하의 종가·거래대금·거래량 로드 (룩백 하한까지만)
 4. 신선도 게이트: 마지막 봉이 기준일에서 RECENCY_LIMIT_DAYS보다 오래된
    종목은 제외 (상장폐지·수집 실패 종목이 옛 점수로 순위에 남는 것 방지)
-5. 유동성 필터: 최근 20거래일 평균 거래대금 하한 (파라미터 — 설계 8절)
-6. 모멘텀 점수 (core.momentum) — 이력이 부족한 신규 상장은 자연 탈락
-7. 직전 스냅샷과 히스테리시스 (core.watchlist, 편입 50/이탈 70)
-8. watchlist_snapshots에 저장 — 같은 기준일 재실행이면 그날 행을 교체하므로,
+5. 거래정지 필터: 최근 20거래일에 거래량 0인 날이 있으면 제외.
+   **4번이 이걸 잡지 못한다** — KIS는 정지일에도 봉을 준다(거래량 0, OHLC는
+   직전 종가). 그래서 시계열이 멈추지 않고 신선도 게이트가 영영 발동하지
+   않는다. 실측: 전체 봉의 3.2%, 2,463종목 중 433종목이 해당.
+6. 유동성 필터: 최근 20거래일 평균 거래대금 하한 (파라미터 — 설계 8절).
+   5번과 겹쳐 보이지만 부족하다 — 20일 중 1~2일 정지는 평균을 10%쯤 낮출
+   뿐이라 하한을 통과한다.
+7. 모멘텀 점수 (core.momentum) — 이력이 부족한 신규 상장은 자연 탈락
+8. 직전 스냅샷과 히스테리시스 (core.watchlist, 편입 50/이탈 70)
+9. watchlist_snapshots에 저장 — 같은 기준일 재실행이면 그날 행을 교체하므로,
    입력 데이터가 같으면 결과도 같다 (검증 요건)
+
+이 필터는 **진입**만 막는다. 보유 중 정지된 종목의 청산은 체결 계층
+(`adapters/broker_sim.py`)이 다룬다 — 정지일 봉으로는 체결시키지 않는다.
 
 읽기는 저장된 캔들만 사용하므로 API 호출이 없다. 참고: 계획서 구조상 이
 조립 계층은 apps/에 속하지만, apps/가 생기는 단계(5단계 백테스트)까지는
@@ -31,7 +40,12 @@ from datetime import date, timedelta
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
-from sontrader.core.filters import SecurityInfo, is_tradeable
+from sontrader.core.filters import (
+    HALT_LOOKBACK_BARS,
+    SecurityInfo,
+    has_recent_halt,
+    is_tradeable,
+)
 from sontrader.core.momentum import LOOKBACK_BARS, SKIP_BARS, momentum_score
 from sontrader.core.watchlist import ENTER_RANK, EXIT_RANK, WatchlistEntry, build_watchlist
 from sontrader.data import db
@@ -52,7 +66,8 @@ class SnapshotResult:
     requested: date  # 호출자가 요청한 날짜
     entries: list[WatchlistEntry]
     candidates: int  # 마스터 필터 통과 종목 수
-    scored: int  # 모멘텀 점수가 산출된 종목 수 (신선도·유동성 통과)
+    scored: int  # 모멘텀 점수가 산출된 종목 수 (신선도·정지·유동성 통과)
+    halted: int = 0  # 최근 거래정지로 제외된 종목 수
 
 
 def build_snapshot(
@@ -64,6 +79,7 @@ def build_snapshot(
     lookback: int = LOOKBACK_BARS,
     skip: int = SKIP_BARS,
     min_avg_trade_value: int = MIN_AVG_TRADE_VALUE,
+    halt_lookback: int = HALT_LOOKBACK_BARS,
 ) -> SnapshotResult:
     candidates = _load_tradeable_symbols(engine)
     effective = _effective_date(engine, as_of)
@@ -74,12 +90,17 @@ def build_snapshot(
     series = _load_series(engine, candidates, effective, lookback)
 
     scores: dict[str, float] = {}
-    for symbol, (closes, trade_values, last_bar) in series.items():
-        if (effective - last_bar).days > RECENCY_LIMIT_DAYS:
+    halted = 0
+    for symbol, s in series.items():
+        if s.last_bar is None or (effective - s.last_bar).days > RECENCY_LIMIT_DAYS:
             continue  # 상장폐지·수집 실패로 시계열이 멈춘 종목
-        if not _is_liquid(trade_values, min_avg_trade_value):
+        # 거래정지는 신선도 게이트에 안 걸린다 — 정지일에도 봉이 오기 때문이다.
+        if has_recent_halt(s.volumes, bars=halt_lookback):
+            halted += 1
             continue
-        score = momentum_score(closes, lookback=lookback, skip=skip)
+        if not _is_liquid(s.trade_values, min_avg_trade_value):
+            continue
+        score = momentum_score(s.closes, lookback=lookback, skip=skip)
         if score is not None:
             scores[symbol] = score
 
@@ -92,6 +113,7 @@ def build_snapshot(
         entries=entries,
         candidates=len(candidates),
         scored=len(scores),
+        halted=halted,
     )
 
 
@@ -112,24 +134,43 @@ def _effective_date(engine: Engine, as_of: date) -> date | None:
         ).scalar_one()
 
 
+@dataclasses.dataclass
+class _Series:
+    """한 종목의 시계열 (날짜 오름차순)."""
+
+    closes: list[float] = dataclasses.field(default_factory=list)
+    trade_values: list[float] = dataclasses.field(default_factory=list)
+    volumes: list[int | None] = dataclasses.field(default_factory=list)
+    last_bar: date | None = None
+
+
 def _load_series(
     engine: Engine, symbols: list[str], as_of: date, lookback: int
-) -> dict[str, tuple[list[float], list[float], date]]:
-    """종목별 (종가, 거래대금, 마지막 봉 날짜) — 날짜 오름차순, 룩백 하한까지만.
+) -> dict[str, _Series]:
+    """종목별 시계열 — 날짜 오름차순, 룩백 하한까지만.
 
     하한을 두는 이유: 이력이 무한히 쌓여도 모멘텀은 마지막 lookback+1개만
     쓴다. 거래일→달력일 여유 환산(×1.7 + 40)으로 휴장을 흡수한다.
+
+    거래량도 함께 읽는다 — 거래정지일을 가려내는 유일한 근거다
+    (`core.filters.has_recent_halt` 참고).
     """
     if not symbols:
         return {}
     lower_bound = as_of - timedelta(days=int(lookback * 1.7) + 40)
     columns = db.stock_candles_1d.c
-    series: dict[str, tuple[list[float], list[float], date]] = {}
+    series: dict[str, _Series] = {}
     with engine.connect() as conn:
         for start in range(0, len(symbols), _SYMBOL_CHUNK):
             chunk = symbols[start : start + _SYMBOL_CHUNK]
             result = conn.execute(
-                sa.select(columns.symbol, columns.date, columns.close, columns.trade_value)
+                sa.select(
+                    columns.symbol,
+                    columns.date,
+                    columns.close,
+                    columns.trade_value,
+                    columns.volume,
+                )
                 .where(
                     columns.symbol.in_(chunk),
                     columns.date <= as_of,
@@ -137,11 +178,12 @@ def _load_series(
                 )
                 .order_by(columns.symbol, columns.date)
             )
-            for symbol, day, close, trade_value in result:
-                closes, trade_values, _ = series.get(symbol, ([], [], day))
-                closes.append(close)
-                trade_values.append(trade_value)
-                series[symbol] = (closes, trade_values, day)
+            for symbol, day, close, trade_value, volume in result:
+                entry = series.setdefault(symbol, _Series())
+                entry.closes.append(close)
+                entry.trade_values.append(trade_value)
+                entry.volumes.append(volume)
+                entry.last_bar = day
     return series
 
 
