@@ -175,11 +175,34 @@ def _run_collect_master() -> int:
         engine.dispose()
 
 
+def _empty_universe_hint(engine) -> str:
+    """수집 대상이 0종목일 때, 원인에 맞는 안내를 고른다.
+
+    마스터가 아예 없는 것과 구조적 필터가 전부 걸러낸 것은 대응이 다르다.
+    후자는 실제로 발생한다 — listing_date 컬럼을 추가한 마이그레이션 직후
+    collect-master를 다시 돌리기 전에는 전 행이 NULL이라 fail-closed로 전량
+    제외된다. 이때 "테이블이 비었다"고 안내하면 원인을 못 찾는다.
+    """
+    import sqlalchemy as sa
+
+    from sontrader.data.db import symbol_master
+
+    with engine.connect() as conn:
+        total = conn.execute(sa.select(sa.func.count()).select_from(symbol_master)).scalar_one()
+    if total == 0:
+        return "error: symbol_master is empty — run `sontrader collect-master` first."
+    return (
+        f"error: symbol_master에 {total}종목이 있지만 수집 대상이 0종목입니다 "
+        "— 구조적 필터(core.filters.is_collectable)가 전부 제외했습니다. "
+        "listing_date가 비어 있을 수 있으니 `sontrader collect-master`를 다시 실행하세요."
+    )
+
+
 def _run_collect_prices(limit: int | None, pace: float | None, lookback_days: int) -> int:
     from sqlalchemy.exc import SQLAlchemyError
 
     from sontrader.data.db import migrate
-    from sontrader.data.master import load_stock_symbols
+    from sontrader.data.master import load_collectable_symbols
     from sontrader.data.prices import collect_daily_all
 
     try:
@@ -194,12 +217,12 @@ def _run_collect_prices(limit: int | None, pace: float | None, lookback_days: in
         for action in migrate(engine):
             print(action)
         today = _now_kst().date()
-        symbols = load_stock_symbols(engine, today=today)
+        symbols = load_collectable_symbols(engine, today=today)
         if not symbols:
-            print(
-                "error: symbol_master is empty — run `sontrader collect-master` first.",
-                file=sys.stderr,
-            )
+            # "테이블이 비었다"와 "필터가 전부 걸렀다"는 대응이 다르다.
+            # 후자는 마이그레이션으로 listing_date를 추가한 직후 collect-master를
+            # 아직 안 돌린 상태에서 실제로 발생한다(전 행 NULL → fail-closed).
+            print(_empty_universe_hint(engine), file=sys.stderr)
             return 2
         if limit is not None:
             symbols = symbols[:limit]

@@ -234,7 +234,7 @@ def upsert_master(engine: Engine, rows: list[MasterRow], updated_at: datetime) -
     return len(rows), len(stale)
 
 
-def load_stock_symbols(engine: Engine, *, today: date) -> list[str]:
+def load_collectable_symbols(engine: Engine, *, today: date) -> list[str]:
     """일봉 수집 대상. `core.filters.is_collectable()`이 판정한다 —
     구조적 속성만 보므로 백테스트에 편향이 들어가지 않는다(그 함수의
     모듈 독스트링 참고). 시변 상태(관리종목·거래정지 등)로 거르는 것은

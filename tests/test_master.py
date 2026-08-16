@@ -167,7 +167,7 @@ def _row(symbol, name, **overrides):
     return master.parse_master(build_line("KOSPI", symbol, name, **fields), "KOSPI")[0]
 
 
-def test_load_stock_symbols_applies_structural_filter(db_engine):
+def test_load_collectable_symbols_applies_structural_filter(db_engine):
     """수집 대상은 구조적 속성으로만 걸러진다 — 시변 상태는 보지 않는다.
 
     관리종목은 오늘 값일 뿐 과거엔 정상이었을 수 있으므로, 수집 단계에서
@@ -185,10 +185,10 @@ def test_load_stock_symbols_applies_structural_filter(db_engine):
     ]
     master.upsert_master(db_engine, rows, updated_at=datetime(2026, 8, 3))
 
-    assert master.load_stock_symbols(db_engine, today=TODAY) == ["005930", "456789"]
+    assert master.load_collectable_symbols(db_engine, today=TODAY) == ["005930", "456789"]
 
 
-def test_load_stock_symbols_boundary_of_listing_age(db_engine):
+def test_load_collectable_symbols_boundary_of_listing_age(db_engine):
     """상장 400일 경계: 정확히 400일이면 통과, 399일이면 제외."""
     db.migrate(db_engine)
     master.upsert_master(
@@ -200,4 +200,29 @@ def test_load_stock_symbols_boundary_of_listing_age(db_engine):
         updated_at=datetime(2026, 8, 3),
     )
 
-    assert master.load_stock_symbols(db_engine, today=TODAY) == ["111111"]
+    assert master.load_collectable_symbols(db_engine, today=TODAY) == ["111111"]
+
+
+def test_empty_universe_hint_distinguishes_empty_table_from_filtered_out(db_engine):
+    """수집 대상 0종목의 두 원인을 구분해 안내한다.
+
+    listing_date 컬럼을 추가한 마이그레이션 직후 collect-master를 다시 돌리기
+    전에는 전 행이 NULL이라 fail-closed로 전량 제외된다. 이때 "테이블이 비었다"고
+    안내하면 원인을 못 찾는다 — 실제로 이 순서로 실행하면 발생한다.
+    """
+    from sontrader.cli import _empty_universe_hint
+
+    db.migrate(db_engine)
+    assert "is empty" in _empty_universe_hint(db_engine)
+
+    # 마스터는 있지만 상장일자가 없는 상태 (마이그레이션 직후)
+    master.upsert_master(
+        db_engine,
+        [_row("005930", "삼성전자", 상장일자="        ")],
+        updated_at=datetime(2026, 8, 3),
+    )
+
+    hint = _empty_universe_hint(db_engine)
+    assert "1종목이 있지만" in hint
+    assert "collect-master" in hint
+    assert master.load_collectable_symbols(db_engine, today=TODAY) == []
