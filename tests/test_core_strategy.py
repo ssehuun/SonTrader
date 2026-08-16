@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from sontrader.core.strategy import StrategyConfig, build_target
+from sontrader.core.strategy import EntryTrigger, StrategyConfig, build_target
 from sontrader.core.types import (
     Bar,
     Context,
@@ -370,3 +370,71 @@ def test_same_inputs_produce_the_same_target():
 def test_invalid_config_is_rejected(kwargs):
     with pytest.raises(ValueError):
         StrategyConfig(**kwargs)
+
+
+# --- WATCHLIST_RANK 진입 트리거 ------------------------------------------------
+
+WATCHLIST_CFG = StrategyConfig(entry_trigger=EntryTrigger.WATCHLIST_RANK)
+
+
+def test_watchlist_mode_enters_without_any_event_or_judgment():
+    """이벤트도 LLM 판단도 없이 진입 후보가 나온다 — 이 모드의 존재 이유다."""
+    ctx = make_ctx(watchlist=("AAA", "BBB", "CCC"))
+
+    target = build_target(ctx, WATCHLIST_CFG)
+
+    assert [item.symbol for item in target] == ["AAA", "BBB", "CCC"]
+    assert all(item.weight == WATCHLIST_CFG.entry_weight for item in target)
+
+
+def test_watchlist_mode_preserves_rank_order():
+    """게이트가 입력 순서를 슬롯 우선순위로 쓰므로 순위가 그대로 유지돼야 한다."""
+    ctx = make_ctx(watchlist=("ZZZ", "AAA", "MMM"))
+
+    target = build_target(ctx, WATCHLIST_CFG)
+
+    assert [item.symbol for item in target] == ["ZZZ", "AAA", "MMM"]  # 종목코드순 아님
+
+
+def test_watchlist_mode_skips_held_symbols():
+    ctx = make_ctx(
+        series={SYMBOL: make_bars(SYMBOL, [10_000] * 30)},
+        positions=(make_position(SYMBOL),),
+        watchlist=(SYMBOL, "AAA"),
+    )
+
+    target = build_target(ctx, WATCHLIST_CFG)
+
+    entries = [item for item in target if item.symbol != SYMBOL]
+    assert [item.symbol for item in entries] == ["AAA"]
+
+
+def test_watchlist_mode_uses_default_exit_rule_and_no_event_id():
+    """LLM이 청산조건을 주지 않으므로 기본 ExitRule로 통일한다."""
+    ctx = make_ctx(watchlist=("AAA",))
+
+    (item,) = build_target(ctx, WATCHLIST_CFG)
+
+    assert item.event_id is None
+    assert item.exit_rule == ExitRule()
+    assert item.urgency is Urgency.NEXT_OPEN
+
+
+def test_watchlist_mode_ignores_events_entirely():
+    """이벤트가 있어도 워치리스트에 없으면 진입하지 않는다 — 트리거가 순위이지 이벤트가 아니다."""
+    ctx = make_ctx(
+        watchlist=("AAA",),
+        new_events=(make_event("E1", "BBB"),),
+        judgments={"E1": make_judgment("E1")},
+    )
+
+    target = build_target(ctx, WATCHLIST_CFG)
+
+    assert [item.symbol for item in target] == ["AAA"]
+
+
+def test_event_mode_remains_the_default():
+    """기본값을 바꾸지 않았는지 — 기존 동작이 조용히 달라지면 안 된다."""
+    assert StrategyConfig().entry_trigger is EntryTrigger.EVENT
+    ctx = make_ctx(watchlist=("AAA",))
+    assert list(build_target(ctx)) == []  # 이벤트 없으면 진입 없음

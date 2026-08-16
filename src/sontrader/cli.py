@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from dataclasses import replace
 from datetime import timedelta
 
 from sontrader.client import KisClient, KisError
@@ -456,6 +457,30 @@ def _build_llm_backend(provider: str, model: str | None, base_url: str | None):
     return OpenAICompatibleBackend(api_key, model=model, **kwargs), 0
 
 
+def _build_judge(engine, backend):
+    from sontrader.llm.judge import CachingJudge
+
+    return CachingJudge(engine, backend).judge
+
+
+def _build_cycle_config(entry_trigger: str, cooldown_days: int | None):
+    """진입 트리거와 쿨다운만 바꾼 사이클 설정.
+
+    워치리스트 모드는 event_id가 없어 게이트의 동일이벤트 차단이 걸리지
+    않는다 — 청산 직후 같은 종목이 여전히 상위면 바로 재진입한다. 그래서
+    이 모드의 유일한 제동은 쿨다운이고, 값을 명시할 수 있게 열어둔다.
+    """
+    from sontrader.core.gate import GateConfig
+    from sontrader.core.strategy import EntryTrigger, StrategyConfig
+    from sontrader.engine.loop import CycleConfig
+
+    trigger = EntryTrigger.WATCHLIST_RANK if entry_trigger == "watchlist" else EntryTrigger.EVENT
+    config = CycleConfig(strategy=StrategyConfig(entry_trigger=trigger))
+    if cooldown_days is not None:
+        config = replace(config, gate=GateConfig(cooldown_days=cooldown_days))
+    return config
+
+
 def _run_backtest(
     start_str: str,
     end_str: str,
@@ -464,6 +489,8 @@ def _run_backtest(
     llm_provider: str,
     llm_model: str | None,
     llm_base_url: str | None,
+    entry_trigger: str,
+    cooldown_days: int | None,
 ) -> int:
     from sqlalchemy.exc import SQLAlchemyError
 
@@ -495,12 +522,20 @@ def _run_backtest(
             print(action)
         judge = None
         if backend is not None:
-            from sontrader.llm.judge import CachingJudge
-
-            judge = CachingJudge(engine, backend).judge
-        else:
+            judge = _build_judge(engine, backend)
+        cycle_config = _build_cycle_config(entry_trigger, cooldown_days)
+        if entry_trigger == "watchlist":
+            print("진입 트리거: 워치리스트 순위 (이벤트·LLM 미사용)")
+        elif backend is None:
             print("주의: --llm 미지정 — 이번 실행은 신규 진입 없이 청산 로직만 검증합니다.")
-        result = run_backtest(engine, start=start, end=end, initial_cash=initial_cash, judge=judge)
+        result = run_backtest(
+            engine,
+            start=start,
+            end=end,
+            initial_cash=initial_cash,
+            judge=judge,
+            cycle_config=cycle_config,
+        )
         final_equity = result.equity_curve[-1][1] if result.equity_curve else initial_cash
         print(f"{start} ~ {end}: 사이클 {len(result.equity_curve)}일, 체결 {len(result.fills)}건")
         print(
@@ -602,6 +637,19 @@ def main(argv: list[str] | None = None) -> int:
     backtest.add_argument("--start", required=True, help="시작일 YYYYMMDD")
     backtest.add_argument("--end", required=True, help="종료일 YYYYMMDD")
     backtest.add_argument(
+        "--entry-trigger",
+        choices=["event", "watchlist"],
+        default="event",
+        help="진입 촉발 조건. event=공시+LLM(기본), "
+        "watchlist=워치리스트 순위만 (이벤트·LLM 미사용, 비교 기준선)",
+    )
+    backtest.add_argument(
+        "--cooldown-days",
+        type=int,
+        default=None,
+        help="청산 후 같은 종목 재진입 금지 일수. watchlist 모드의 유일한 재진입 제동",
+    )
+    backtest.add_argument(
         "--initial-cash", type=int, default=10_000_000, help="초기 자본 KRW (기본 1,000만원)"
     )
     backtest.add_argument(
@@ -657,6 +705,8 @@ def main(argv: list[str] | None = None) -> int:
             args.llm_provider,
             args.llm_model,
             args.llm_base_url,
+            args.entry_trigger,
+            args.cooldown_days,
         )
 
     try:

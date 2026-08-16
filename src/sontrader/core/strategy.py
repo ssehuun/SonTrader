@@ -10,6 +10,23 @@
 4. 슬롯 상한(5종목)은 여기서 강제하지 않는다 — `core/gate.py`의 몫이다(설계 2.5절).
    여기서는 신호가 경합할 때 어느 쪽이 이길지 순서만 정해서 넘긴다.
 
+## 진입 트리거가 둘인 이유 (`EntryTrigger`)
+
+위 2~3번은 `EntryTrigger.EVENT`일 때의 경로다. `WATCHLIST_RANK`를 고르면
+이벤트도 LLM도 보지 않고 워치리스트 순위대로 슬롯을 채운다. 청산·게이트·
+집행은 완전히 동일하다.
+
+두 번째 경로가 필요한 이유는 두 가지다.
+
+**1. 이벤트 레이어를 평가할 기준선.** "공시가 진입 타이밍을 개선하는가"는
+비교 없이 답할 수 없다. 진입 트리거만 다른 두 arm을 같은 데이터로 돌려야
+차이가 이벤트 때문인지 알 수 있다.
+
+**2. LLM 없이 엔진 전체를 관통 검증.** EVENT 모드는 `ctx.judgments`가
+비면 진입 후보가 0건이라, LLM 키가 없으면 백테스트가 거래를 한 건도
+만들지 못한다 — 게이트·diff·체결·청산·비용이 실데이터로 한 번도 안 돌아본
+상태가 된다. WATCHLIST_RANK는 API 비용 0으로 그 경로를 열어준다.
+
 ## 명시적으로 확정한 것들
 
 **1. 보유 종목의 목표 비중은 "현재 비중"이지 고정 20%가 아니다.**
@@ -44,15 +61,32 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 
 from sontrader.core import exit_rules
 from sontrader.core.types import Context, ExitRule, Position, Target, TargetItem, Urgency
+
+
+class EntryTrigger(Enum):
+    """무엇이 신규 진입을 촉발하는가.
+
+    두 값을 두는 목적은 **비교 가능성**이다. 이벤트 트리거가 성과에 기여하는지
+    는 기준선 없이 판정할 수 없다 — 같은 유니버스·같은 청산 규칙 위에서 진입
+    트리거만 바꿔 돌려봐야 "공시가 진입 타이밍을 개선하는가"에 답할 수 있다.
+    """
+
+    EVENT = "event"
+    """공시 + LLM 판단 (설계 §2.3의 기본 동작). 이벤트가 없으면 진입도 없다."""
+
+    WATCHLIST_RANK = "watchlist_rank"
+    """워치리스트 순위만 보고 슬롯을 채운다. 이벤트도 LLM도 쓰지 않는다."""
 
 
 @dataclass(frozen=True)
 class StrategyConfig:
     entry_weight: float = 0.20  # 신규 진입 목표 비중 (설계 1.2절 "5종목 균등 20%")
     exit_history_bars: int = 300  # 청산 판정에 넘길 봉 개수 (ATR 창 + 보유기간 여유)
+    entry_trigger: EntryTrigger = EntryTrigger.EVENT
 
     def __post_init__(self) -> None:
         if not 0.0 < self.entry_weight <= 1.0:
@@ -70,7 +104,12 @@ def build_target(ctx: Context, config: StrategyConfig | None = None) -> Target:
         items.append(_held_item(pos, ctx, cfg))
         seen.add(pos.symbol)
 
-    for symbol, event_id, exit_rule in _ranked_entries(ctx, seen):
+    if cfg.entry_trigger is EntryTrigger.EVENT:
+        candidates = _event_entries(ctx, seen)
+    else:
+        candidates = _watchlist_entries(ctx, seen)
+
+    for symbol, event_id, exit_rule in candidates:
         items.append(
             TargetItem(
                 symbol=symbol,
@@ -109,7 +148,28 @@ def _current_weight(pos: Position, ctx: Context, cfg: StrategyConfig) -> float:
     return min(max(pos.qty * bar.close / ctx.equity, 0.0), 1.0)
 
 
-def _ranked_entries(ctx: Context, exclude: set[str]) -> list[tuple[str, str, ExitRule]]:
+def _watchlist_entries(ctx: Context, exclude: set[str]) -> list[tuple[str, str | None, ExitRule]]:
+    """워치리스트 순위 그대로 진입 후보를 만든다 (이벤트·LLM 미사용).
+
+    `ctx.watchlist`는 이미 순위 오름차순이다(`data/universe.py`가 그렇게
+    저장한다). 게이트가 입력 순서를 슬롯 우선순위로 존중하므로 여기서
+    다시 정렬하지 않는다.
+
+    `event_id`는 None이다 — 촉발한 이벤트가 없다. 게이트의 동일이벤트
+    검사는 None을 건너뛰므로(`gate.py`), 청산 후 재진입은 쿨다운
+    (`GateConfig.cooldown_days`)이 유일한 제동이다. 이벤트 모드에서
+    `used_event_ids`가 하던 역할을 여기서는 쿨다운이 대신한다는 뜻이라,
+    이 모드를 쓸 때는 쿨다운을 0보다 크게 잡는 편이 안전하다.
+
+    `exit_rule`도 기본값이다 — LLM이 종목별로 정해주던 최대보유일·스톱을
+    쓸 수 없으므로 `ExitRule()`의 기본값(ATR 트레일링 / 30일 / -5%)으로
+    통일한다. 이게 오히려 비교에는 유리하다: 두 arm의 차이가 진입 트리거
+    하나로 좁혀진다.
+    """
+    return [(symbol, None, ExitRule()) for symbol in ctx.watchlist if symbol not in exclude]
+
+
+def _event_entries(ctx: Context, exclude: set[str]) -> list[tuple[str, str, ExitRule]]:
     """워치리스트 신규 진입 후보를 확신도 내림차순으로 정렬해 (symbol, event_id, exit_rule)로 반환.
 
     한 종목에 이벤트가 여러 건이면 확신도가 가장 높은 것만 남긴다 — `Target`은
