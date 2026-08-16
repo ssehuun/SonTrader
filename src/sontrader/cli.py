@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from datetime import timedelta
 
 from sontrader.client import KisClient, KisError
 from sontrader.config import load_dart_api_key, load_database_url, load_settings
@@ -173,6 +174,121 @@ def _run_collect_master() -> int:
         return 1
     finally:
         engine.dispose()
+
+
+def _run_backfill_prices(
+    limit: int | None, pace: float | None, earliest_str: str | None, dry_run: bool
+) -> int:
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from sontrader.data.db import migrate
+    from sontrader.data.master import load_collectable_symbols, load_listing_dates
+    from sontrader.data.prices import backfill_daily_all
+
+    earliest = None
+    if earliest_str:
+        try:
+            earliest = _parse_date_arg(earliest_str)
+        except ValueError:
+            print(f"error: --earliest must be YYYYMMDD, got {earliest_str!r}", file=sys.stderr)
+            return 2
+    try:
+        settings = load_settings()
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    engine = _open_engine()
+    if engine is None:
+        return 2
+    try:
+        for action in migrate(engine):
+            print(action)
+        today = _now_kst().date()
+        symbols = load_collectable_symbols(engine, today=today)
+        if not symbols:
+            print(_empty_universe_hint(engine), file=sys.stderr)
+            return 2
+        if limit is not None:
+            symbols = symbols[:limit]
+        listing_dates = load_listing_dates(engine)
+
+        estimate = _backfill_estimate(engine, symbols, listing_dates, earliest)
+        print(estimate)
+        if dry_run:
+            return 0
+
+        pace_seconds = pace if pace is not None else (0.5 if settings.paper else 0.06)
+
+        def on_progress(index: int, total: int) -> None:
+            if index % 50 == 0 or index == total:
+                print(f"  {index}/{total}", flush=True)
+
+        with KisClient(settings) as client:
+            results, failures = backfill_daily_all(
+                engine,
+                client,
+                symbols,
+                listing_dates=listing_dates,
+                earliest=earliest,
+                pace_seconds=pace_seconds,
+                on_progress=on_progress,
+            )
+        rows = sum(r.rows for r in results)
+        pages = sum(r.pages for r in results)
+        print(
+            f"백필 완료: {len(results)}종목, {rows:,}행 추가, {pages:,}호출 (실패 {len(failures)})"
+        )
+        for symbol, exc in failures[:5]:
+            print(f"  실패 {symbol}: {_first_line(exc)}", file=sys.stderr)
+        return 1 if failures else 0
+    except SQLAlchemyError as exc:
+        print(f"error: DB access failed: {_first_line(exc)}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("중단됨 — 지금까지 채운 구간은 저장되어 있고, 재실행하면 이어서 채웁니다.")
+        return 0
+    finally:
+        engine.dispose()
+
+
+def _backfill_estimate(engine, symbols, listing_dates, earliest) -> str:
+    """실행 전 규모를 알린다 — 전체 백필은 몇 시간 단위라 눈으로 확인해야 한다."""
+    import math
+
+    import sqlalchemy as sa
+
+    from sontrader.data.db import stock_candles_1d
+
+    columns = stock_candles_1d.c
+    with engine.connect() as conn:
+        oldest = {
+            row.symbol: row.first_date
+            for row in conn.execute(
+                sa.select(columns.symbol, sa.func.min(columns.date).label("first_date")).group_by(
+                    columns.symbol
+                )
+            )
+        }
+    pages = 0
+    covered = 0
+    for symbol in symbols:
+        first = oldest.get(symbol)
+        if first is None:
+            continue  # 아직 한 봉도 없음 — collect-prices가 먼저
+        bounds = [d for d in (listing_dates.get(symbol), earliest) if d is not None]
+        floor = max(bounds) if bounds else None
+        if floor is None:
+            continue  # 하한 미상 — 빈 페이지 연속으로 종료, 추정 불가
+        span = (first - timedelta(days=1) - floor).days + 1
+        if span <= 0:
+            continue
+        covered += 1
+        pages += math.ceil(span / 100)
+    hours = pages * 0.2 / 3600
+    return (
+        f"백필 대상 {covered:,}종목 / 예상 {pages:,}호출 / 약 {hours:.1f}시간 "
+        f"(하한: {earliest or '상장일'})"
+    )
 
 
 def _empty_universe_hint(engine) -> str:
@@ -458,6 +574,17 @@ def main(argv: list[str] | None = None) -> int:
         "--lookback-days", type=int, default=420, help="최초 수집 시 소급 일수 (달력일)"
     )
 
+    backfill = sub.add_parser(
+        "backfill-prices",
+        help="일봉을 과거 방향으로 채운다 (collect-prices는 앞으로만 간다)",
+    )
+    backfill.add_argument(
+        "--earliest", help="이 날짜(YYYYMMDD) 이전은 받지 않는다. 생략하면 상장일까지"
+    )
+    backfill.add_argument("--limit", type=int, default=None, help="상위 N종목만 (테스트용)")
+    backfill.add_argument("--pace", type=float, default=None, help="API 호출 간격 초")
+    backfill.add_argument("--dry-run", action="store_true", help="규모만 추정하고 종료 (호출 없음)")
+
     universe = sub.add_parser(
         "build-universe", help="모멘텀 워치리스트 산출 + 일별 스냅샷 저장 (히스테리시스 50/70)"
     )
@@ -517,6 +644,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_collect_master()
     if args.command == "collect-prices":
         return _run_collect_prices(args.limit, args.pace, args.lookback_days)
+    if args.command == "backfill-prices":
+        return _run_backfill_prices(args.limit, args.pace, args.earliest, args.dry_run)
     if args.command == "build-universe":
         return _run_build_universe(args.date, args.min_trade_value, args.lookback, args.skip)
     if args.command == "backtest":

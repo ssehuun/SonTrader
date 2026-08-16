@@ -47,12 +47,24 @@ uv run sontrader collect-master                 # KOSPI/KOSDAQ 종목 마스터
 uv run sontrader collect-dart                   # 오늘자 DART 공시 → events (멱등)
 uv run sontrader collect-dart --date 20260101 --interval 60   # 특정일, 주기 폴링
 uv run sontrader collect-prices                 # 일봉 수집 (수정주가, 증분+자가치유)
-uv run sontrader collect-prices --limit 50      # 상위 N종목만 (테스트용)
+uv run sontrader collect-prices --limit 50      # 앞쪽 N종목만 (종목코드 오름차순, 테스트용)
+uv run sontrader backfill-prices --dry-run      # 과거 방향 백필 규모만 추정
+uv run sontrader backfill-prices --earliest 20180101   # 2018년까지 소급 수집
 uv run sontrader build-universe                 # 모멘텀 워치리스트 산출 + 일별 스냅샷 저장
 ```
 
 `collect-dart`/`collect-prices`/`build-universe`는 매일 장 시작 전 실행해야 그날의 이벤트·
 시세·워치리스트가 쌓인다 — cron이나 systemd timer로 스케줄링한다.
+
+`collect-prices`는 저장된 마지막 봉에서 **앞으로만** 간다. 한번 수집한 뒤 `--lookback-days`를
+키워도 과거는 늘지 않으므로, 백테스트 기간을 늘리려면 `backfill-prices`를 쓴다. 백필은 기존
+행을 건드리지 않고 과거 행만 추가하므로 실행 중에도 조회·백테스트가 정상 동작하고, 중단해도
+재실행하면 이어서 채운다. 규모가 시간 단위라 먼저 `--dry-run`으로 확인할 것.
+
+**백테스트 가능 구간 = 보유 거래일 − 253.** 모멘텀이 `lookback + 1 = 253` 거래일을 입력으로
+쓰기 때문에, 그만큼은 워밍업으로 앞에서 소비된다 (2년치 백테스트 ≈ 743 거래일 ≈ 1,110 달력일
+필요). 다만 과거로 갈수록 생존 편향이 커진다 — 상장폐지 종목은 `symbol_master`에 없어서
+그 시점 유니버스에서 이미 빠져 있다.
 
 ### 백테스트
 

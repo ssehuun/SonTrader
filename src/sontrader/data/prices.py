@@ -32,6 +32,12 @@ LOOKBACK_DAYS = 420  # 12-1 모멘텀(약 13개월) + 휴장 여유
 OVERLAP_DAYS = 10  # 증분 수집 시 소급 수정 감지용 겹침 (달력일)
 WINDOW_DAYS = 100  # 호출당 조회 폭 — 100행 응답 한도를 달력일로 안전하게 커버
 
+# 백필 종료 판정: 상장일자를 하한으로 쓰되, 그 값이 틀렸을 때를 대비해
+# 연속 빈 페이지도 종료 조건으로 둔다. 1페이지로 끊지 않는 이유는 장기
+# 거래정지 구간이 100일을 넘으면 중간에 빈 응답이 나올 수 있어서다 —
+# 거기서 멈추면 그보다 과거를 영영 못 받는다.
+BACKFILL_EMPTY_TOLERANCE = 3
+
 
 class DailyCandleSource(Protocol):
     """KisClient가 만족하는 시세 소스 (테스트에서는 스텁으로 대체)."""
@@ -80,6 +86,108 @@ def collect_daily(
 
     _upsert(engine, fetched)
     return CollectResult(symbol=symbol, rows=len(fetched), full=full)
+
+
+@dataclass(frozen=True)
+class BackfillResult:
+    symbol: str
+    rows: int  # 새로 채운 행 수
+    pages: int  # 소비한 API 호출 수
+    reached: date | None  # 새로 채운 구간의 시작일 (없으면 None)
+
+
+def backfill_daily(
+    engine: Engine,
+    client: DailyCandleSource,
+    symbol: str,
+    *,
+    listing_date: date | None = None,
+    earliest: date | None = None,
+    pace_seconds: float = 0.0,
+    sleep: Callable[[float], None] = time_module.sleep,
+) -> BackfillResult:
+    """저장된 가장 오래된 봉보다 **과거** 구간을 채운다.
+
+    `collect_daily()`는 `max(date)`에서 앞으로만 가므로, 한번 수집한 뒤에는
+    `lookback_days`를 키워도 과거가 늘지 않는다. 이 함수가 반대 방향을 맡는다.
+
+    기존 행은 건드리지 않고 과거 행만 추가하므로, 실행 중에도 조회·백테스트가
+    정상 동작한다. 수정주가 기준이 기존 수집분과 같아(둘 다 오늘 기준) 이어
+    붙여도 시계열이 갈라지지 않는다 — 그래서 `_was_adjusted()` 대조가 필요 없다.
+
+    종료 조건은 둘이다: `listing_date`(있으면)와 `earliest` 중 늦은 날짜에
+    도달하거나, 빈 페이지가 `BACKFILL_EMPTY_TOLERANCE`회 연속 나오거나.
+
+    아직 한 봉도 없는 종목은 아무것도 하지 않는다 — 어디서부터 거슬러
+    올라갈지 기준이 없다. `collect_daily()`를 먼저 돌려야 한다.
+    """
+    oldest = _first_stored_date(engine, symbol)
+    if oldest is None:
+        return BackfillResult(symbol=symbol, rows=0, pages=0, reached=None)
+
+    floor = max((d for d in (listing_date, earliest) if d is not None), default=None)
+    cursor = oldest - timedelta(days=1)
+    total_rows = 0
+    pages = 0
+    empty_streak = 0
+    reached: date | None = None
+
+    while floor is None or cursor >= floor:
+        window_start = cursor - timedelta(days=WINDOW_DAYS - 1)
+        if floor is not None:
+            window_start = max(window_start, floor)
+        if pace_seconds > 0:
+            sleep(pace_seconds)
+        pages += 1
+        raw_rows = _call_with_retry(client, symbol, window_start, cursor, sleep)
+        parsed = [row for row in (_parse_row(symbol, raw) for raw in raw_rows) if row is not None]
+        if parsed:
+            _upsert(engine, parsed)
+            total_rows += len(parsed)
+            reached = min(row["date"] for row in parsed)
+            empty_streak = 0
+        else:
+            empty_streak += 1
+            if empty_streak >= BACKFILL_EMPTY_TOLERANCE:
+                break
+        cursor = window_start - timedelta(days=1)
+
+    return BackfillResult(symbol=symbol, rows=total_rows, pages=pages, reached=reached)
+
+
+def backfill_daily_all(
+    engine: Engine,
+    client: DailyCandleSource,
+    symbols: list[str],
+    *,
+    listing_dates: dict[str, date] | None = None,
+    earliest: date | None = None,
+    pace_seconds: float = 0.0,
+    sleep: Callable[[float], None] = time_module.sleep,
+    on_progress: Callable[[int, int], None] | None = None,
+) -> tuple[list[BackfillResult], list[tuple[str, Exception]]]:
+    """여러 종목 백필. 한 종목의 실패가 전체를 중단시키지 않는다."""
+    results: list[BackfillResult] = []
+    failures: list[tuple[str, Exception]] = []
+    dates = listing_dates or {}
+    for index, symbol in enumerate(symbols, start=1):
+        try:
+            results.append(
+                backfill_daily(
+                    engine,
+                    client,
+                    symbol,
+                    listing_date=dates.get(symbol),
+                    earliest=earliest,
+                    pace_seconds=pace_seconds,
+                    sleep=sleep,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 — 종목 단위 격리가 목적
+            failures.append((symbol, exc))
+        if on_progress is not None:
+            on_progress(index, len(symbols))
+    return results, failures
 
 
 def collect_daily_all(
@@ -200,6 +308,15 @@ def _to_float(value: Any) -> float | None:
         return float(str(value).strip())
     except (ValueError, TypeError):
         return None
+
+
+def _first_stored_date(engine: Engine, symbol: str) -> date | None:
+    with engine.connect() as conn:
+        return conn.execute(
+            sa.select(sa.func.min(db.stock_candles_1d.c.date)).where(
+                db.stock_candles_1d.c.symbol == symbol
+            )
+        ).scalar_one()
 
 
 def _last_stored_date(engine: Engine, symbol: str) -> date | None:

@@ -250,3 +250,15 @@ def load_collectable_symbols(engine: Engine, *, today: date) -> list[str]:
             for row in rows
             if is_collectable(StructuralInfo(**row._mapping), today=today)
         ]
+
+
+def load_listing_dates(engine: Engine) -> dict[str, date]:
+    """종목 → 상장일자. 백필의 하한으로 쓴다 — 상장 이전을 조회하면
+    빈 응답만 돌아와 호출을 낭비한다. 값이 없는 종목은 빠진다(하한 없이
+    빈 페이지 연속으로 종료 판정)."""
+    columns = db.symbol_master.c
+    with engine.connect() as conn:
+        rows = conn.execute(
+            sa.select(columns.symbol, columns.listing_date).where(columns.listing_date.isnot(None))
+        )
+        return {row.symbol: row.listing_date for row in rows}

@@ -231,3 +231,128 @@ def test_collect_all_isolates_per_symbol_failures(db_engine):
 
     assert [r.symbol for r in results] == ["005930", "000660"]
     assert [symbol for symbol, _ in failures] == ["999999"]
+
+
+# --- 백필 (과거 방향) --------------------------------------------------------
+
+
+def seed(engine, days, close=1000):
+    """일봉 몇 개를 미리 넣어둔다 — 백필은 여기서 거슬러 올라간다."""
+    db.migrate(engine)
+    client = FakeClient({d: raw_row(d, close) for d in days})
+    prices.collect_daily(engine, client, "005930", today=days[-1], lookback_days=30)
+    return client
+
+
+def test_backfill_fills_older_range_and_stops_at_listing_date(db_engine):
+    recent = business_days(TODAY, 5)
+    seed(db_engine, recent)
+
+    listed = TODAY - timedelta(days=250)
+    older = business_days(recent[0] - timedelta(days=1), 40)
+    client = FakeClient({d: raw_row(d, 900) for d in older if d >= listed})
+
+    result = prices.backfill_daily(db_engine, client, "005930", listing_date=listed)
+
+    stored = dict(stored_closes(db_engine))
+    assert min(stored) == min(d for d in older if d >= listed)
+    assert result.rows > 0
+    # 상장일보다 과거는 절대 조회하지 않는다 — 빈 응답만 받아 호출을 낭비한다.
+    assert all(start >= listed for start, _ in client.calls)
+
+
+def test_backfill_never_touches_existing_rows(db_engine):
+    recent = business_days(TODAY, 5)
+    seed(db_engine, recent, close=1000)
+    before = dict(stored_closes(db_engine))
+
+    older = business_days(recent[0] - timedelta(days=1), 10)
+    # 겹치는 날짜에 다른 종가를 주더라도, 백필은 과거 구간만 조회하므로 안 닿는다.
+    client = FakeClient({d: raw_row(d, 777) for d in older + recent})
+    prices.backfill_daily(db_engine, client, "005930", listing_date=older[0])
+
+    after = dict(stored_closes(db_engine))
+    assert all(after[d] == before[d] for d in before)
+    assert all(end < recent[0] for _, end in client.calls)
+
+
+def test_backfill_stops_after_consecutive_empty_pages(db_engine):
+    """상장일자가 없어도 빈 페이지 연속으로 종료한다 (무한 루프 방지)."""
+    recent = business_days(TODAY, 5)
+    seed(db_engine, recent)
+    client = FakeClient({})  # 과거 데이터가 전혀 없음
+
+    result = prices.backfill_daily(db_engine, client, "005930", listing_date=None)
+
+    assert result.rows == 0
+    assert result.pages == prices.BACKFILL_EMPTY_TOLERANCE
+
+
+def test_backfill_tolerates_a_gap_longer_than_one_page(db_engine):
+    """장기 거래정지로 중간 페이지가 비어도 그보다 과거를 포기하지 않는다."""
+    recent = business_days(TODAY, 5)
+    seed(db_engine, recent)
+
+    # 최근 이전 150일은 공백, 그보다 과거에 데이터가 있다.
+    gap_start = recent[0] - timedelta(days=150)
+    ancient = business_days(gap_start, 10)
+    client = FakeClient({d: raw_row(d, 500) for d in ancient})
+
+    result = prices.backfill_daily(
+        db_engine, client, "005930", listing_date=ancient[0] - timedelta(days=5)
+    )
+
+    assert result.rows == len(ancient)
+    assert min(dict(stored_closes(db_engine))) == ancient[0]
+
+
+def test_backfill_respects_earliest_floor(db_engine):
+    recent = business_days(TODAY, 5)
+    seed(db_engine, recent)
+
+    floor = recent[0] - timedelta(days=30)
+    older = business_days(recent[0] - timedelta(days=1), 60)
+    client = FakeClient({d: raw_row(d, 800) for d in older})
+
+    prices.backfill_daily(db_engine, client, "005930", listing_date=older[0], earliest=floor)
+
+    assert min(dict(stored_closes(db_engine))) >= floor
+    assert all(start >= floor for start, _ in client.calls)
+
+
+def test_backfill_skips_symbols_with_no_data(db_engine):
+    """한 봉도 없으면 어디서 거슬러 올라갈지 기준이 없다 — 호출하지 않는다."""
+    db.migrate(db_engine)
+    client = FakeClient({})
+
+    result = prices.backfill_daily(db_engine, client, "005930", listing_date=TODAY)
+
+    assert result == prices.BackfillResult(symbol="005930", rows=0, pages=0, reached=None)
+    assert client.calls == []
+
+
+def test_backfill_all_isolates_per_symbol_failures(db_engine):
+    recent = business_days(TODAY, 5)
+    db.migrate(db_engine)
+    for symbol in ("005930", "000660"):
+        c = FakeClient({d: raw_row(d, 1000) for d in recent})
+        prices.collect_daily(db_engine, c, symbol, today=recent[-1], lookback_days=30)
+
+    class Exploding(FakeClient):
+        def get_daily_candles(self, code, start, end, adjusted=True):
+            if code == "000660":
+                raise RuntimeError("boom")
+            return super().get_daily_candles(code, start, end, adjusted)
+
+    older = business_days(recent[0] - timedelta(days=1), 10)
+    client = Exploding({d: raw_row(d, 900) for d in older})
+
+    results, failures = prices.backfill_daily_all(
+        db_engine,
+        client,
+        ["005930", "000660"],
+        listing_dates={"005930": older[0], "000660": older[0]},
+    )
+
+    assert [r.symbol for r in results] == ["005930"]
+    assert [s for s, _ in failures] == ["000660"]
