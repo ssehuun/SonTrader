@@ -376,12 +376,18 @@ def _run_collect_prices(limit: int | None, pace: float | None, lookback_days: in
 
 
 def _run_build_universe(
-    date_str: str | None, min_trade_value: int, lookback: int, skip: int
+    date_str: str | None,
+    min_trade_value: int,
+    lookback: int,
+    skip: int,
+    from_str: str | None,
+    to_str: str | None,
+    scope_name: str,
 ) -> int:
     from sqlalchemy.exc import SQLAlchemyError
 
     from sontrader.data.db import migrate
-    from sontrader.data.universe import UniverseError, build_snapshot
+    from sontrader.data.universe import UniverseError, UniverseScope, build_snapshot
 
     as_of = None
     if date_str:
@@ -396,9 +402,32 @@ def _run_build_universe(
             file=sys.stderr,
         )
         return 2
+    scope = UniverseScope.STRUCTURAL if scope_name == "structural" else UniverseScope.TRADEABLE_NOW
     engine = _open_engine()
     if engine is None:
         return 2
+
+    if from_str or to_str:
+        if not (from_str and to_str):
+            print("error: --from and --to must be given together.", file=sys.stderr)
+            engine.dispose()
+            return 2
+        try:
+            return _run_build_universe_range(
+                engine,
+                _parse_date_arg(from_str),
+                _parse_date_arg(to_str),
+                lookback=lookback,
+                skip=skip,
+                min_trade_value=min_trade_value,
+                scope=scope,
+            )
+        except ValueError:
+            print("error: --from/--to must be YYYYMMDD", file=sys.stderr)
+            return 2
+        finally:
+            engine.dispose()
+
     try:
         for action in migrate(engine):
             print(action)
@@ -408,6 +437,7 @@ def _run_build_universe(
             lookback=lookback,
             skip=skip,
             min_avg_trade_value=min_trade_value,
+            scope=scope,
         )
         if result.as_of != result.requested:
             gap = (result.requested - result.as_of).days
@@ -428,6 +458,89 @@ def _run_build_universe(
         return 1
     finally:
         engine.dispose()
+
+
+def _run_build_universe_range(
+    engine, start, end, *, lookback: int, skip: int, min_trade_value: int, scope
+) -> int:
+    """기간 내 모든 거래일의 스냅샷을 **연대순으로** 만든다.
+
+    순서가 중요하다: 히스테리시스(편입 50 / 이탈 70)가 직전 스냅샷을 참조하므로,
+    거꾸로 만들거나 건너뛰면 이후 전부가 어긋난다. 그래서 기존 스냅샷이 구간
+    안에 남아 있으면 먼저 지운다 — 다른 파라미터로 만든 잔재가 체인에 섞이면
+    재현성이 깨진다.
+
+    거래일 목록은 저장된 일봉에서 가져온다. 캘린더를 따로 두지 않아도 되고,
+    "데이터가 있는 날"과 "스냅샷이 있는 날"이 정확히 일치하게 된다.
+    """
+    import time as time_module
+
+    import sqlalchemy as sa
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from sontrader.data.db import migrate, stock_candles_1d, watchlist_snapshots
+    from sontrader.data.universe import UniverseError, build_snapshot
+
+    try:
+        for action in migrate(engine):
+            print(action)
+        columns = stock_candles_1d.c
+        with engine.connect() as conn:
+            days = [
+                row.date
+                for row in conn.execute(
+                    sa.select(columns.date)
+                    .where(columns.date >= start, columns.date <= end)
+                    .distinct()
+                    .order_by(columns.date)
+                )
+            ]
+        if not days:
+            print(f"error: {start} ~ {end} 구간에 일봉이 없습니다.", file=sys.stderr)
+            return 2
+
+        with engine.begin() as conn:
+            deleted = conn.execute(
+                sa.delete(watchlist_snapshots).where(
+                    watchlist_snapshots.c.date >= start, watchlist_snapshots.c.date <= end
+                )
+            ).rowcount
+        if deleted:
+            print(f"기존 스냅샷 {deleted}행 삭제 (히스테리시스 체인 재구성)")
+
+        print(f"{len(days)}거래일 생성 시작 ({days[0]} ~ {days[-1]}, scope={scope.value})")
+        started = time_module.time()
+        empty = 0
+        for index, day in enumerate(days, start=1):
+            result = build_snapshot(
+                engine,
+                as_of=day,
+                lookback=lookback,
+                skip=skip,
+                min_avg_trade_value=min_trade_value,
+                scope=scope,
+            )
+            if not result.entries:
+                empty += 1
+            if index % 100 == 0 or index == len(days):
+                elapsed = time_module.time() - started
+                eta = elapsed / index * (len(days) - index)
+                print(
+                    f"  {index}/{len(days)}  {day}  워치 {len(result.entries)}종목"
+                    f"  (경과 {elapsed / 60:.0f}분, 남은 {eta / 60:.0f}분)",
+                    flush=True,
+                )
+        print(f"완료: {len(days)}거래일 (워치리스트가 빈 날 {empty}일)")
+        return 0
+    except UniverseError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except SQLAlchemyError as exc:
+        print(f"error: DB access failed: {_first_line(exc)}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("중단됨 — 재실행하면 구간 전체를 처음부터 다시 만듭니다(체인 정합성 유지).")
+        return 0
 
 
 def _build_llm_backend(provider: str, model: str | None, base_url: str | None):
@@ -631,6 +744,15 @@ def main(argv: list[str] | None = None) -> int:
         help="최근 20거래일 평균 거래대금 하한 (KRW, 기본 10억)",
     )
     universe.add_argument("--lookback", type=int, default=252, help="모멘텀 룩백 (거래일)")
+    universe.add_argument("--from", dest="from_date", help="배치 시작일 YYYYMMDD (--to와 함께)")
+    universe.add_argument("--to", dest="to_date", help="배치 종료일 YYYYMMDD (--from과 함께)")
+    universe.add_argument(
+        "--universe-scope",
+        choices=["tradeable", "structural"],
+        default="tradeable",
+        help="마스터 필터 기준. tradeable=오늘 상태 플래그 포함(기본), "
+        "structural=구조적 속성만 (과거 소급 생성용 — 생존 편향 감소)",
+    )
     universe.add_argument("--skip", type=int, default=21, help="모멘텀 스킵 (거래일)")
 
     backtest = sub.add_parser("backtest", help="백테스트 실행")
@@ -695,7 +817,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "backfill-prices":
         return _run_backfill_prices(args.limit, args.pace, args.earliest, args.dry_run)
     if args.command == "build-universe":
-        return _run_build_universe(args.date, args.min_trade_value, args.lookback, args.skip)
+        return _run_build_universe(
+            args.date,
+            args.min_trade_value,
+            args.lookback,
+            args.skip,
+            args.from_date,
+            args.to_date,
+            args.universe_scope,
+        )
     if args.command == "backtest":
         return _run_backtest(
             args.start,

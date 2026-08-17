@@ -3,7 +3,10 @@
 파이프라인 (일 1회, **장 마감 후** 실행 전제 — 장중에 실행하면 오늘의 임시
 종가가 점수에 섞여 재현 불가능한 스냅샷이 된다):
 
-1. symbol_master → 방어 필터 (core.filters) → 후보 종목
+1. symbol_master → 방어 필터 (core.filters) → 후보 종목.
+   `UniverseScope`가 무엇으로 거를지 정한다 — 오늘 매매용은 시변 상태까지
+   보는 `is_tradeable()`, 과거 소급 생성은 구조적 속성만 보는
+   `is_collectable()`. 후자를 쓰는 이유는 그 enum의 독스트링 참고.
 2. 스냅샷 기준일 결정: 요청일 이하의 **마지막 거래일** (저장된 일봉의 최신
    날짜). 벽시계 날짜가 아니라 데이터 날짜로 기록해야 주말/휴장일 실행이
    point-in-time 기록을 오염시키지 않고, 수집이 밀린 날은 밀린 날짜로
@@ -36,6 +39,7 @@ from __future__ import annotations
 import dataclasses
 from dataclasses import dataclass
 from datetime import date, timedelta
+from enum import Enum
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
@@ -43,7 +47,9 @@ from sqlalchemy.engine import Engine
 from sontrader.core.filters import (
     HALT_LOOKBACK_BARS,
     SecurityInfo,
+    StructuralInfo,
     has_recent_halt,
+    is_collectable,
     is_tradeable,
 )
 from sontrader.core.momentum import LOOKBACK_BARS, SKIP_BARS, momentum_score
@@ -54,6 +60,31 @@ MIN_AVG_TRADE_VALUE = 1_000_000_000  # 최근 20거래일 평균 거래대금 �
 LIQUIDITY_BARS = 20
 RECENCY_LIMIT_DAYS = 7  # 마지막 봉이 기준일보다 이보다 오래되면 점수 제외 (달력일)
 _SYMBOL_CHUNK = 500  # IN 절 바인드 변수 한도(SQLite ~999) 대비
+
+
+class UniverseScope(Enum):
+    """1번 단계(마스터 필터)에서 무엇으로 거를지.
+
+    `symbol_master`는 **오늘자 스냅샷**이다. 그래서 과거 날짜의 스냅샷을
+    지금 만들 때 어떤 필드를 쓰느냐에 따라 편향의 방향이 달라진다.
+    """
+
+    TRADEABLE_NOW = "tradeable_now"
+    """`is_tradeable()` — 시변 상태(관리종목·거래정지·시장경고·영업이익·
+    시총규모·기준가)까지 본다. 오늘 매매할 유니버스를 뽑는 데는 이게 맞다."""
+
+    STRUCTURAL = "structural"
+    """`is_collectable()` — 구조적 속성(증권 종류·우선주·SPAC·상장일자)만
+    본다. **과거 스냅샷을 소급 생성할 때 쓴다.**
+
+    오늘의 상태 플래그를 과거에 적용하면 "오늘 관리종목인 회사는 2019년에도
+    제외"가 되어 확정적인 생존 편향이 들어간다 — 미래 정보를 쓰는 것이라
+    되돌릴 수 없다. 반면 구조적 필터만 쓰면 그 시점에 실제로 부실했던 종목이
+    후보에 남는데, 그 실질적 영향(거래 안 됨·거래대금 급감)은 뒤따르는
+    거래정지 필터(`volume==0`)와 유동성 필터가 **그 시점의 사실로** 잡아낸다.
+
+    상장일자 판정은 `as_of` 기준이라 이 모드가 오히려 더 point-in-time에
+    가깝다 — `is_tradeable()`에는 날짜 개념이 아예 없다."""
 
 
 class UniverseError(RuntimeError):
@@ -80,13 +111,14 @@ def build_snapshot(
     skip: int = SKIP_BARS,
     min_avg_trade_value: int = MIN_AVG_TRADE_VALUE,
     halt_lookback: int = HALT_LOOKBACK_BARS,
+    scope: UniverseScope = UniverseScope.TRADEABLE_NOW,
 ) -> SnapshotResult:
-    candidates = _load_tradeable_symbols(engine)
     effective = _effective_date(engine, as_of)
     if effective is None:
         raise UniverseError(
             "no daily candles at or before the requested date — run `sontrader collect-prices`"
         )
+    candidates = _load_candidates(engine, as_of=effective, scope=scope)
     series = _load_series(engine, candidates, effective, lookback)
 
     scores: dict[str, float] = {}
@@ -117,12 +149,18 @@ def build_snapshot(
     )
 
 
-def _load_tradeable_symbols(engine: Engine) -> list[str]:
-    # 컬럼 목록은 SecurityInfo 필드에서 파생 — 둘이 어긋날 수 없다.
-    columns = [db.symbol_master.c[field.name] for field in dataclasses.fields(SecurityInfo)]
+def _load_candidates(engine: Engine, *, as_of: date, scope: UniverseScope) -> list[str]:
+    """마스터 필터를 통과한 후보 종목. 컬럼 목록은 dataclass 필드에서
+    파생하므로 스키마와 어긋날 수 없다."""
+    info_type = SecurityInfo if scope is UniverseScope.TRADEABLE_NOW else StructuralInfo
+    columns = [db.symbol_master.c[field.name] for field in dataclasses.fields(info_type)]
     with engine.connect() as conn:
         rows = conn.execute(sa.select(*columns)).all()
-    return [row.symbol for row in rows if is_tradeable(SecurityInfo(**row._mapping))]
+    if scope is UniverseScope.TRADEABLE_NOW:
+        return [row.symbol for row in rows if is_tradeable(SecurityInfo(**row._mapping))]
+    return [
+        row.symbol for row in rows if is_collectable(StructuralInfo(**row._mapping), today=as_of)
+    ]
 
 
 def _effective_date(engine: Engine, as_of: date) -> date | None:
