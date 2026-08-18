@@ -106,6 +106,31 @@ def test_process_update_approves_proposal_on_callback(db_engine):
     assert decided.proposal_id == proposal.proposal_id
 
 
+def test_process_update_still_confirms_when_answer_callback_query_fails(db_engine):
+    """텔레그램 콜백 유효시간이 지나 answerCallbackQuery가 400을 반환해도
+    (실전 테스트 중 실제로 재현됨), 이미 반영된 결정의 확인 메시지는 여전히
+    나가야 한다."""
+    db.migrate(db_engine)
+    proposal = approval.propose(db_engine, entry_item(), now=NOW)
+    calls = []
+
+    def responder(request):
+        calls.append(request)
+        if request.url.path.endswith("/answerCallbackQuery"):
+            return httpx.Response(400, json={"ok": False, "description": "query is too old"})
+        return ok_response()
+
+    notifier = make_notifier(db_engine, responder)
+    update = {"callback_query": {"id": "cb-1", "data": f"approve:{proposal.proposal_id}"}}
+
+    notifier.process_update(update, now=NOW)  # 예외 없이 끝나야 한다
+
+    [decided] = approval.pull_approved(db_engine)
+    assert decided.proposal_id == proposal.proposal_id
+    send_message_calls = [c for c in calls if c.url.path.endswith("/sendMessage")]
+    assert len(send_message_calls) == 1
+
+
 def test_process_update_rejects_proposal_on_callback(db_engine):
     db.migrate(db_engine)
     proposal = approval.propose(db_engine, entry_item(), now=NOW)

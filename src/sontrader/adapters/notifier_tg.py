@@ -131,7 +131,7 @@ class TelegramNotifier:
         action, _, proposal_id = data.partition(":")
         query_id = callback_query["id"]
         if action not in ("approve", "reject") or not proposal_id:
-            self.answer_callback_query(query_id, "알 수 없는 요청입니다.")
+            self._safe_answer_callback_query(query_id, "알 수 없는 요청입니다.")
             return
 
         try:
@@ -139,15 +139,29 @@ class TelegramNotifier:
                 self._engine, proposal_id, approve=(action == "approve"), now=now
             )
         except approval.ProposalNotFoundError:
-            self.answer_callback_query(query_id, "존재하지 않는 제안입니다.")
+            self._safe_answer_callback_query(query_id, "존재하지 않는 제안입니다.")
             return
         except approval.ProposalNotPendingError:
-            self.answer_callback_query(query_id, "이미 처리됐거나 만료된 제안입니다.")
+            self._safe_answer_callback_query(query_id, "이미 처리됐거나 만료된 제안입니다.")
             return
 
         verb = "승인" if action == "approve" else "거부"
-        self.answer_callback_query(query_id, f"{proposal.symbol} {verb}했습니다.")
+        self._safe_answer_callback_query(query_id, f"{proposal.symbol} {verb}했습니다.")
         self.send_message(f"{proposal.symbol} 진입 {verb}됨 (제안 {proposal.proposal_id[:8]})")
+
+    def _safe_answer_callback_query(self, callback_query_id: str, text: str = "") -> None:
+        """`answer_callback_query()`가 실패해도 무시한다.
+
+        텔레그램의 콜백은 유효시간이 있어 응답이 늦으면(폴링 주기가 길거나
+        일시적으로 밀리면) HTTP 400으로 거절될 수 있다. 이건 버튼의 로딩
+        스피너를 못 지우는 UX 문제일 뿐이다 — `approval.decide()`는 이미
+        반영됐으므로, 이 실패 때문에 뒤따르는 `send_message()` 확인 알림까지
+        막히면 안 된다(실전 테스트 중 실제로 이 순서로 재현됐다).
+        """
+        try:
+            self.answer_callback_query(callback_query_id, text)
+        except (TelegramError, httpx.HTTPError):
+            pass
 
     def _process_command(self, message: dict[str, Any], *, now: datetime) -> None:
         text = (message.get("text") or "").strip()
