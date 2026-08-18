@@ -27,6 +27,29 @@ against the paper domain, so make sure the key matches your `KIS_PAPER` setting.
 | `backtest --llm`, 실전 실행 (진입 판단) | `ANTHROPIC_API_KEY` (또는 백테스트는 `OPENAI_API_KEY`도 가능) |
 | 실전 실행의 승인 큐·알림·킬 스위치 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` |
 
+### DB는 로컬이 아니라 클라우드에 두는 것을 권장
+
+코드는 `DATABASE_URL`(또는 `POSTGRES_*`) 하나로만 동작해서 그 값이 로컬이든 클라우드든 상관없이
+그대로 돌아간다. 그래도 클라우드를 권장하는 이유:
+
+- 01문서 §6.1 설계 자체가 **로컬 PC(백테스트·데이터 수집)와 클라우드 VM(실전 실행)이 같은
+  DB를 공유**하는 구조다 — 결국 옮겨야 한다.
+- `backfill-prices`(과거 일봉, 상장일까지면 수 시간·수만 건의 실제 KIS API 호출)와
+  `build-universe --scope structural --from/--to`(과거 워치리스트 소급 생성)는 **한 번만 해도
+  되는 무거운 작업**이다. DB가 로컬 PC 한 대에만 있으면, 다른 머신이나 세션에서 작업할 때마다
+  이걸 다시 해야 한다 — 시간과 API 호출량 둘 다 낭비다.
+
+그래서 **이 무거운 백필을 실행하기 전에** 클라우드 DB로 옮기는 것이 순서상 맞다. 나중에 로컬에서
+채운 걸 옮기는 것보다, 처음부터 클라우드에 채우는 편이 간단하다.
+
+추천: Neon·Supabase 같은 관리형 Postgres — 이 프로젝트 규모(종목 수천 개, 계좌 1개)면 무료~월
+몇 달러 티어로 충분하고, VM이 죽어도 DB는 살아남는다. 다만 01문서가 실전 실행용 VM엔 "무료 티어
+금지"(가용성이 곧 손실)를 못박은 것과 같은 이유로, 8단계(배포)에서 실전 실행을 이 DB에 붙일
+때는 유료 티어(또는 VM 자체 호스팅)로 올리는 걸 다시 고려한다.
+
+적용 방법: 가입은 직접 해야 하지만, 그다음은 `.env`의 `DATABASE_URL`을 새 연결 문자열로 바꾸고
+`uv run sontrader migrate`를 한 번 실행하면 끝이다 — 코드 변경은 필요 없다.
+
 ## CLI 사용법
 
 ### 조회 / 수동 주문
