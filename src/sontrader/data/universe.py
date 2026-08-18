@@ -22,7 +22,7 @@
    5번과 겹쳐 보이지만 부족하다 — 20일 중 1~2일 정지는 평균을 10%쯤 낮출
    뿐이라 하한을 통과한다.
 7. 모멘텀 점수 (core.momentum) — 이력이 부족한 신규 상장은 자연 탈락
-8. 직전 스냅샷과 히스테리시스 (core.watchlist, 편입 50/이탈 70)
+8. 직전 스냅샷과 히스테리시스 (core.watchlist, 편입 30/이탈 42)
 9. watchlist_snapshots에 저장 — 같은 기준일 재실행이면 그날 행을 교체하므로,
    입력 데이터가 같으면 결과도 같다 (검증 요건)
 
@@ -56,7 +56,7 @@ from sontrader.core.momentum import LOOKBACK_BARS, SKIP_BARS, momentum_score
 from sontrader.core.watchlist import ENTER_RANK, EXIT_RANK, WatchlistEntry, build_watchlist
 from sontrader.data import db
 
-MIN_AVG_TRADE_VALUE = 1_000_000_000  # 최근 20거래일 평균 거래대금 하한 (10억 KRW)
+MIN_AVG_TRADE_VALUE = 10_000_000_000  # 최근 20거래일 평균 거래대금 하한 (100억 KRW)
 LIQUIDITY_BARS = 20
 RECENCY_LIMIT_DAYS = 7  # 마지막 봉이 기준일보다 이보다 오래되면 점수 제외 (달력일)
 _SYMBOL_CHUNK = 500  # IN 절 바인드 변수 한도(SQLite ~999) 대비

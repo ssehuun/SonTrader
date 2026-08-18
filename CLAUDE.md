@@ -20,7 +20,7 @@ uv run sontrader migrate                       # create/extend trading-state DB 
 uv run sontrader collect-dart                  # ingest today's DART disclosures (needs DART_API_KEY too)
 uv run sontrader collect-master                # KOSPI/KOSDAQ symbol master → symbol_master
 uv run sontrader collect-prices                # daily candles, 수정주가 (incremental + self-healing)
-uv run sontrader build-universe                # momentum watchlist + daily snapshot (hysteresis 50/70)
+uv run sontrader build-universe                # momentum watchlist + daily snapshot (hysteresis 30/42)
 ```
 
 ## Architecture
@@ -53,7 +53,7 @@ Three layers, each in one module under `src/sontrader/`:
   겹침 구간 종가 대조로 기업행위 감지 시 종목 전체 재수집 (자가치유), 일시 오류 재시도.
 - `data/universe.py` — 워치리스트 스냅샷 빌더: 마스터 필터 → 유동성(20일 평균 거래대금) →
   모멘텀 → 히스테리시스 → `watchlist_snapshots` (같은 날 재실행 시 동일 결과).
-- `core/` — 순수 함수만, 부작용 없음 (momentum.py, watchlist.py 히스테리시스 50/70,
+- `core/` — 순수 함수만, 부작용 없음 (momentum.py, watchlist.py 히스테리시스 30/42,
   filters.py 방어 필터). DB/네트워크/시각 접근 금지 — 백테스트와 실전이 같은 코드를 쓰는 전제.
 
 KIS API responses put data in `output` / `output1` / `output2` keys with all values as strings

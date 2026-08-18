@@ -734,14 +734,14 @@ def main(argv: list[str] | None = None) -> int:
     backfill.add_argument("--dry-run", action="store_true", help="규모만 추정하고 종료 (호출 없음)")
 
     universe = sub.add_parser(
-        "build-universe", help="모멘텀 워치리스트 산출 + 일별 스냅샷 저장 (히스테리시스 50/70)"
+        "build-universe", help="모멘텀 워치리스트 산출 + 일별 스냅샷 저장 (히스테리시스 30/42)"
     )
     universe.add_argument("--date", help="기준일 YYYYMMDD (기본: 오늘)")
     universe.add_argument(
         "--min-trade-value",
         type=int,
-        default=1_000_000_000,
-        help="최근 20거래일 평균 거래대금 하한 (KRW, 기본 10억)",
+        default=10_000_000_000,
+        help="최근 20거래일 평균 거래대금 하한 (KRW, 기본 100억)",
     )
     universe.add_argument("--lookback", type=int, default=252, help="모멘텀 룩백 (거래일)")
     universe.add_argument("--from", dest="from_date", help="배치 시작일 YYYYMMDD (--to와 함께)")
