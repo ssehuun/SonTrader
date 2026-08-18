@@ -60,7 +60,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 from sontrader.core import exit_rules
@@ -87,6 +87,11 @@ class StrategyConfig:
     entry_weight: float = 0.20  # 신규 진입 목표 비중 (설계 1.2절 "5종목 균등 20%")
     exit_history_bars: int = 300  # 청산 판정에 넘길 봉 개수 (ATR 창 + 보유기간 여유)
     entry_trigger: EntryTrigger = EntryTrigger.EVENT
+    # WATCHLIST_RANK 모드에서 신규 진입에 붙일 청산 조건. EVENT 모드는 LLM이
+    # 종목별로 정하므로 이 값을 쓰지 않는다. 여기 둔 이유는 (a) 배선이 이미
+    # 있고(CycleConfig.strategy → build_target), (b) "진입에 어떤 청산 조건을
+    # 붙일지"가 전략의 결정이기 때문이다. 파라미터 스윕의 주입 지점이 된다.
+    exit_rule: ExitRule = field(default_factory=ExitRule)
 
     def __post_init__(self) -> None:
         if not 0.0 < self.entry_weight <= 1.0:
@@ -107,7 +112,7 @@ def build_target(ctx: Context, config: StrategyConfig | None = None) -> Target:
     if cfg.entry_trigger is EntryTrigger.EVENT:
         candidates = _event_entries(ctx, seen)
     else:
-        candidates = _watchlist_entries(ctx, seen)
+        candidates = _watchlist_entries(ctx, seen, cfg)
 
     for symbol, event_id, exit_rule in candidates:
         items.append(
@@ -148,7 +153,9 @@ def _current_weight(pos: Position, ctx: Context, cfg: StrategyConfig) -> float:
     return min(max(pos.qty * bar.close / ctx.equity, 0.0), 1.0)
 
 
-def _watchlist_entries(ctx: Context, exclude: set[str]) -> list[tuple[str, str | None, ExitRule]]:
+def _watchlist_entries(
+    ctx: Context, exclude: set[str], cfg: StrategyConfig
+) -> list[tuple[str, str | None, ExitRule]]:
     """워치리스트 순위 그대로 진입 후보를 만든다 (이벤트·LLM 미사용).
 
     `ctx.watchlist`는 이미 순위 오름차순이다(`data/universe.py`가 그렇게
@@ -161,12 +168,11 @@ def _watchlist_entries(ctx: Context, exclude: set[str]) -> list[tuple[str, str |
     `used_event_ids`가 하던 역할을 여기서는 쿨다운이 대신한다는 뜻이라,
     이 모드를 쓸 때는 쿨다운을 0보다 크게 잡는 편이 안전하다.
 
-    `exit_rule`도 기본값이다 — LLM이 종목별로 정해주던 최대보유일·스톱을
-    쓸 수 없으므로 `ExitRule()`의 기본값(ATR 트레일링 / 30일 / -5%)으로
-    통일한다. 이게 오히려 비교에는 유리하다: 두 arm의 차이가 진입 트리거
-    하나로 좁혀진다.
+    `exit_rule`은 종목과 무관하게 `cfg.exit_rule` 하나로 통일한다 — LLM이
+    종목별로 정해주던 최대보유일·스톱을 쓸 수 없기 때문이다. 이게 오히려
+    비교에는 유리하다: 두 arm의 차이가 진입 트리거 하나로 좁혀진다.
     """
-    return [(symbol, None, ExitRule()) for symbol in ctx.watchlist if symbol not in exclude]
+    return [(symbol, None, cfg.exit_rule) for symbol in ctx.watchlist if symbol not in exclude]
 
 
 def _event_entries(ctx: Context, exclude: set[str]) -> list[tuple[str, str, ExitRule]]:

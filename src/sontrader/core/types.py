@@ -114,9 +114,9 @@ class ExitRule:
     엔진이 결정적으로 수행한다. 보유 중 재호출하면 캐시가 무너지고 백테스트가
     비결정적이 된다.
 
-    `atr_period`/`atr_k`는 LLM 출력이 아니라 시스템 파라미터(설계 8절, 백테스트로
-    확정)지만 포지션마다 함께 저장한다. 전역 값이 나중에 바뀌어도 과거 포지션의
-    스톱 레벨이 그대로 재현되어야 하기 때문이다.
+    `atr_period`/`atr_k`/`breakeven_trigger`는 LLM 출력이 아니라 시스템
+    파라미터(설계 8절, 백테스트로 확정)지만 포지션마다 함께 저장한다. 전역 값이
+    나중에 바뀌어도 과거 포지션의 스톱 레벨이 그대로 재현되어야 하기 때문이다.
     """
 
     technical: TechnicalExit = TechnicalExit.ATR_TRAILING
@@ -124,6 +124,11 @@ class ExitRule:
     stop_loss_pct: float = -0.05  # 진입가 대비 고정 손절 (음수)
     atr_period: int = 14  # 봉 개수. 봉 주기는 주입하는 쪽이 정한다
     atr_k: float = 2.0
+    # 이 수익률에 도달하면 스톱을 본전 위로 올린다 (설계 4절 3구간 스톱의
+    # 구간 전환점). 원래 exit_rules 모듈 상수였는데, 다른 스톱 파라미터가
+    # 전부 여기 있어 혼자만 주입 불가였다 — 백테스트로 확정할 값이므로
+    # 포지션에 함께 저장해야 과거 스톱이 재현된다.
+    breakeven_trigger: float = 0.05
 
     def __post_init__(self) -> None:
         if self.max_hold_days <= 0:
@@ -134,6 +139,8 @@ class ExitRule:
             raise ValueError(f"atr_period must be >= 1: {self.atr_period}")
         if self.atr_k <= 0:
             raise ValueError(f"atr_k must be positive: {self.atr_k}")
+        if self.breakeven_trigger <= 0.0:
+            raise ValueError(f"breakeven_trigger must be positive: {self.breakeven_trigger}")
 
     def to_dict(self) -> dict[str, Any]:
         """`positions.exit_rule_json` 저장 형식. LLM의 한글 키 스키마와는 별개다."""
@@ -143,6 +150,7 @@ class ExitRule:
             "stop_loss_pct": self.stop_loss_pct,
             "atr_period": self.atr_period,
             "atr_k": self.atr_k,
+            "breakeven_trigger": self.breakeven_trigger,
         }
 
     @classmethod
@@ -164,6 +172,7 @@ class ExitRule:
             stop_loss_pct=float(payload.get("stop_loss_pct", defaults.stop_loss_pct)),
             atr_period=int(payload.get("atr_period", defaults.atr_period)),
             atr_k=float(payload.get("atr_k", defaults.atr_k)),
+            breakeven_trigger=float(payload.get("breakeven_trigger", defaults.breakeven_trigger)),
         )
 
 

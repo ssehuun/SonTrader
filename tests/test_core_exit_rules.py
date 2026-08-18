@@ -10,7 +10,6 @@ from datetime import datetime, timedelta
 import pytest
 
 from sontrader.core.exit_rules import (
-    BREAKEVEN_TRIGGER,
     ExitReason,
     average_true_range,
     evaluate,
@@ -68,8 +67,8 @@ def test_stop_moves_to_breakeven_exactly_at_the_trigger():
 
 def test_stop_level_formula_at_each_regime():
     rule = ExitRule(stop_loss_pct=-0.05, atr_k=2.0)
-    below = ENTRY_PRICE * (1 + BREAKEVEN_TRIGGER) - 1
-    at = ENTRY_PRICE * (1 + BREAKEVEN_TRIGGER)
+    below = ENTRY_PRICE * (1 + rule.breakeven_trigger) - 1
+    at = ENTRY_PRICE * (1 + rule.breakeven_trigger)
 
     assert stop_level(ENTRY_PRICE, below, 100.0, rule=rule) == pytest.approx(9_500.0)
     # 트리거를 넘는 순간 ATR 트레일링으로 전환된다. 진입가는 고정값이 아니라
@@ -237,3 +236,19 @@ def test_bars_of_another_symbol_are_rejected():
     foreign = Bar(symbol="000660", ts=ENTRY_TS, open=1, high=1, low=1, close=1, volume=1)
     with pytest.raises(ValueError, match="symbol"):
         evaluate(make_position(), [foreign], now=ENTRY_TS)
+
+
+def test_breakeven_trigger_is_injectable_per_rule():
+    """문턱을 넓히면 본전 이동이 늦어진다 — 스윕이 실제로 동작하는지."""
+    wide = ExitRule(stop_loss_pct=-0.05, atr_k=2.0, breakeven_trigger=0.20)
+
+    # +5%는 넓은 문턱(20%)에 못 미치므로 아직 고정 손절 구간이다.
+    assert stop_level(ENTRY_PRICE, ENTRY_PRICE * 1.05, 100.0, rule=wide) == pytest.approx(9_500.0)
+    # +20%에 도달해야 트레일링으로 전환된다 (12000 - 2*100).
+    assert stop_level(ENTRY_PRICE, ENTRY_PRICE * 1.20, 100.0, rule=wide) == pytest.approx(11_800.0)
+
+
+def test_exit_rule_round_trip_preserves_breakeven_trigger():
+    """포지션 저장/복원에서 살아남아야 한다 — 전역 값이 바뀌어도 과거 스톱이 재현된다."""
+    rule = ExitRule(breakeven_trigger=0.12, stop_loss_pct=-0.08)
+    assert ExitRule.from_dict(rule.to_dict()) == rule

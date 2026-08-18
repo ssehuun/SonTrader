@@ -4,8 +4,8 @@
 
 | 구간 | 스톱 레벨 |
 |---|---|
-| 진입 ~ +5% 미만 | 진입가 × (1 + stop_loss_pct) — 기본 −5% 고정 |
-| +5% 도달 시점 | 진입가 (본전 이동) |
+| 진입 ~ breakeven_trigger 미만 | 진입가 × (1 + stop_loss_pct) — 기본 −5% 고정 |
+| breakeven_trigger 도달 시점 | 진입가 (본전 이동) — 기본 +5% |
 | 이후 | max(진입가, high_water − k × ATR) |
 
 기준가는 **진입 체결 가중평균가**이고, 스톱 레벨은 **절대 하향되지 않는다.**
@@ -46,7 +46,10 @@ from enum import Enum
 
 from sontrader.core.types import Bar, ExitRule, Position, TechnicalExit
 
-BREAKEVEN_TRIGGER = 0.05  # 진입가 대비 이 수익률에 도달하면 스톱을 본전으로 올린다
+# 본전 이동 문턱은 `ExitRule.breakeven_trigger`로 옮겼다 — 다른 스톱
+# 파라미터(stop_loss_pct·atr_k·atr_period)가 전부 거기 있는데 이것만 모듈
+# 상수라 주입할 수 없었고, 포지션에 함께 저장되지 않아 전역 값을 바꾸면
+# 과거 포지션의 스톱 레벨이 재현되지 않았다.
 
 
 class ExitReason(str, Enum):
@@ -72,10 +75,10 @@ def stop_level(
     """설계 4절 3구간 스톱의 **한 시점** 값. 시간에 걸친 하향 금지는 여기서 다루지 않는다.
 
     `atr_value`가 None이면(ATR 창을 채울 봉이 아직 부족) 본전 스톱으로 둔다.
-    이 구간에 들어왔다는 것은 이미 +5% 이상 올랐다는 뜻이므로, 트레일링을
-    계산할 수 없다고 해서 고정 손절(−5%)로 되돌리면 스톱이 하향된다.
+    이 구간에 들어왔다는 것은 이미 `breakeven_trigger` 이상 올랐다는 뜻이므로,
+    트레일링을 계산할 수 없다고 해서 고정 손절로 되돌리면 스톱이 하향된다.
     """
-    if high_water < entry_price * (1.0 + BREAKEVEN_TRIGGER):
+    if high_water < entry_price * (1.0 + rule.breakeven_trigger):
         return entry_price * (1.0 + rule.stop_loss_pct)
     if atr_value is None:
         return entry_price

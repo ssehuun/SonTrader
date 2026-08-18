@@ -438,3 +438,45 @@ def test_event_mode_remains_the_default():
     assert StrategyConfig().entry_trigger is EntryTrigger.EVENT
     ctx = make_ctx(watchlist=("AAA",))
     assert list(build_target(ctx)) == []  # 이벤트 없으면 진입 없음
+
+
+# --- exit_rule 주입 (파라미터 스윕 경로) ---------------------------------------
+
+
+def test_watchlist_mode_uses_the_injected_exit_rule():
+    """StrategyConfig.exit_rule이 신규 진입에 그대로 붙는다.
+
+    이게 파라미터 스윕의 주입 지점이다 — 소스를 고치지 않고 스톱 폭을
+    바꿔가며 백테스트를 돌릴 수 있어야 한다.
+    """
+    rule = ExitRule(stop_loss_pct=-0.12, atr_k=3.0, breakeven_trigger=0.15, max_hold_days=60)
+    cfg = StrategyConfig(entry_trigger=EntryTrigger.WATCHLIST_RANK, exit_rule=rule)
+
+    (item,) = build_target(make_ctx(watchlist=("AAA",)), cfg)
+
+    assert item.exit_rule == rule
+
+
+def test_default_exit_rule_is_unchanged():
+    """기본값이 조용히 바뀌지 않았는지 — 기존 백테스트 결과가 달라지면 안 된다."""
+    default = StrategyConfig().exit_rule
+    assert default == ExitRule()
+    assert default.stop_loss_pct == -0.05
+    assert default.breakeven_trigger == 0.05
+    assert default.atr_k == 2.0
+    assert default.max_hold_days == 30
+
+
+def test_event_mode_ignores_the_config_exit_rule():
+    """EVENT 모드는 LLM이 종목별로 정한 규칙을 쓴다 — config가 덮어쓰면 안 된다."""
+    llm_rule = ExitRule(stop_loss_pct=-0.20)
+    cfg = StrategyConfig(exit_rule=ExitRule(stop_loss_pct=-0.03))
+    ctx = make_ctx(
+        watchlist=("AAA",),
+        new_events=(make_event("E1", "AAA"),),
+        judgments={"E1": make_judgment("E1", rule=llm_rule)},
+    )
+
+    (item,) = build_target(ctx, cfg)
+
+    assert item.exit_rule == llm_rule
