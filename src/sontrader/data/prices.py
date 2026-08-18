@@ -78,9 +78,15 @@ def collect_daily(
         # 겹침 구간이 저장분과 다르다 = 기업행위로 과거가 소급 수정됨.
         # 전체 이력을 **먼저 받고, 성공한 뒤에야** 한 트랜잭션으로 교체한다 —
         # 지우고 나서 받다가 실패하면 종목 이력이 통째로 사라지기 때문.
-        full_rows = _fetch_range(
-            client, symbol, today - timedelta(days=lookback_days), today, pace_seconds, sleep
-        )
+        #
+        # 재수집 시작일은 **기존 이력의 시작일까지** 거슬러 올라간다.
+        # lookback_days만 쓰면 `backfill-prices`로 채운 과거가 조용히 날아간다 —
+        # _replace_symbol()이 종목 행을 전부 지우고 새로 받은 것만 넣기 때문이다.
+        # (실측: 2018년까지 2,116봉 있던 종목이 420일치 282봉으로 줄었다.)
+        oldest = _first_stored_date(engine, symbol)
+        default_start = today - timedelta(days=lookback_days)
+        start = min(oldest, default_start) if oldest is not None else default_start
+        full_rows = _fetch_range(client, symbol, start, today, pace_seconds, sleep)
         _replace_symbol(engine, symbol, full_rows)
         return CollectResult(symbol=symbol, rows=len(full_rows), full=True)
 

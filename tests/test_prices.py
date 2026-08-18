@@ -356,3 +356,42 @@ def test_backfill_all_isolates_per_symbol_failures(db_engine):
 
     assert [r.symbol for r in results] == ["005930"]
     assert [s for s, _ in failures] == ["000660"]
+
+
+def test_self_heal_refetches_back_to_the_existing_history_start(db_engine):
+    """기업행위 재수집이 backfill로 채운 과거를 날리지 않는다.
+
+    _replace_symbol()은 종목 행을 전부 지우고 새로 받은 것만 넣는다. 재수집
+    범위를 lookback_days로만 잡으면 그보다 과거가 조용히 사라진다 — 실제로
+    2018년까지 2,116봉 있던 종목이 420일치 282봉으로 줄었다.
+    """
+    db.migrate(db_engine)
+    deep = business_days(TODAY, 200)  # 재수집 기본 범위(30일)보다 훨씬 깊은 이력
+    client = FakeClient({d: raw_row(d, 1000) for d in deep})
+    prices.collect_daily(db_engine, client, "005930", today=TODAY, lookback_days=400)
+    assert len(stored_closes(db_engine)) == len(deep)
+
+    # 다음 수집에서 겹침 구간 종가가 달라진다 = 기업행위 감지
+    healed = FakeClient({d: raw_row(d, 500) for d in deep})
+    result = prices.collect_daily(db_engine, healed, "005930", today=TODAY, lookback_days=30)
+
+    stored = dict(stored_closes(db_engine))
+    assert result.full is True
+    assert min(stored) == deep[0]  # 과거가 보존됐다
+    assert len(stored) == len(deep)
+    assert all(close == 500 for close in stored.values())  # 새 기준으로 전부 교체
+
+
+def test_self_heal_still_covers_lookback_when_history_is_shallow(db_engine):
+    """기존 이력이 lookback_days보다 얕으면 lookback_days까지 넓혀 받는다."""
+    db.migrate(db_engine)
+    shallow = business_days(TODAY, 5)
+    client = FakeClient({d: raw_row(d, 1000) for d in shallow})
+    prices.collect_daily(db_engine, client, "005930", today=TODAY, lookback_days=7)
+
+    wide = business_days(TODAY, 40)
+    healed = FakeClient({d: raw_row(d, 500) for d in wide})
+    prices.collect_daily(db_engine, healed, "005930", today=TODAY, lookback_days=60)
+
+    stored = dict(stored_closes(db_engine))
+    assert min(stored) < shallow[0]  # 기존보다 더 과거까지 받았다
