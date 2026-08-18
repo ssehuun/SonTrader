@@ -49,7 +49,6 @@ import httpx
 from sqlalchemy.engine import Engine
 
 from sontrader.adapters.broker import BrokerPosition, OrderResult
-from sontrader.auth import is_transient
 from sontrader.client import KisClient, KisError
 from sontrader.core.types import Fill, Order, OrderStatus, Side
 from sontrader.data import orders as orders_repo
@@ -122,7 +121,7 @@ class KisBroker:
 
         side = "buy" if order.side is Side.BUY else "sell"
         try:
-            response = self._submit_with_retry(side, order)
+            response = self._client.order(side, order.symbol, order.qty, price=order.limit_price)
         except httpx.HTTPError:
             # 접수 여부를 알 수 없다 — 이미 UNKNOWN으로 기록돼 있으니 그대로 둔다.
             return OrderResult(order=order, status=OrderStatus.UNKNOWN)
@@ -140,27 +139,6 @@ class KisBroker:
         return OrderResult(
             order=order, status=OrderStatus.SUBMITTED, broker_order_no=broker_order_no
         )
-
-    def _submit_with_retry(self, side: str, order: Order) -> dict:
-        """일시 오류(유량 초과 등)는 재시도한다.
-
-        재시도가 안전한 이유: `auth.TRANSIENT_ERROR_CODES`는 전부 KIS가 주문을
-        **접수하기 전에** 거절한 경우다. 접수 여부가 불분명한 상황(타임아웃)은
-        `httpx.HTTPError`로 올라와 여기서 잡지 않는다 — 그건 UNKNOWN이 맞다.
-
-        재시도가 없으면 초당 유량에 한 번 걸린 청산이 그 사이클을 통째로
-        날린다(다음 사이클에 새 멱등 키로 재시도되므로 영구 손실은 아니지만,
-        IMMEDIATE 청산이 60초 지연되는 것은 그 자체로 손실이다).
-        """
-        for attempt in range(1, _SUBMIT_RETRIES + 1):
-            try:
-                return self._client.order(side, order.symbol, order.qty, price=order.limit_price)
-            except KisError as exc:
-                if not is_transient(exc) or attempt == _SUBMIT_RETRIES:
-                    raise
-                self._log(f"주문 재시도 {attempt}/{_SUBMIT_RETRIES} {order.symbol}: {exc}")
-                self._sleep(float(attempt))  # 선형 백오프
-        raise AssertionError("unreachable")
 
     def _log(self, message: str) -> None:
         print(message, file=sys.stderr, flush=True)

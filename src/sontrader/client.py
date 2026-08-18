@@ -7,12 +7,14 @@ in _TR_IDS. API reference: https://apiportal.koreainvestment.com
 
 from __future__ import annotations
 
+import time as time_module
+from collections.abc import Callable
 from datetime import date, datetime
 from typing import Any
 
 import httpx
 
-from sontrader.auth import KisError, TokenManager, raise_for_kis_error
+from sontrader.auth import KisError, TokenManager, is_transient, raise_for_kis_error
 from sontrader.config import Settings
 
 # endpoint key -> (real tr_id, paper tr_id)
@@ -36,14 +38,24 @@ ORDER_DVSN_LIMIT = "00"  # 지정가
 ORDER_DVSN_MARKET = "01"  # 시장가
 
 
+_RETRIES = 3
+_RETRY_BACKOFF = 0.6  # 초. 모의투자 초당 2건 한도를 한 번의 대기로 넘긴다
+
 __all__ = ["KisClient", "KisError"]
 
 
 class KisClient:
-    def __init__(self, settings: Settings, transport: httpx.BaseTransport | None = None):
+    def __init__(
+        self,
+        settings: Settings,
+        transport: httpx.BaseTransport | None = None,
+        *,
+        sleep: Callable[[float], None] = time_module.sleep,
+    ):
         self._settings = settings
         self._http = httpx.Client(base_url=settings.base_url, timeout=10.0, transport=transport)
         self._tokens = TokenManager(settings, self._http)
+        self._sleep = sleep
 
     def close(self) -> None:
         self._http.close()
@@ -248,8 +260,24 @@ class KisClient:
             "tr_id": paper_id if self._settings.paper else real_id,
             "custtype": "P",
         }
-        response = self._http.request(method, path, headers=headers, params=params, json=json)
-        # 상태 코드보다 본문을 먼저 본다 — 이유는 raise_for_kis_error() 참고.
-        raise_for_kis_error(response)
-        response.raise_for_status()
-        return response.json()
+        # 일시 오류는 여기서 재시도한다. 유량 한도가 모의 초당 2건이라
+        # reconcile()처럼 여러 엔드포인트를 연달아 부르는 호출자가 정상 동작
+        # 중에도 EGW00201을 맞는다 — 호출자마다 재시도를 붙이는 대신 모든
+        # 요청이 지나는 이 지점 하나에 둔다.
+        #
+        # 주문에도 안전하다: `auth.TRANSIENT_ERROR_CODES`는 전부 KIS가 주문을
+        # **접수하기 전에** 거절한 경우다. 접수 여부가 불분명한 타임아웃은
+        # httpx 예외로 올라와 여기서 잡지 않으므로 재전송되지 않는다.
+        for attempt in range(1, _RETRIES + 1):
+            response = self._http.request(method, path, headers=headers, params=params, json=json)
+            try:
+                # 상태 코드보다 본문을 먼저 본다 — 이유는 raise_for_kis_error() 참고.
+                raise_for_kis_error(response)
+            except KisError as exc:
+                if not is_transient(exc) or attempt == _RETRIES:
+                    raise
+                self._sleep(_RETRY_BACKOFF * attempt)
+                continue
+            response.raise_for_status()
+            return response.json()
+        raise AssertionError("unreachable")

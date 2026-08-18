@@ -273,3 +273,49 @@ def test_non_kis_http_error_still_raises_http_status_error(settings):
     with make_client(settings, responder) as client:
         with pytest.raises(httpx.HTTPStatusError):
             client.get_quote("005930")
+
+
+def test_transient_errors_are_retried_at_the_client_level(settings):
+    """유량 초과는 모든 엔드포인트에서 재시도된다.
+
+    reconcile()처럼 여러 엔드포인트를 연달아 부르는 호출자가 정상 동작
+    중에도 EGW00201을 맞는다 — 모의투자는 초당 2건 한도라 특히 잦다.
+    호출자마다 재시도를 붙이는 대신 모든 요청이 지나는 지점 하나에 둔다.
+    """
+    attempts = []
+
+    def responder(request):
+        attempts.append(request)
+        if len(attempts) < 3:
+            return httpx.Response(
+                200, json={"rt_cd": "1", "msg_cd": "EGW00201", "msg1": "초당 거래건수를 초과"}
+            )
+        return httpx.Response(200, json={"rt_cd": "0", "output": {"stck_prpr": "71000"}})
+
+    def handler(request):
+        if request.url.path == "/oauth2/tokenP":
+            return httpx.Response(200, json=TOKEN_RESPONSE)
+        return responder(request)
+
+    client = KisClient(settings, transport=httpx.MockTransport(handler), sleep=lambda _s: None)
+    with client:
+        assert client.get_quote("005930")["stck_prpr"] == "71000"
+    assert len(attempts) == 3
+
+
+def test_permanent_errors_are_not_retried(settings):
+    attempts = []
+
+    def handler(request):
+        if request.url.path == "/oauth2/tokenP":
+            return httpx.Response(200, json=TOKEN_RESPONSE)
+        attempts.append(request)
+        return httpx.Response(
+            200, json={"rt_cd": "1", "msg_cd": "APBK0656", "msg1": "주문가능금액이 부족합니다."}
+        )
+
+    client = KisClient(settings, transport=httpx.MockTransport(handler), sleep=lambda _s: None)
+    with client:
+        with pytest.raises(KisError, match="APBK0656"):
+            client.get_quote("005930")
+    assert len(attempts) == 1
