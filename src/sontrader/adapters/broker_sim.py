@@ -65,12 +65,16 @@ from sontrader.core.types import Bar, Fill, Order, OrderStatus, OrderType, Side
 
 @dataclass(frozen=True)
 class SimBrokerConfig:
-    """거래비용 파라미터. 전부 01문서 §8 "미확정 파라미터"에 해당한다 — 여기
-    기본값은 자리표시자이며, 실제 백테스트 결과를 신뢰하려면 확정된 요율로
-    교체해야 한다."""
+    """거래비용 파라미터. 01문서 §8 "미확정 파라미터" 중 수수료·거래세는
+    한국투자증권 실제 계좌 기준으로 확정했다(2026-08 확인) — `slippage_bps`와
+    `settlement_days`(캘린더일 근사)는 여전히 미확정이라 자리표시자로 남는다."""
 
-    commission_rate: float = 0.00015  # 매수·매도 공통 위탁수수료 (플레이스홀더)
-    tax_rate: float = 0.0018  # 매도 시 증권거래세 등 (플레이스홀더, 시장·시점별로 다름)
+    # 매수·매도 공통 위탁수수료. KRX 기준(0.0140527%) — 이 시스템은 NXT로
+    # 주문을 라우팅하지 않는다(client.py가 시세·주문 전부 FID_COND_MRKT_DIV_CODE
+    # "J"=KRX만 쓴다). NXT 매매수수료는 0.0130527%로 더 낮지만, 주문 라우팅을
+    # 실제로 구현하기 전까지는 적용 대상이 없다.
+    commission_rate: float = 0.0140527 / 100
+    tax_rate: float = 0.002  # 매도 시 증권거래세, 코스피·코스닥 공통 0.2%(농특세 등 포함)
     slippage_bps: float = 10.0  # 시가 기준. 매수는 불리하게 위로, 매도는 아래로
     settlement_days: int = 2  # D+2. 캘린더일 근사 (위 docstring 참고)
 
