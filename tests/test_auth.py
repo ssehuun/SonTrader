@@ -175,3 +175,47 @@ def test_non_kis_http_error_still_raises_http_status_error(settings):
 
     with pytest.raises(httpx.HTTPStatusError):
         TokenManager(settings, http).get_token()
+
+
+def test_token_cache_is_invalidated_when_the_app_key_changes(settings, tmp_path):
+    """앱키를 바꾸면 캐시된 토큰을 재사용하지 않는다.
+
+    KIS는 앱키가 바뀌면 이전 토큰을 무효화하는데, 그 상태로 쓰면
+    "기간이 만료된 token"(EGW00123)이라는 엉뚱한 사유로 거절한다 — 캐시는
+    아직 유효 기간이 남아 있어 원인을 찾기 어렵다. 실제로 모의투자 전환
+    중에 겪은 문제다.
+    """
+    import dataclasses
+
+    calls = []
+    manager = TokenManager(settings, make_http(settings, calls))
+    assert manager.get_token() == "test-token"
+    assert len(calls) == 1
+
+    manager.get_token()
+    assert len(calls) == 1  # 같은 키면 캐시 재사용
+
+    rekeyed = dataclasses.replace(settings, app_key="a-different-app-key")
+    TokenManager(rekeyed, make_http(rekeyed, calls)).get_token()
+    assert len(calls) == 2  # 키가 바뀌면 재발급
+
+
+def test_approval_key_cache_is_invalidated_when_the_app_key_changes(settings):
+    import dataclasses
+
+    calls = []
+
+    def http_for(cfg):
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            return httpx.Response(200, json={"approval_key": "approval-123"})
+
+        return httpx.Client(base_url=cfg.base_url, transport=httpx.MockTransport(handler))
+
+    ApprovalKeyManager(settings, http_for(settings)).get_key()
+    ApprovalKeyManager(settings, http_for(settings)).get_key()
+    assert len(calls) == 1
+
+    rekeyed = dataclasses.replace(settings, app_key="a-different-app-key")
+    ApprovalKeyManager(rekeyed, http_for(rekeyed)).get_key()
+    assert len(calls) == 2

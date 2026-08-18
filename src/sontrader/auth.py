@@ -3,11 +3,14 @@
 KIS access tokens live for 24 hours and re-issuing invalidates the
 previous token, so the token is cached on disk and reused until
 shortly before expiry. Paper and real tokens are not interchangeable;
-the cache records which base URL issued it.
+the cache records which base URL **and which app key** issued it — changing
+either invalidates the stored token, and KIS reports the mismatch as a
+misleading "expired token" (EGW00123) if a stale one is reused.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import datetime, timedelta
 
@@ -18,6 +21,15 @@ from sontrader.config import Settings
 _EXPIRY_MARGIN = timedelta(minutes=10)
 # KIS returns expiry as local (KST) wall-clock time, e.g. "2026-07-31 09:00:00".
 _EXPIRY_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+def _app_key_fingerprint(app_key: str) -> str:
+    """캐시가 어느 앱키로 받은 토큰인지 식별하는 값.
+
+    앱키 자체를 쓰지 않고 해시를 쓴다 — 캐시 파일은 이미 토큰을 담고 있지만,
+    자격증명을 두 곳에 복제할 이유는 없다. 충돌만 피하면 되므로 앞 16자로 충분하다.
+    """
+    return hashlib.sha256(app_key.encode()).hexdigest()[:16]
 
 
 class KisError(RuntimeError):
@@ -69,6 +81,12 @@ class TokenManager:
             return None
         if data.get("base_url") != self._settings.base_url:
             return None
+        # 앱키가 바뀌면 이전 토큰은 KIS 쪽에서 무효화된다. base_url만 보면
+        # 같은 도메인에서 키만 교체했을 때 죽은 토큰을 계속 재사용하게 되고,
+        # KIS가 "기간이 만료된 token"(EGW00123)이라는 엉뚱한 사유로 답해
+        # 원인을 찾기 어렵다 — 실제로 모의투자 전환 중에 겪었다.
+        if data.get("app_key_fp") != _app_key_fingerprint(self._settings.app_key):
+            return None
         try:
             expires_at = datetime.strptime(data["expires_at"], _EXPIRY_FORMAT)
         except (KeyError, ValueError):
@@ -102,6 +120,7 @@ class TokenManager:
                     "access_token": token,
                     "expires_at": expires_at,
                     "base_url": self._settings.base_url,
+                    "app_key_fp": _app_key_fingerprint(self._settings.app_key),
                 }
             )
         )
@@ -136,6 +155,8 @@ class ApprovalKeyManager:
             return None
         if data.get("base_url") != self._settings.base_url:
             return None
+        if data.get("app_key_fp") != _app_key_fingerprint(self._settings.app_key):
+            return None  # 앱키가 바뀌면 이전 접속키도 무효다 (TokenManager와 같은 이유)
         try:
             issued_at = datetime.strptime(data["issued_at"], _EXPIRY_FORMAT)
         except (KeyError, ValueError):
@@ -170,6 +191,7 @@ class ApprovalKeyManager:
                     "approval_key": key,
                     "issued_at": datetime.now().strftime(_EXPIRY_FORMAT),
                     "base_url": self._settings.base_url,
+                    "app_key_fp": _app_key_fingerprint(self._settings.app_key),
                 }
             )
         )
