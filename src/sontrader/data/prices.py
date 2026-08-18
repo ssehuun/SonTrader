@@ -25,6 +25,7 @@ import httpx
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
+from sontrader.auth import is_transient
 from sontrader.client import KisError
 from sontrader.data import db
 
@@ -265,7 +266,7 @@ def _call_with_retry(
     end: date,
     sleep: Callable[[float], None],
 ) -> list[dict[str, Any]]:
-    """일시 오류(KIS 5xx, 유량 초과 EGW00201)만 재시도한다."""
+    """일시 오류(KIS 5xx, `auth.TRANSIENT_ERROR_CODES`)만 재시도한다."""
     for attempt in range(1, _RETRIES + 1):
         try:
             return client.get_daily_candles(symbol, start, end)
@@ -276,7 +277,7 @@ def _call_with_retry(
             if attempt == _RETRIES:
                 raise
         except KisError as exc:
-            if "EGW00201" not in str(exc) or attempt == _RETRIES:
+            if not is_transient(exc) or attempt == _RETRIES:
                 raise
         sleep(float(attempt))  # 선형 백오프
     raise AssertionError("unreachable")

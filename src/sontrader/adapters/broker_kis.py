@@ -39,23 +39,36 @@ TTTC8434R/VTTC8434R)를 그대로 쓴다.
 
 from __future__ import annotations
 
+import sys
+import time as time_module
 import uuid
+from collections.abc import Callable
 from datetime import datetime
 
 import httpx
 from sqlalchemy.engine import Engine
 
 from sontrader.adapters.broker import BrokerPosition, OrderResult
+from sontrader.auth import is_transient
 from sontrader.client import KisClient, KisError
 from sontrader.core.types import Fill, Order, OrderStatus, Side
 from sontrader.data import orders as orders_repo
 from sontrader.data.orders import OrderRecord
 
+_SUBMIT_RETRIES = 3
+
 
 class KisBroker:
-    def __init__(self, client: KisClient, engine: Engine) -> None:
+    def __init__(
+        self,
+        client: KisClient,
+        engine: Engine,
+        *,
+        sleep: Callable[[float], None] = time_module.sleep,
+    ) -> None:
         self._client = client
         self._engine = engine
+        self._sleep = sleep
 
     def submit(self, orders: list[Order], *, now: datetime) -> list[OrderResult]:
         return [self._submit_one(order, now) for order in orders]
@@ -109,13 +122,16 @@ class KisBroker:
 
         side = "buy" if order.side is Side.BUY else "sell"
         try:
-            response = self._client.order(side, order.symbol, order.qty, price=order.limit_price)
+            response = self._submit_with_retry(side, order)
         except httpx.HTTPError:
             # 접수 여부를 알 수 없다 — 이미 UNKNOWN으로 기록돼 있으니 그대로 둔다.
             return OrderResult(order=order, status=OrderStatus.UNKNOWN)
-        except KisError:
+        except KisError as exc:
+            # 사유를 남긴다. 예전에는 그냥 REJECTED로만 기록해서 "잔고 부족"과
+            # "유량 초과"를 구분할 수 없었다 — 상시 가동에서 관측 공백이 된다.
             orders_repo.update_status(self._engine, order_id, OrderStatus.REJECTED)
-            return OrderResult(order=order, status=OrderStatus.REJECTED)
+            self._log(f"주문 거절 {order.symbol} {side} {order.qty}주: {exc}")
+            return OrderResult(order=order, status=OrderStatus.REJECTED, reason=str(exc))
 
         broker_order_no = response.get("ODNO")
         orders_repo.update_status(
@@ -124,6 +140,30 @@ class KisBroker:
         return OrderResult(
             order=order, status=OrderStatus.SUBMITTED, broker_order_no=broker_order_no
         )
+
+    def _submit_with_retry(self, side: str, order: Order) -> dict:
+        """일시 오류(유량 초과 등)는 재시도한다.
+
+        재시도가 안전한 이유: `auth.TRANSIENT_ERROR_CODES`는 전부 KIS가 주문을
+        **접수하기 전에** 거절한 경우다. 접수 여부가 불분명한 상황(타임아웃)은
+        `httpx.HTTPError`로 올라와 여기서 잡지 않는다 — 그건 UNKNOWN이 맞다.
+
+        재시도가 없으면 초당 유량에 한 번 걸린 청산이 그 사이클을 통째로
+        날린다(다음 사이클에 새 멱등 키로 재시도되므로 영구 손실은 아니지만,
+        IMMEDIATE 청산이 60초 지연되는 것은 그 자체로 손실이다).
+        """
+        for attempt in range(1, _SUBMIT_RETRIES + 1):
+            try:
+                return self._client.order(side, order.symbol, order.qty, price=order.limit_price)
+            except KisError as exc:
+                if not is_transient(exc) or attempt == _SUBMIT_RETRIES:
+                    raise
+                self._log(f"주문 재시도 {attempt}/{_SUBMIT_RETRIES} {order.symbol}: {exc}")
+                self._sleep(float(attempt))  # 선형 백오프
+        raise AssertionError("unreachable")
+
+    def _log(self, message: str) -> None:
+        print(message, file=sys.stderr, flush=True)
 
     def _resolve_one(self, record: OrderRecord) -> OrderResult:
         order = _order_from_record(record)

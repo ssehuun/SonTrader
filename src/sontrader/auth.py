@@ -40,6 +40,23 @@ class KisError(RuntimeError):
     """
 
 
+# 재시도하면 풀릴 수 있는 KIS 오류. 이 목록 밖은 전부 영구 실패로 다룬다
+# (fail-closed) — 잔고 부족·잘못된 종목코드를 재시도해봐야 같은 답만 온다.
+TRANSIENT_ERROR_CODES = frozenset(
+    {
+        "EGW00201",  # 초당 거래건수를 초과하였습니다
+        "EGW00316",  # 조회 처리 중 오류 — 재조회 요청 (백필에서 실제로 겪었다)
+    }
+)
+
+
+def is_transient(exc: Exception) -> bool:
+    """일시 오류인가. 메시지에 코드가 들어 있는지로 판정한다 —
+    `raise_for_kis_error()`가 항상 "코드: 설명" 형태로 만들기 때문이다."""
+    text = str(exc)
+    return any(code in text for code in TRANSIENT_ERROR_CODES)
+
+
 def raise_for_kis_error(response: httpx.Response) -> None:
     """KIS가 본문에 담아 보낸 실패를 ``KisError``로 올린다.
 

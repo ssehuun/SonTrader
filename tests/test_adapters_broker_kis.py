@@ -381,3 +381,73 @@ def test_sell_order_is_submitted_correctly(db_engine, settings):
 
     assert captured["tr_id"] == "VTTC0011U"  # paper sell
     assert captured["body"]["ORD_QTY"] == "5"
+
+
+# --- 일시 오류 재시도 / 거절 사유 보존 ------------------------------------------
+
+
+def _order_response(odno: str = "0000000123") -> httpx.Response:
+    return httpx.Response(200, json={"rt_cd": "0", "msg_cd": "APBK0013", "output": {"ODNO": odno}})
+
+
+def _kis_error(code: str, msg: str) -> httpx.Response:
+    return httpx.Response(200, json={"rt_cd": "1", "msg_cd": code, "msg1": msg})
+
+
+def test_transient_rate_limit_is_retried_and_then_succeeds(settings, db_engine):
+    """유량 초과는 접수 전 거절이라 재시도가 안전하다.
+
+    재시도가 없으면 초당 유량에 한 번 걸린 IMMEDIATE 청산이 그 사이클을
+    통째로 날린다 — 다음 사이클에 새 멱등 키로 재시도되긴 하지만 60초 지연이다.
+    """
+    db.migrate(db_engine)
+    attempts = []
+
+    def responder(request):
+        attempts.append(request)
+        if len(attempts) < 3:
+            return _kis_error("EGW00201", "초당 거래건수를 초과하였습니다.")
+        return _order_response()
+
+    broker = KisBroker(make_client(settings, responder), db_engine, sleep=lambda _s: None)
+    (result,) = broker.submit([make_order()], now=NOW)
+
+    assert result.status is OrderStatus.SUBMITTED
+    assert result.broker_order_no == "0000000123"
+    assert len(attempts) == 3
+
+
+def test_permanent_rejection_is_not_retried_and_keeps_the_reason(settings, db_engine):
+    """잔고 부족은 재시도해도 같은 답이다 — 즉시 거절하되 사유를 남긴다."""
+    db.migrate(db_engine)
+    attempts = []
+
+    def responder(request):
+        attempts.append(request)
+        return _kis_error("APBK0656", "주문가능금액이 부족합니다.")
+
+    broker = KisBroker(make_client(settings, responder), db_engine, sleep=lambda _s: None)
+    (result,) = broker.submit([make_order()], now=NOW)
+
+    assert result.status is OrderStatus.REJECTED
+    assert len(attempts) == 1  # 재시도하지 않는다
+    assert "APBK0656" in result.reason
+    assert "주문가능금액" in result.reason
+
+
+def test_exhausted_transient_retries_end_in_rejection_with_reason(settings, db_engine):
+    db.migrate(db_engine)
+    attempts = []
+
+    def responder(request):
+        attempts.append(request)
+        return _kis_error("EGW00201", "초당 거래건수를 초과하였습니다.")
+
+    broker = KisBroker(make_client(settings, responder), db_engine, sleep=lambda _s: None)
+    (result,) = broker.submit([make_order()], now=NOW)
+
+    assert result.status is OrderStatus.REJECTED
+    assert "EGW00201" in result.reason
+    assert len(attempts) == 3
+    stored = orders.find_by_idempotency_key(db_engine, make_order().idempotency_key)
+    assert stored.status is OrderStatus.REJECTED

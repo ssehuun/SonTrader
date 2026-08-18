@@ -43,6 +43,9 @@ class OrderResult:
     status: OrderStatus
     fills: tuple[Fill, ...] = ()
     broker_order_no: str | None = None  # KIS 주문번호(ODNO) 등 — UNKNOWN 해소용
+    # 거절 사유 원문. "잔고 부족"과 "유량 초과"는 대응이 완전히 다른데,
+    # 상태 코드만으로는 구분할 수 없어 상시 가동에서 관측 공백이 된다.
+    reason: str | None = None
 
 
 class Broker(Protocol):
