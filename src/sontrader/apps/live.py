@@ -173,10 +173,23 @@ def _start_tick_stream(
 
 
 def _load_watchlist(engine: sa.engine.Engine, day: date) -> tuple[str, ...]:
+    """`day` **이하** 가장 최근 스냅샷을 쓴다.
+
+    `data/universe.py`는 "장 마감 후 실행 전제"라 오늘 워치리스트는 어제
+    종가로 계산돼 `date=어제`로 저장된다 — 오늘 장중에는 `date=오늘`인
+    행이 아직 없다(오늘 장이 끝나야 생긴다). `date == day`로 정확히
+    일치하는 행만 찾으면 실전 매매 중에는 항상 빈 워치리스트가 되어
+    신규 진입이 조용히 0건으로 고정된다.
+    """
     columns = db.watchlist_snapshots.c
     with engine.connect() as conn:
+        latest = conn.execute(
+            sa.select(sa.func.max(columns.date)).where(columns.date <= day)
+        ).scalar_one()
+        if latest is None:
+            return ()
         rows = conn.execute(
-            sa.select(columns.symbol).where(columns.date == day).order_by(columns.rank)
+            sa.select(columns.symbol).where(columns.date == latest).order_by(columns.rank)
         )
         return tuple(row.symbol for row in rows)
 

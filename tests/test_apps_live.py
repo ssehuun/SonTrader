@@ -47,6 +47,30 @@ def test_load_watchlist_returns_symbols_in_rank_order(db_engine):
     assert _load_watchlist(db_engine, date(2026, 3, 10)) == ("005930", "000660")
 
 
+def test_load_watchlist_uses_most_recent_snapshot_on_or_before_today(db_engine):
+    """워치리스트는 장 마감 후 어제 종가로 계산돼 date=어제로 저장된다 —
+    오늘 장중에는 date=오늘인 행이 아직 없으므로 어제 것을 써야 한다."""
+    db.migrate(db_engine)
+    with db_engine.begin() as conn:
+        conn.execute(
+            db.watchlist_snapshots.insert(),
+            [{"date": date(2026, 3, 9), "symbol": "005930", "score": 0.9, "rank": 1}],
+        )
+
+    assert _load_watchlist(db_engine, date(2026, 3, 10)) == ("005930",)
+
+
+def test_load_watchlist_ignores_snapshots_after_today(db_engine):
+    db.migrate(db_engine)
+    with db_engine.begin() as conn:
+        conn.execute(
+            db.watchlist_snapshots.insert(),
+            [{"date": date(2026, 3, 11), "symbol": "005930", "score": 0.9, "rank": 1}],
+        )
+
+    assert _load_watchlist(db_engine, date(2026, 3, 10)) == ()
+
+
 def test_load_watchlist_returns_empty_tuple_when_no_snapshot(db_engine):
     db.migrate(db_engine)
     assert _load_watchlist(db_engine, date(2026, 3, 10)) == ()
