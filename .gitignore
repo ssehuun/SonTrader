@@ -16,3 +16,6 @@ uv.lock.orig
 
 # Never track a stray "~" dir (unexpanded tilde artifacts)
 /~/
+
+# scripts/daily_collect.sh's cron log output — machine-local, not source
+/logs/
