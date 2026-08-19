@@ -1,9 +1,10 @@
 """data/calendar.py 테스트."""
 
 from dataclasses import replace
-from datetime import date
+from datetime import date, datetime
 
 import httpx
+import pytest
 
 from sontrader.client import KisClient
 from sontrader.data import calendar, db
@@ -101,3 +102,36 @@ def test_store_upserts_existing_dates(db_engine, settings):
     calendar._store(db_engine, client.get_market_holidays(date(2026, 3, 10)))
 
     assert calendar.is_open(db_engine, date(2026, 3, 10)) is False
+
+
+# --- 장 운영시간 (순수 함수) ---------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "hhmm,expected",
+    [
+        ((8, 29), False),  # 동시호가 직전
+        ((8, 30), True),  # 장 전 동시호가 시작 — 이때 낸 주문이 시초가에 체결된다
+        ((9, 0), True),
+        ((15, 29), True),
+        ((15, 30), False),  # 정규장 마감 — 시간외는 다루지 않는다
+        ((3, 0), False),
+        ((23, 59), False),
+    ],
+)
+def test_market_hours_boundaries(hhmm, expected):
+    now = datetime(2026, 8, 20, *hhmm)
+    assert calendar.is_market_hours(now) is expected
+
+
+def test_market_hours_ignores_holidays():
+    """휴장일 판정은 is_open()의 몫이다 — 둘은 각각 판정해 함께 쓴다."""
+    sunday = datetime(2026, 8, 16, 10, 0)
+    assert calendar.is_market_hours(sunday) is True
+
+
+@pytest.mark.parametrize(
+    "hhmm,expected", [((15, 39), False), ((15, 40), True), ((18, 0), True), ((9, 0), False)]
+)
+def test_today_bar_is_final_boundary(hhmm, expected):
+    assert calendar.today_bar_is_final(datetime(2026, 8, 20, *hhmm)) is expected

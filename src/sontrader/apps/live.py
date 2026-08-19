@@ -81,6 +81,7 @@ def main() -> None:
 
         offset: int | None = None
         notified_holiday: date | None = None
+        trading_open = False  # 장중/장외 전이 로그를 한 번만 남기기 위한 상태
         while not stop.is_set():
             if notifier is not None:
                 offset = _poll_telegram(notifier, offset)
@@ -94,6 +95,23 @@ def main() -> None:
                         notified_holiday = now.date()
                     stop.wait(CYCLE_INTERVAL)
                     continue
+
+            # 장 운영시간 밖에서는 매매 사이클을 건너뛴다. reconcile 하나가
+            # 잔고조회+미체결조회 2회를 쓰므로, 60초마다 돌리면 하루 약 2,880회를
+            # 아무 소득 없이 소비한다(유량 한도는 모의 초당 2건). 그 시간에 낸
+            # 주문은 KIS가 어차피 거부하고 orders 테이블에 쓰레기만 쌓인다.
+            #
+            # 텔레그램 폴링은 위에서 이미 끝냈다 — 휴장일 처리와 같은 이유로
+            # 킬 스위치·상태 조회는 24시간 살아 있어야 한다.
+            if not calendar.is_market_hours(now):
+                if trading_open:  # 장중 → 장외 전이에만 남긴다
+                    print(f"[{now:%H:%M}] 장 마감 — 매매 사이클 중단", flush=True)
+                    trading_open = False
+                stop.wait(CYCLE_INTERVAL)
+                continue
+            if not trading_open:
+                print(f"[{now:%H:%M}] 장 시작 — 매매 사이클 시작", flush=True)
+                trading_open = True
 
             report = reconcile_mod.reconcile(engine, broker)
             if report.halt:

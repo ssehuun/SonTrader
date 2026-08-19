@@ -22,16 +22,6 @@ def _now_kst():
     return datetime.now(timezone(timedelta(hours=9))).replace(tzinfo=None)
 
 
-# 정규장 마감 15:30 + 체결 정리 여유. 이 시각 전에 받은 오늘 봉은 임시
-# 종가라서 저장하지 않는다 (data/prices.py의 include_today 참고).
-# 휴장일·주말은 KIS가 오늘 봉 자체를 주지 않으므로 따로 다루지 않는다.
-_MARKET_FINAL_KST = (15, 40)
-
-
-def _today_bar_is_final(now) -> bool:
-    return (now.hour, now.minute) >= _MARKET_FINAL_KST
-
-
 def _parse_date_arg(date_str: str):
     """--date 값(YYYYMMDD) → date. 형식이 틀리면 ValueError."""
     from datetime import datetime
@@ -345,11 +335,13 @@ def _run_collect_prices(limit: int | None, pace: float | None, lookback_days: in
             print(action)
         now = _now_kst()
         today = now.date()
-        include_today = _today_bar_is_final(now)
+        from sontrader.data.calendar import BAR_FINAL_AFTER, today_bar_is_final
+
+        include_today = today_bar_is_final(now)
         if not include_today:
             print(
                 f"장중({now:%H:%M})이라 오늘 봉은 저장하지 않습니다 — 임시 종가입니다. "
-                f"{_MARKET_FINAL_KST[0]}:{_MARKET_FINAL_KST[1]:02d} 이후 다시 실행하세요."
+                f"{BAR_FINAL_AFTER:%H:%M} 이후 다시 실행하세요."
             )
         symbols = load_collectable_symbols(engine, today=today)
         if not symbols:

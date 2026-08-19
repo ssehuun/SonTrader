@@ -20,13 +20,39 @@ TR_ID CTCA0903R는 실전 전용이다(`KisClient.get_market_holidays()`가
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, time
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
 from sontrader.client import KisClient
 from sontrader.data import db
+
+# 장 운영시간 (KST). 순수 상수 + 순수 함수라 시각을 인자로 받는다.
+#
+# 시작을 09:00이 아니라 08:30으로 잡는 이유: 장 전 동시호가가 08:30에 시작하고,
+# 이때 낸 시장가 주문은 시초가에 체결된다. 설계 1.3절이 "진입은 다음 개장
+# 시가"라고 정한 것과 정확히 맞는 타이밍이라, 09:00까지 기다리면 오히려
+# 의도한 체결 시점을 놓친다 (L6 검증에서 08:45 주문이 시초가 체결됨을 확인).
+#
+# 종료는 정규장 마감 15:30. 시간외 거래는 이 시스템이 다루지 않는다.
+TRADING_START = time(8, 30)
+TRADING_END = time(15, 30)
+
+# 오늘 일봉이 확정되는 시각. 마감 + 체결 정리 여유. 이 전에 받은 오늘 봉은
+# 임시 종가라 저장하면 안 된다 (data/prices.py의 include_today 참고).
+BAR_FINAL_AFTER = time(15, 40)
+
+
+def is_market_hours(now: datetime) -> bool:
+    """지금이 주문을 낼 수 있는 시간대인가. **휴장일 여부는 보지 않는다** —
+    그건 `is_open()`의 몫이고, 둘은 각각 판정해 함께 쓴다."""
+    return TRADING_START <= now.time() < TRADING_END
+
+
+def today_bar_is_final(now: datetime) -> bool:
+    """오늘 일봉이 확정됐는가 (수집기가 저장해도 되는가)."""
+    return now.time() >= BAR_FINAL_AFTER
 
 
 def refresh_if_needed(engine: Engine, client: KisClient, *, today: date) -> None:
