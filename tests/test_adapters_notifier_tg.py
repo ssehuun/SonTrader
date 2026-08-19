@@ -251,3 +251,51 @@ def test_get_updates_returns_result_list(db_engine):
     result = notifier.get_updates()
 
     assert result == updates
+
+
+def _capture(db_engine):
+    """전송된 페이로드를 모으는 notifier."""
+    sent = []
+
+    def responder(request):
+        sent.append(json.loads(request.content))
+        return ok_response()
+
+    return sent, make_notifier(db_engine, responder)
+
+
+def test_approval_request_includes_the_symbol_name(db_engine):
+    """코드만으로는 어느 종목인지 즉시 알 수 없어 승인 판단이 느려진다."""
+    db.migrate(db_engine)
+    with db_engine.begin() as conn:
+        conn.execute(
+            db.symbol_master.insert().values(
+                symbol="005930",
+                name="삼성전자",
+                market="KOSPI",
+                updated_at=datetime(2026, 8, 20, 8, 0),
+            )
+        )
+    sent, notifier = _capture(db_engine)
+
+    notifier.send_approval_request(
+        approval.propose(db_engine, entry_item(symbol="005930"), now=NOW)
+    )
+
+    assert "005930 삼성전자" in sent[0]["text"]
+
+
+def test_missing_name_falls_back_to_the_code(db_engine):
+    """이름 조회가 실패해도 알림은 나가야 한다.
+
+    이 알림은 사람이 승인해야 주문이 나가는 경로다 — 부가 정보 때문에
+    승인 요청 자체를 잃으면 매매가 통째로 멈춘다.
+    """
+    db.migrate(db_engine)  # symbol_master가 비어 있다
+    sent, notifier = _capture(db_engine)
+
+    notifier.send_approval_request(
+        approval.propose(db_engine, entry_item(symbol="999999"), now=NOW)
+    )
+
+    assert "999999" in sent[0]["text"]

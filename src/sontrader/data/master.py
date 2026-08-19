@@ -14,6 +14,7 @@ from __future__ import annotations
 import dataclasses
 import io
 import zipfile
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from datetime import date, datetime
 
@@ -262,3 +263,15 @@ def load_listing_dates(engine: Engine) -> dict[str, date]:
             sa.select(columns.symbol, columns.listing_date).where(columns.listing_date.isnot(None))
         )
         return {row.symbol: row.listing_date for row in rows}
+
+
+def load_names(engine: Engine, symbols: Sequence[str]) -> dict[str, str]:
+    """종목코드 → 종목명. 없는 코드는 결과에서 빠진다 (호출자가 코드로 대체)."""
+    if not symbols:
+        return {}
+    columns = db.symbol_master.c
+    with engine.connect() as conn:
+        rows = conn.execute(
+            sa.select(columns.symbol, columns.name).where(columns.symbol.in_(list(symbols)))
+        )
+        return {row.symbol: row.name for row in rows}

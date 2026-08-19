@@ -66,6 +66,7 @@ class TelegramNotifier:
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self._chat_id = chat_id
+        self._names: dict[str, str] = {}  # 종목코드 → 이름 캐시
         self._engine = engine
         self._http = httpx.Client(
             base_url=f"https://api.telegram.org/bot{bot_token}",
@@ -82,6 +83,26 @@ class TelegramNotifier:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
+    def _label(self, symbol: str) -> str:
+        """`005930 삼성전자` 형태. 코드만으로는 어느 종목인지 즉시 알 수 없어
+        승인 판단이 느려진다.
+
+        이름을 못 찾으면 **코드만 돌려주고 절대 예외를 내지 않는다.** 이 알림은
+        사람이 승인해야 주문이 나가는 경로라, 이름 조회 실패로 알림이 끊기면
+        매매가 통째로 멈춘다 — 부가 정보 때문에 본 기능을 잃을 수는 없다.
+
+        이름은 상장 기간 중 거의 바뀌지 않으므로 프로세스 수명 동안 캐시한다.
+        """
+        if symbol not in self._names:
+            try:
+                from sontrader.data.master import load_names
+
+                self._names.update(load_names(self._engine, [symbol]))
+            except Exception:  # noqa: BLE001 — 알림이 우선이다
+                pass
+        name = self._names.get(symbol)
+        return f"{symbol} {name}" if name else symbol
+
     def send_message(self, text: str) -> None:
         """체결·손절·장애 알림 등 단방향 푸시."""
         self._call("sendMessage", {"chat_id": self._chat_id, "text": text})
@@ -92,7 +113,7 @@ class TelegramNotifier:
         그대로 파싱해 `engine.approval.decide()`를 호출한다."""
         text = (
             f"진입 승인 요청\n"
-            f"종목: {proposal.symbol}\n"
+            f"종목: {self._label(proposal.symbol)}\n"
             f"비중: {proposal.weight:.0%}\n"
             f"만료: {proposal.expires_at.isoformat()}"
         )
@@ -185,7 +206,7 @@ class TelegramNotifier:
         ]
         for proposal in pending:
             lines.append(
-                f"  - {proposal.symbol} ({proposal.weight:.0%}, "
+                f"  - {self._label(proposal.symbol)} ({proposal.weight:.0%}, "
                 f"만료 {proposal.expires_at.isoformat()})"
             )
         return "\n".join(lines)
