@@ -1,6 +1,12 @@
 import pytest
 
-from sontrader.config import PAPER_BASE_URL, REAL_BASE_URL, load_database_url, load_settings
+from sontrader.config import (
+    PAPER_BASE_URL,
+    REAL_BASE_URL,
+    load_database_url,
+    load_entry_trigger,
+    load_settings,
+)
 
 
 @pytest.fixture
@@ -87,3 +93,28 @@ def test_partial_postgres_vars_yield_none(env):
     env.setenv("POSTGRES_USER", "trader")
 
     assert load_database_url() is None
+
+
+def _no_dotenv(monkeypatch):
+    monkeypatch.setattr("sontrader.config.load_dotenv", lambda: None)
+
+
+def test_entry_trigger_defaults_to_watchlist(monkeypatch):
+    _no_dotenv(monkeypatch)
+    """LLM 없이도 신규 진입이 돌아가야 한다 — 기본값이 그 요건을 만족한다."""
+    monkeypatch.delenv("SONTRADER_ENTRY_TRIGGER", raising=False)
+    assert load_entry_trigger() == "watchlist"
+
+
+def test_entry_trigger_accepts_event(monkeypatch):
+    _no_dotenv(monkeypatch)
+    monkeypatch.setenv("SONTRADER_ENTRY_TRIGGER", "EVENT")
+    assert load_entry_trigger() == "event"
+
+
+def test_entry_trigger_rejects_unknown_values(monkeypatch):
+    _no_dotenv(monkeypatch)
+    """오타를 조용히 기본값으로 대체하면 전략이 말없이 바뀐다 — fail-closed."""
+    monkeypatch.setenv("SONTRADER_ENTRY_TRIGGER", "momentum")
+    with pytest.raises(RuntimeError, match="SONTRADER_ENTRY_TRIGGER"):
+        load_entry_trigger()

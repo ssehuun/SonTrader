@@ -48,14 +48,68 @@ def test_propose_is_idempotent_for_same_event_id(db_engine):
     assert len(approval.list_pending(db_engine)) == 1
 
 
-def test_propose_rejects_item_without_event_id(db_engine):
+def test_propose_accepts_item_without_event_id(db_engine):
+    """워치리스트 순위 진입은 촉발한 이벤트가 없다 (EntryTrigger.WATCHLIST_RANK).
+
+    예전에는 event_id를 필수로 요구해서, LLM 없이 진입하는 구성에서 승인 큐가
+    사이클을 통째로 예외로 죽였다.
+    """
     db.migrate(db_engine)
     item = TargetItem(
         symbol="005930", weight=0.2, urgency=Urgency.NEXT_OPEN, exit_rule=ExitRule(), event_id=None
     )
 
-    with pytest.raises(ValueError, match="event_id"):
-        approval.propose(db_engine, item, now=NOW)
+    proposal = approval.propose(db_engine, item, now=NOW)
+
+    assert proposal.symbol == "005930"
+    assert proposal.event_id is None
+    assert len(approval.list_pending(db_engine)) == 1
+
+
+def test_propose_without_event_id_dedups_on_symbol(db_engine):
+    """이벤트가 없으면 종목이 정체성이다 — 매 사이클 제안이 쌓이면 안 된다."""
+    db.migrate(db_engine)
+
+    def item(symbol):
+        return TargetItem(
+            symbol=symbol,
+            weight=0.2,
+            urgency=Urgency.NEXT_OPEN,
+            exit_rule=ExitRule(),
+            event_id=None,
+        )
+
+    first = approval.propose(db_engine, item("005930"), now=NOW)
+    again = approval.propose(db_engine, item("005930"), now=NOW)
+    other = approval.propose(db_engine, item("000660"), now=NOW)
+
+    assert again.proposal_id == first.proposal_id  # 같은 종목 → 재사용
+    assert other.proposal_id != first.proposal_id  # 다른 종목 → 별도 제안
+    assert len(approval.list_pending(db_engine)) == 2
+
+
+def test_event_and_symbol_keys_do_not_collide(db_engine):
+    """event_id가 우연히 종목코드와 같아도 섞이지 않는다."""
+    db.migrate(db_engine)
+    with_event = TargetItem(
+        symbol="005930",
+        weight=0.2,
+        urgency=Urgency.NEXT_OPEN,
+        exit_rule=ExitRule(),
+        event_id="005930",
+    )
+    without = TargetItem(
+        symbol="005930",
+        weight=0.2,
+        urgency=Urgency.NEXT_OPEN,
+        exit_rule=ExitRule(),
+        event_id=None,
+    )
+
+    a = approval.propose(db_engine, with_event, now=NOW)
+    b = approval.propose(db_engine, without, now=NOW)
+
+    assert a.proposal_id != b.proposal_id
 
 
 def test_propose_rejects_item_without_exit_rule(db_engine):

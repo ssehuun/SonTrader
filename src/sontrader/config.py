@@ -48,6 +48,24 @@ def load_dart_api_key() -> str | None:
     return _optional_env("DART_API_KEY")
 
 
+def load_entry_trigger() -> str:
+    """상시 가동의 신규 진입 트리거. ``watchlist``(기본) | ``event``.
+
+    기본값이 ``watchlist``인 이유는 두 가지다. (a) LLM 없이도 매매가 돌아가야
+    한다는 요건, (b) 백테스트로 실제 관통 검증을 마친 경로가 이쪽뿐이다 —
+    이벤트 경로는 LLM 응답이 있어야 진입 후보가 생기고, 그 성과가 워치리스트
+    단독보다 나은지 아직 비교되지 않았다.
+
+    환경변수로 **명시**하게 둔 이유: ANTHROPIC_API_KEY 유무로 자동 전환하면
+    키를 지우거나 만료시키는 것만으로 전략이 조용히 바뀐다. 실전에서 가장
+    위험한 종류의 사고라 기동 로그에도 어느 쪽인지 찍는다.
+    """
+    value = (_optional_env("SONTRADER_ENTRY_TRIGGER") or "watchlist").strip().lower()
+    if value not in ("watchlist", "event"):
+        raise RuntimeError(f"SONTRADER_ENTRY_TRIGGER must be 'watchlist' or 'event', got {value!r}")
+    return value
+
+
 def load_anthropic_api_key() -> str | None:
     """Claude API key for the LLM 판단 계층 (6단계)."""
     return _optional_env("ANTHROPIC_API_KEY")

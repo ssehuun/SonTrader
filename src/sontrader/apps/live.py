@@ -40,14 +40,16 @@ from sontrader.client import KisClient
 from sontrader.config import (
     load_anthropic_api_key,
     load_database_url,
+    load_entry_trigger,
     load_settings,
     load_telegram_bot_token,
     load_telegram_chat_id,
 )
+from sontrader.core.strategy import EntryTrigger, StrategyConfig
 from sontrader.data import calendar, db, live_bars
 from sontrader.engine import reconcile as reconcile_mod
 from sontrader.engine.live_context import JudgeFn, build_context
-from sontrader.engine.loop import Deps, run_cycle
+from sontrader.engine.loop import CycleConfig, Deps, run_cycle
 from sontrader.engine.reconcile import ReconcileReport
 
 CYCLE_INTERVAL = 60.0  # 초 — 텔레그램 폴링·이벤트/승인 확인 주기
@@ -62,6 +64,7 @@ def main() -> None:
     broker = KisBroker(client, engine)
     notifier = _build_notifier(engine)
     judge = _build_judge(engine)
+    cycle_config = _build_cycle_config(judge)
     stop = _install_signal_handlers()
 
     tick_stream: LiveTickStream | None = None
@@ -104,7 +107,7 @@ def main() -> None:
                 watchlist=_load_watchlist(engine, now.date()),
                 judge=judge or (lambda event: None),
             )
-            run_cycle(ctx, Deps(broker=broker, engine=engine, notifier=notifier))
+            run_cycle(ctx, Deps(broker=broker, engine=engine, notifier=notifier), cycle_config)
 
             stop.wait(CYCLE_INTERVAL)
     finally:
@@ -121,6 +124,25 @@ def _build_notifier(engine: sa.engine.Engine) -> TelegramNotifier | None:
     if not token or not chat_id:
         return None
     return TelegramNotifier(token, chat_id, engine)
+
+
+def _build_cycle_config(judge: JudgeFn | None) -> CycleConfig:
+    """진입 트리거를 확정한다. 어느 쪽인지 기동 로그에 반드시 남긴다 —
+    전략이 조용히 바뀌는 것이 실전에서 가장 위험하다."""
+    trigger = load_entry_trigger()
+    if trigger == "event":
+        if judge is None:
+            raise RuntimeError(
+                "SONTRADER_ENTRY_TRIGGER=event 인데 ANTHROPIC_API_KEY가 없습니다 "
+                "— 이 조합은 신규 진입이 영원히 0건이라 조용히 청산만 돌게 됩니다."
+            )
+        entry = EntryTrigger.EVENT
+        print("진입 트리거: 공시 이벤트 + LLM 판단", flush=True)
+    else:
+        entry = EntryTrigger.WATCHLIST_RANK
+        note = " (ANTHROPIC_API_KEY가 있지만 쓰지 않습니다)" if judge is not None else ""
+        print(f"진입 트리거: 워치리스트 순위 — LLM 미사용{note}", flush=True)
+    return CycleConfig(strategy=StrategyConfig(entry_trigger=entry))
 
 
 def _build_judge(engine: sa.engine.Engine) -> JudgeFn | None:

@@ -10,15 +10,18 @@ TTL을 만료시키는 순수 DB 로직만 다룬다. 신규 진입 후보를 `p
 (`core/gate.py`의 "킬 스위치·승인 큐는 core에 둘 수 없다" 주석 참고) 이
 모듈은 engine 계층에 있다.
 
-## 왜 event_id로 중복을 막는가
+## 무엇으로 중복을 막는가
 
 `core/strategy.py`의 `build_target()`은 승인이 나기 전까지 매 사이클 같은
 진입 후보를 계속 다시 내놓는다(승인 여부를 알지 못하니 당연하다).
 `propose()`를 멱등하게 만들지 않으면 사이클마다 같은 종목에 제안이 쌓인다.
-이벤트당 판단은 하나뿐이므로(Judgment 캐시, 4단계) event_id를 식별자로
-쓴다 — 같은 종목에 다른 이벤트가 새로 발생하면 별도 제안으로 취급한다(같은
-종목에 제안이 둘 이상 대기할 수 있다는 뜻이지만 드문 경우라 지금은 막지
-않는다).
+
+식별자는 **이벤트가 있으면 event_id, 없으면 종목코드**다(`_proposal_key`).
+이벤트 기반 진입(EntryTrigger.EVENT)은 이벤트당 판단이 하나뿐이라
+(Judgment 캐시, 4단계) event_id가 자연스러운 정체성이고, 같은 종목에 다른
+이벤트가 새로 발생하면 별도 제안으로 취급한다. 반면 워치리스트 순위 기반
+진입(EntryTrigger.WATCHLIST_RANK)은 촉발한 이벤트가 없으므로 종목 자체가
+정체성이다 — 이쪽은 한 종목에 제안이 하나만 대기하게 되어 더 엄격하다.
 
 ## TTL 경합
 
@@ -82,24 +85,32 @@ class Proposal:
     expires_at: datetime
 
 
+def _proposal_key(symbol: str, event_id: str | None) -> str:
+    """제안 중복 판정의 정체성. 이벤트가 있으면 그것이, 없으면 종목이 기준이다.
+
+    접두어를 붙이는 이유는 event_id가 우연히 종목코드와 같은 문자열이어도
+    섞이지 않게 하기 위해서다.
+    """
+    return f"event:{event_id}" if event_id is not None else f"symbol:{symbol}"
+
+
 def propose(
     engine: Engine, item: TargetItem, *, now: datetime, ttl: timedelta = DEFAULT_TTL
 ) -> Proposal:
     """진입 후보 하나를 대기열에 넣는다.
 
-    같은 event_id로 대기 중인 제안이 있으면 새로 만들지 않고 그걸 그대로
-    반환한다(멱등). 단, 그 기존 제안이 TTL을 넘겼다면 재사용하지 않고 먼저
-    만료 처리한 뒤 새로 만든다.
+    같은 후보(모듈 상단 `_proposal_key` 참고)로 대기 중인 제안이 있으면 새로
+    만들지 않고 그걸 그대로 반환한다(멱등). 단, 그 기존 제안이 TTL을 넘겼다면
+    재사용하지 않고 먼저 만료 처리한 뒤 새로 만든다.
     """
-    if item.event_id is None:
-        raise ValueError("approval proposals require an event_id")
     if item.exit_rule is None:
         raise ValueError("approval proposals require an exit_rule (entry candidates only)")
     if item.weight <= 0:
         raise ValueError("approval proposals require a positive weight (entry candidates only)")
 
+    key = _proposal_key(item.symbol, item.event_id)
     for existing in _load_by_status(engine, ApprovalStatus.PENDING):
-        if existing.event_id != item.event_id:
+        if _proposal_key(existing.symbol, existing.event_id) != key:
             continue
         if now >= existing.expires_at:
             _set_status(engine, existing.proposal_id, ApprovalStatus.EXPIRED)
