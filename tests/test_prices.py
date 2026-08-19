@@ -395,3 +395,58 @@ def test_self_heal_still_covers_lookback_when_history_is_shallow(db_engine):
 
     stored = dict(stored_closes(db_engine))
     assert min(stored) < shallow[0]  # 기존보다 더 과거까지 받았다
+
+
+def test_intraday_run_does_not_trigger_self_heal_next_day(db_engine):
+    """장중 수집이 남긴 임시 종가를 기업행위로 오인하면 안 된다.
+
+    실측: 어제 장 시작 전에 collect-prices를 돌려 08-18 임시 봉이 저장됐고,
+    다음 날 겹침 비교에서 최종 종가와 달라 3종목 중 2종목이 2018년까지
+    전체 재수집됐다(종목당 69초). 장중에 한 번 수집한 것만으로 전 종목
+    재수집이 유발되면 API 유량이 통째로 낭비된다.
+    """
+    db.migrate(db_engine)
+    days = business_days(TODAY - timedelta(days=1), 30)
+
+    # 1일차: 장중 실행 — 마지막 봉이 임시 종가(1000)로 저장된다.
+    provisional = FakeClient({d: raw_row(d, 1000) for d in days})
+    prices.collect_daily(db_engine, provisional, "005930", today=days[-1], lookback_days=60)
+
+    # 2일차: 그 봉의 최종 종가는 1200이었다 (임시값과 다르다).
+    final = dict.fromkeys(days[:-1], 1000)
+    final[days[-1]] = 1200
+    tomorrow = days[-1] + timedelta(days=1)
+    client = FakeClient({d: raw_row(d, c) for d, c in final.items()})
+    client.rows_by_date[tomorrow] = raw_row(tomorrow, 1210)
+
+    result = prices.collect_daily(db_engine, client, "005930", today=tomorrow, lookback_days=60)
+
+    assert result.full is False  # 전체 재수집이 아니다
+    stored = dict(stored_closes(db_engine))
+    assert stored[days[-1]] == 1200  # 임시값은 upsert로 갱신됐다
+    assert stored[tomorrow] == 1210
+
+
+def test_real_corporate_action_is_still_detected(db_engine):
+    """마지막 봉을 비교에서 빼도 진짜 기업행위는 잡아야 한다."""
+    db.migrate(db_engine)
+    days = business_days(TODAY - timedelta(days=1), 30)
+    prices.collect_daily(
+        db_engine,
+        FakeClient({d: raw_row(d, 1000) for d in days}),
+        "005930",
+        today=days[-1],
+        lookback_days=60,
+    )
+
+    # 액면분할: 과거 **전체**가 소급 조정된다 (마지막 봉만이 아니다).
+    tomorrow = days[-1] + timedelta(days=1)
+    halved = {d: raw_row(d, 500) for d in days}
+    halved[tomorrow] = raw_row(tomorrow, 505)
+    result = prices.collect_daily(
+        db_engine, FakeClient(halved), "005930", today=tomorrow, lookback_days=60
+    )
+
+    assert result.full is True
+    stored = stored_closes(db_engine)
+    assert all(stored[d] == 500 for d in days)

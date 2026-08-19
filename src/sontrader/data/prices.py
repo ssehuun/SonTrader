@@ -75,7 +75,7 @@ def collect_daily(
 
     fetched = _fetch_range(client, symbol, start, today, pace_seconds, sleep)
 
-    if not full and _was_adjusted(engine, symbol, fetched, today=today):
+    if not full and _was_adjusted(engine, symbol, fetched, today=today, last_stored=last_date):
         # 겹침 구간이 저장분과 다르다 = 기업행위로 과거가 소급 수정됨.
         # 전체 이력을 **먼저 받고, 성공한 뒤에야** 한 트랜잭션으로 교체한다 —
         # 지우고 나서 받다가 실패하면 종목 이력이 통째로 사라지기 때문.
@@ -336,16 +336,29 @@ def _last_stored_date(engine: Engine, symbol: str) -> date | None:
 
 
 def _was_adjusted(
-    engine: Engine, symbol: str, fetched: list[dict[str, Any]], *, today: date
+    engine: Engine,
+    symbol: str,
+    fetched: list[dict[str, Any]],
+    *,
+    today: date,
+    last_stored: date | None = None,
 ) -> bool:
     """겹침 구간에서 저장분과 (종가, 거래량)이 하나라도 다르면 소급 수정으로 판단.
 
-    - 오늘 봉은 비교에서 뺀다: 장중 실행이면 임시 종가가 저장돼 있어 기업행위로
-      오인되고, 전 종목 대량 재수집을 유발한다 (오늘 봉 자체는 upsert로 갱신됨).
+    - **오늘 봉과 저장된 마지막 봉**은 비교에서 뺀다. 오늘 봉은 장중 실행이면
+      임시 종가라서고, 저장된 마지막 봉은 **이전 실행이 장중이었다면 그때의
+      임시 종가가 굳어 있어서**다. 후자를 빼지 않으면 장중에 한 번 수집한 것만
+      으로 다음 날 그 종목이 통째로 재수집된다 — 실측으로 3종목 중 2종목이
+      2018년까지 재수집돼 종목당 69초가 걸렸다. 둘 다 upsert로 갱신되므로
+      비교에서 빼도 데이터는 최신이 된다.
     - 거래량도 비교한다: 액면분할은 거래량도 역비율로 환산되므로, 수정계수가
       1에 가까워 정수 종가가 우연히 같아지는 경우를 거래량이 잡아낸다.
+
+    겹침이 OVERLAP_DAYS(10일)라 둘을 빼도 비교할 봉이 여러 개 남는다 —
+    기업행위는 과거 전체를 바꾸므로 한 봉만 봐도 잡히지만, 여유가 있는 편이 낫다.
     """
-    comparable = [row for row in fetched if row["date"] < today]
+    cutoff = today if last_stored is None else min(today, last_stored)
+    comparable = [row for row in fetched if row["date"] < cutoff]
     if not comparable:
         return False
     dates = [row["date"] for row in comparable]
