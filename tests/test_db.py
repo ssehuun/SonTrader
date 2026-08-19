@@ -21,6 +21,7 @@ NEW_TABLES = {
     "stock_candles_1m",
     "market_calendar",
     "watchlist_snapshots",
+    "cycle_log",
 }
 
 

@@ -28,6 +28,7 @@ from __future__ import annotations
 import sqlalchemy as sa
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     Column,
     Date,
     DateTime,
@@ -292,6 +293,30 @@ def upsert_rows(
             }
             stmt = stmt.on_conflict_do_update(index_elements=list(key_cols), set_=update_cols)
         conn.execute(stmt)
+
+
+cycle_log = Table(
+    "cycle_log",
+    metadata,
+    Column("ts", DateTime, primary_key=True, comment="사이클 시각 (KST naive)"),
+    Column("watchlist_n", Integer, nullable=False),
+    Column("positions_n", Integer, nullable=False),
+    Column("cash", BigInteger, nullable=False),
+    Column("equity", BigInteger, nullable=False),
+    Column("pending_n", Integer, nullable=False, comment="승인 대기 중인 제안 수"),
+    Column("orders_n", Integer, nullable=False, comment="이번 사이클에 제출한 주문 수"),
+    Column(
+        "rejections",
+        _JSON,
+        comment="게이트가 스킵한 신규 진입 [{symbol, reason, event_id}]. '왜 안 샀나'의 근거",
+    ),
+    Column(
+        "halted",
+        Boolean,
+        nullable=False,
+        comment="reconcile 불일치로 매매를 중단했는가",
+    ),
+)
 
 
 def migrate(engine: Engine) -> list[str]:

@@ -46,7 +46,8 @@ from sontrader.config import (
     load_telegram_chat_id,
 )
 from sontrader.core.strategy import EntryTrigger, StrategyConfig
-from sontrader.data import calendar, db, live_bars
+from sontrader.data import calendar, cycle_log, db, live_bars
+from sontrader.engine import approval
 from sontrader.engine import reconcile as reconcile_mod
 from sontrader.engine.live_context import JudgeFn, build_context
 from sontrader.engine.loop import CycleConfig, Deps, run_cycle
@@ -96,18 +97,46 @@ def main() -> None:
 
             report = reconcile_mod.reconcile(engine, broker)
             if report.halt:
+                # 중단도 기록한다 — 로그에 구멍만 남으면 "죽었다"와 "멈췄다"를
+                # 구분할 수 없다.
+                cycle_log.record(
+                    engine,
+                    ts=now,
+                    watchlist_n=0,
+                    positions_n=len(report.positions),
+                    cash=0,
+                    equity=0,
+                    halted=True,
+                )
                 _halt(notifier, report)
                 return
 
+            watchlist = _load_watchlist(engine, now.date())
             ctx = build_context(
                 engine,
                 now=now,
                 positions=report.positions,
                 cash=broker.cash(),
-                watchlist=_load_watchlist(engine, now.date()),
+                watchlist=watchlist,
                 judge=judge or (lambda event: None),
             )
-            run_cycle(ctx, Deps(broker=broker, engine=engine, notifier=notifier), cycle_config)
+            result = run_cycle(
+                ctx, Deps(broker=broker, engine=engine, notifier=notifier), cycle_config
+            )
+            # 사이클마다 무조건 남긴다. "변화가 있을 때만" 조건을 걸면 정작
+            # 필요한 "아무 일도 없었다"는 사실이 사라지고, 로그의 구멍이
+            # 다운타임인지 무거래인지 구분할 수 없게 된다.
+            cycle_log.record(
+                engine,
+                ts=now,
+                watchlist_n=len(watchlist),
+                positions_n=len(ctx.positions),
+                cash=ctx.cash,
+                equity=ctx.equity,
+                pending_n=len(approval.list_pending(engine)),
+                orders_n=len(result.orders),
+                rejections=result.rejections,
+            )
 
             stop.wait(CYCLE_INTERVAL)
     finally:
