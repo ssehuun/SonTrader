@@ -1,6 +1,13 @@
 #!/bin/sh
 # 장 마감 후 일일 수집 체인: 일봉 → 워치리스트.
-# cron으로 매일 16:00 KST(=07:00 UTC, 이 서버 타임존) 평일 실행 — crontab 참고.
+#
+# cron 예시 (평일 16:00 KST). cron은 서버 타임존을 따르므로 둘 중 맞는 것을 쓴다:
+#   KST 서버 : 0 16 * * 1-5 /path/to/SonTrader/scripts/daily_collect.sh
+#   UTC 서버 : 0  7 * * 1-5 /path/to/SonTrader/scripts/daily_collect.sh
+#
+# **16:00보다 이르게 잡지 말 것.** collect-prices는 15:40(KST) 전에 실행하면
+# 오늘 봉이 임시 종가라 저장하지 않고 건너뛴다 — 그날 워치리스트가 하루
+# 묵은 데이터로 만들어진다 (src/sontrader/data/prices.py의 include_today 참고).
 #
 # collect-dart(공시 수집)는 뺐다 — 지금 실전 진입 트리거 기본값이
 # SONTRADER_ENTRY_TRIGGER=watchlist(모멘텀 단독)라 공시 데이터가 필요
@@ -8,14 +15,40 @@
 #
 # &&로 묶는다: 앞 단계가 실패하면 뒤를 돌리지 않는다. 시세 수집이 실패했는데
 # 옛 데이터로 워치리스트를 다시 만들면 그날의 워치리스트가 조용히 틀어진다.
-#
-# cron은 인터랙티브 셸이 아니라 PATH가 최소한만 잡혀 있어 uv를 전체 경로로 부른다.
 
 set -e
 
 cd "$(dirname "$0")/.." || exit 1
 
-UV=/home/shn413.jung/.local/bin/uv
+# uv 경로 찾기. cron은 인터랙티브 셸이 아니라 PATH가 최소한만 잡혀 있어
+# `uv`를 그냥 부르면 실패한다 — 그렇다고 특정 머신 경로를 박아두면 다른
+# 환경에서 안 돈다. 환경변수 → PATH → 흔한 설치 위치 순으로 찾는다.
+#   UV=/some/path/uv scripts/daily_collect.sh   ← 위 어디에도 없을 때
+if [ -z "$UV" ]; then
+    UV=$(command -v uv 2>/dev/null) || true
+fi
+if [ -z "$UV" ]; then
+    for candidate in \
+        "$HOME/.local/bin/uv" \
+        /opt/homebrew/bin/uv \
+        /usr/local/bin/uv \
+        /usr/bin/uv
+    do
+        if [ -x "$candidate" ]; then
+            UV=$candidate
+            break
+        fi
+    done
+fi
+if [ -z "$UV" ] || [ ! -x "$UV" ]; then
+    echo "daily_collect: uv를 찾을 수 없습니다. UV=/path/to/uv 로 지정하세요." >&2
+    exit 127
+fi
+
+# 실패한 cron 실행을 나중에 추적하려면 무엇이 언제 돌았는지 남아야 한다.
+echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] daily_collect 시작 (uv=$UV)"
 
 "$UV" run sontrader collect-prices \
   && "$UV" run sontrader build-universe
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] daily_collect 완료"
