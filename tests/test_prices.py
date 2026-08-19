@@ -450,3 +450,51 @@ def test_real_corporate_action_is_still_detected(db_engine):
     assert result.full is True
     stored = stored_closes(db_engine)
     assert all(stored[d] == 500 for d in days)
+
+
+def test_include_today_false_does_not_store_the_provisional_bar(db_engine):
+    """장중 수집은 오늘 봉을 저장하지 않는다.
+
+    저장하면 (a) 실전 청산이 임시 종가로 발동하고 — 백테스트는 확정 종가로
+    판정하므로 검증한 적 없는 동작이다, (b) build-universe 스냅샷이 재현
+    불가능해지고, (c) 다음 날 그 종목이 통째로 재수집된다.
+    """
+    db.migrate(db_engine)
+    days = business_days(TODAY, 20)
+    client = FakeClient({d: raw_row(d, 1000) for d in days})
+
+    prices.collect_daily(
+        db_engine, client, "005930", today=TODAY, lookback_days=60, include_today=False
+    )
+
+    stored = dict(stored_closes(db_engine))
+    assert TODAY not in stored
+    assert max(stored) == days[-2]
+    assert client.calls  # 조회는 오늘까지 하되 저장만 안 한다
+
+
+def test_include_today_false_also_applies_to_self_heal(db_engine):
+    """전체 재수집 경로에도 같은 규칙이 걸려야 한다."""
+    db.migrate(db_engine)
+    days = business_days(TODAY - timedelta(days=1), 20)
+    prices.collect_daily(
+        db_engine,
+        FakeClient({d: raw_row(d, 1000) for d in days}),
+        "005930",
+        today=days[-1],
+        lookback_days=60,
+    )
+
+    halved = {d: raw_row(d, 500) for d in days}
+    halved[TODAY] = raw_row(TODAY, 505)
+    result = prices.collect_daily(
+        db_engine,
+        FakeClient(halved),
+        "005930",
+        today=TODAY,
+        lookback_days=60,
+        include_today=False,
+    )
+
+    assert result.full is True
+    assert TODAY not in dict(stored_closes(db_engine))

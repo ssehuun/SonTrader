@@ -76,8 +76,10 @@ uv run sontrader backfill-prices --earliest 20180101   # 2018년까지 소급 �
 uv run sontrader build-universe                 # 모멘텀 워치리스트 산출 + 일별 스냅샷 저장
 ```
 
-`collect-dart`/`collect-prices`/`build-universe`는 매일 장 시작 전 실행해야 그날의 이벤트·
-시세·워치리스트가 쌓인다 — cron이나 systemd timer로 스케줄링한다.
+`collect-dart`/`collect-prices`/`build-universe`는 **매일 장 마감 후(15:40 이후)** 실행한다 —
+cron이나 systemd timer로 스케줄링한다. 장중에 돌리면 `collect-prices`가 오늘 봉을 저장하지
+않고 건너뛴다(임시 종가라서). 그대로 저장하면 실전 청산이 임시 종가로 발동하고,
+`build-universe` 스냅샷이 재현 불가능해지며, 다음 날 그 종목이 통째로 재수집된다.
 
 `collect-prices`는 저장된 마지막 봉에서 **앞으로만** 간다. 한번 수집한 뒤 `--lookback-days`를
 키워도 과거는 늘지 않으므로, 백테스트 기간을 늘리려면 `backfill-prices`를 쓴다. 백필은 기존

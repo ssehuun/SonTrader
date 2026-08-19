@@ -64,8 +64,21 @@ def collect_daily(
     lookback_days: int = LOOKBACK_DAYS,
     pace_seconds: float = 0.0,
     sleep: Callable[[float], None] = time_module.sleep,
+    include_today: bool = True,
 ) -> CollectResult:
-    """한 종목의 일봉을 증분 수집한다. 재실행해도 결과가 같다 (upsert)."""
+    """한 종목의 일봉을 증분 수집한다. 재실행해도 결과가 같다 (upsert).
+
+    `include_today=False`면 오늘 봉을 **저장하지 않는다**. 장중에 받은 오늘
+    봉은 임시 종가라서, 저장하면 세 가지가 한꺼번에 어긋난다:
+
+    - 실전 청산이 임시 종가로 발동한다. 백테스트는 확정 종가로 판정한 뒤
+      다음 시가에 체결하므로, 검증한 적 없는 동작이 실전에서만 일어난다.
+    - `build-universe` 스냅샷이 재현 불가능해진다 (같은 날 다시 돌리면 값이
+      다르다).
+    - 다음 날 겹침 비교에서 최종 종가와 달라 그 종목이 통째로 재수집된다.
+
+    장이 끝났는지는 호출자가 판단한다 — 이 모듈은 시장 운영시간을 알지 않는다.
+    """
     last_date = _last_stored_date(engine, symbol)
     full = last_date is None
     if full:
@@ -87,12 +100,26 @@ def collect_daily(
         oldest = _first_stored_date(engine, symbol)
         default_start = today - timedelta(days=lookback_days)
         start = min(oldest, default_start) if oldest is not None else default_start
-        full_rows = _fetch_range(client, symbol, start, today, pace_seconds, sleep)
+        full_rows = _keep_final(
+            _fetch_range(client, symbol, start, today, pace_seconds, sleep),
+            today=today,
+            include_today=include_today,
+        )
         _replace_symbol(engine, symbol, full_rows)
         return CollectResult(symbol=symbol, rows=len(full_rows), full=True)
 
-    _upsert(engine, fetched)
-    return CollectResult(symbol=symbol, rows=len(fetched), full=full)
+    storable = _keep_final(fetched, today=today, include_today=include_today)
+    _upsert(engine, storable)
+    return CollectResult(symbol=symbol, rows=len(storable), full=full)
+
+
+def _keep_final(
+    rows: list[dict[str, Any]], *, today: date, include_today: bool
+) -> list[dict[str, Any]]:
+    """확정된 봉만 남긴다 (`collect_daily`의 `include_today` 참고)."""
+    if include_today:
+        return rows
+    return [row for row in rows if row["date"] < today]
 
 
 @dataclass(frozen=True)
@@ -207,6 +234,7 @@ def collect_daily_all(
     pace_seconds: float = 0.0,
     sleep: Callable[[float], None] = time_module.sleep,
     on_progress: Callable[[int, int], None] | None = None,
+    include_today: bool = True,
 ) -> tuple[list[CollectResult], list[tuple[str, Exception]]]:
     """여러 종목 수집. 한 종목의 실패가 전체를 중단시키지 않는다."""
     results: list[CollectResult] = []
@@ -222,6 +250,7 @@ def collect_daily_all(
                     lookback_days=lookback_days,
                     pace_seconds=pace_seconds,
                     sleep=sleep,
+                    include_today=include_today,
                 )
             )
         except Exception as exc:  # noqa: BLE001 — 종목 단위 격리가 목적
