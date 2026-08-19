@@ -118,8 +118,11 @@ def _resolve_entries(
     for item in target:
         if item.symbol in held or item.weight <= 0.0:
             continue
-        proposal = approval.propose(deps.engine, item, now=ctx.now, ttl=cfg.approval_ttl)
-        if deps.notifier is not None:
+        proposal, created = approval.propose(deps.engine, item, now=ctx.now, ttl=cfg.approval_ttl)
+        # 새로 만든 제안만 알린다. build_target()이 승인 전까지 매 사이클 같은
+        # 후보를 다시 내놓으므로, created를 보지 않으면 60초마다 같은 요청이
+        # 재전송된다.
+        if created and deps.notifier is not None:
             deps.notifier.send_approval_request(proposal)
 
     expired = approval.expire_stale(deps.engine, now=ctx.now)

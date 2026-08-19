@@ -29,7 +29,7 @@ def entry_item(*, symbol="005930", event_id="evt-1", weight=0.20) -> TargetItem:
 def test_propose_creates_pending_proposal_with_ttl(db_engine):
     db.migrate(db_engine)
 
-    proposal = approval.propose(db_engine, entry_item(), now=NOW, ttl=timedelta(hours=6))
+    proposal, _ = approval.propose(db_engine, entry_item(), now=NOW, ttl=timedelta(hours=6))
 
     assert proposal.status is approval.ApprovalStatus.PENDING
     assert proposal.symbol == "005930"
@@ -41,8 +41,8 @@ def test_propose_creates_pending_proposal_with_ttl(db_engine):
 def test_propose_is_idempotent_for_same_event_id(db_engine):
     db.migrate(db_engine)
 
-    first = approval.propose(db_engine, entry_item(), now=NOW)
-    second = approval.propose(db_engine, entry_item(), now=NOW + timedelta(minutes=5))
+    first, _ = approval.propose(db_engine, entry_item(), now=NOW)
+    second, _ = approval.propose(db_engine, entry_item(), now=NOW + timedelta(minutes=5))
 
     assert first.proposal_id == second.proposal_id
     assert len(approval.list_pending(db_engine)) == 1
@@ -59,7 +59,7 @@ def test_propose_accepts_item_without_event_id(db_engine):
         symbol="005930", weight=0.2, urgency=Urgency.NEXT_OPEN, exit_rule=ExitRule(), event_id=None
     )
 
-    proposal = approval.propose(db_engine, item, now=NOW)
+    proposal, _ = approval.propose(db_engine, item, now=NOW)
 
     assert proposal.symbol == "005930"
     assert proposal.event_id is None
@@ -79,9 +79,9 @@ def test_propose_without_event_id_dedups_on_symbol(db_engine):
             event_id=None,
         )
 
-    first = approval.propose(db_engine, item("005930"), now=NOW)
-    again = approval.propose(db_engine, item("005930"), now=NOW)
-    other = approval.propose(db_engine, item("000660"), now=NOW)
+    first, _ = approval.propose(db_engine, item("005930"), now=NOW)
+    again, _ = approval.propose(db_engine, item("005930"), now=NOW)
+    other, _ = approval.propose(db_engine, item("000660"), now=NOW)
 
     assert again.proposal_id == first.proposal_id  # 같은 종목 → 재사용
     assert other.proposal_id != first.proposal_id  # 다른 종목 → 별도 제안
@@ -106,8 +106,8 @@ def test_event_and_symbol_keys_do_not_collide(db_engine):
         event_id=None,
     )
 
-    a = approval.propose(db_engine, with_event, now=NOW)
-    b = approval.propose(db_engine, without, now=NOW)
+    a, _ = approval.propose(db_engine, with_event, now=NOW)
+    b, _ = approval.propose(db_engine, without, now=NOW)
 
     assert a.proposal_id != b.proposal_id
 
@@ -124,9 +124,9 @@ def test_propose_rejects_item_without_exit_rule(db_engine):
 
 def test_propose_creates_new_proposal_when_existing_one_expired(db_engine):
     db.migrate(db_engine)
-    stale = approval.propose(db_engine, entry_item(), now=NOW, ttl=timedelta(minutes=1))
+    stale, _ = approval.propose(db_engine, entry_item(), now=NOW, ttl=timedelta(minutes=1))
 
-    fresh = approval.propose(db_engine, entry_item(), now=NOW + timedelta(hours=1))
+    fresh, _ = approval.propose(db_engine, entry_item(), now=NOW + timedelta(hours=1))
 
     assert fresh.proposal_id != stale.proposal_id
     assert fresh.status is approval.ApprovalStatus.PENDING
@@ -136,7 +136,7 @@ def test_propose_creates_new_proposal_when_existing_one_expired(db_engine):
 
 def test_decide_approve_transitions_to_approved(db_engine):
     db.migrate(db_engine)
-    proposal = approval.propose(db_engine, entry_item(), now=NOW)
+    proposal, _ = approval.propose(db_engine, entry_item(), now=NOW)
 
     decided = approval.decide(db_engine, proposal.proposal_id, approve=True, now=NOW)
 
@@ -146,7 +146,7 @@ def test_decide_approve_transitions_to_approved(db_engine):
 
 def test_decide_reject_transitions_to_rejected(db_engine):
     db.migrate(db_engine)
-    proposal = approval.propose(db_engine, entry_item(), now=NOW)
+    proposal, _ = approval.propose(db_engine, entry_item(), now=NOW)
 
     decided = approval.decide(db_engine, proposal.proposal_id, approve=False, now=NOW)
 
@@ -155,7 +155,7 @@ def test_decide_reject_transitions_to_rejected(db_engine):
 
 def test_decide_raises_when_already_decided(db_engine):
     db.migrate(db_engine)
-    proposal = approval.propose(db_engine, entry_item(), now=NOW)
+    proposal, _ = approval.propose(db_engine, entry_item(), now=NOW)
     approval.decide(db_engine, proposal.proposal_id, approve=True, now=NOW)
 
     with pytest.raises(approval.ProposalNotPendingError):
@@ -164,7 +164,7 @@ def test_decide_raises_when_already_decided(db_engine):
 
 def test_decide_raises_and_expires_when_ttl_passed(db_engine):
     db.migrate(db_engine)
-    proposal = approval.propose(db_engine, entry_item(), now=NOW, ttl=timedelta(hours=1))
+    proposal, _ = approval.propose(db_engine, entry_item(), now=NOW, ttl=timedelta(hours=1))
 
     with pytest.raises(approval.ProposalNotPendingError):
         approval.decide(db_engine, proposal.proposal_id, approve=True, now=NOW + timedelta(hours=2))
@@ -181,7 +181,7 @@ def test_decide_raises_for_unknown_proposal_id(db_engine):
 
 def test_expire_stale_marks_pending_past_ttl_as_expired_and_returns_them(db_engine):
     db.migrate(db_engine)
-    proposal = approval.propose(db_engine, entry_item(), now=NOW, ttl=timedelta(hours=1))
+    proposal, _ = approval.propose(db_engine, entry_item(), now=NOW, ttl=timedelta(hours=1))
 
     expired = approval.expire_stale(db_engine, now=NOW + timedelta(hours=2))
 
@@ -202,7 +202,7 @@ def test_expire_stale_leaves_fresh_pending_untouched(db_engine):
 
 def test_pull_approved_consumes_and_returns_approved_proposals(db_engine):
     db.migrate(db_engine)
-    proposal = approval.propose(db_engine, entry_item(), now=NOW)
+    proposal, _ = approval.propose(db_engine, entry_item(), now=NOW)
     approval.decide(db_engine, proposal.proposal_id, approve=True, now=NOW)
 
     pulled = approval.pull_approved(db_engine)
@@ -213,7 +213,7 @@ def test_pull_approved_consumes_and_returns_approved_proposals(db_engine):
 
 def test_pull_approved_does_not_return_same_proposal_twice(db_engine):
     db.migrate(db_engine)
-    proposal = approval.propose(db_engine, entry_item(), now=NOW)
+    proposal, _ = approval.propose(db_engine, entry_item(), now=NOW)
     approval.decide(db_engine, proposal.proposal_id, approve=True, now=NOW)
     approval.pull_approved(db_engine)
 
@@ -222,10 +222,34 @@ def test_pull_approved_does_not_return_same_proposal_twice(db_engine):
 
 def test_list_pending_only_returns_pending(db_engine):
     db.migrate(db_engine)
-    pending = approval.propose(db_engine, entry_item(event_id="evt-pending"), now=NOW)
-    approved = approval.propose(db_engine, entry_item(event_id="evt-approved"), now=NOW)
+    pending, _ = approval.propose(db_engine, entry_item(event_id="evt-pending"), now=NOW)
+    approved, _ = approval.propose(db_engine, entry_item(event_id="evt-approved"), now=NOW)
     approval.decide(db_engine, approved.proposal_id, approve=True, now=NOW)
 
     result = approval.list_pending(db_engine)
 
     assert [p.proposal_id for p in result] == [pending.proposal_id]
+
+
+def test_propose_reports_whether_it_created_a_new_proposal(db_engine):
+    """알림 재전송을 막는 근거. build_target()이 승인 전까지 매 사이클 같은
+    후보를 다시 내놓으므로, 호출자가 이 값을 보지 않으면 60초마다 같은
+    승인 요청이 텔레그램으로 다시 나간다 — 실제로 10분 만에 50건이 나갔다."""
+    db.migrate(db_engine)
+
+    _, created_first = approval.propose(db_engine, entry_item(), now=NOW)
+    _, created_again = approval.propose(db_engine, entry_item(), now=NOW)
+
+    assert created_first is True
+    assert created_again is False
+
+
+def test_expired_proposal_is_replaced_and_reported_as_new(db_engine):
+    """TTL을 넘긴 제안을 재사용하지 않으므로, 새 제안은 다시 알려야 한다."""
+    db.migrate(db_engine)
+    first, _ = approval.propose(db_engine, entry_item(), now=NOW, ttl=timedelta(hours=1))
+
+    second, created = approval.propose(db_engine, entry_item(), now=NOW + timedelta(hours=2))
+
+    assert created is True
+    assert second.proposal_id != first.proposal_id

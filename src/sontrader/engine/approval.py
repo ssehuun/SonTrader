@@ -96,12 +96,17 @@ def _proposal_key(symbol: str, event_id: str | None) -> str:
 
 def propose(
     engine: Engine, item: TargetItem, *, now: datetime, ttl: timedelta = DEFAULT_TTL
-) -> Proposal:
-    """진입 후보 하나를 대기열에 넣는다.
+) -> tuple[Proposal, bool]:
+    """진입 후보 하나를 대기열에 넣는다. 반환은 `(제안, 새로 만들었는가)`.
 
     같은 후보(모듈 상단 `_proposal_key` 참고)로 대기 중인 제안이 있으면 새로
     만들지 않고 그걸 그대로 반환한다(멱등). 단, 그 기존 제안이 TTL을 넘겼다면
     재사용하지 않고 먼저 만료 처리한 뒤 새로 만든다.
+
+    두 번째 값이 필요한 이유는 **알림 때문**이다. `build_target()`이 승인 전까지
+    매 사이클 같은 후보를 다시 내놓으므로, 호출자가 이걸 보지 않고 알림을 보내면
+    60초마다 같은 승인 요청이 재전송된다 — TTL이 12시간이면 한 건당 700통이 넘고,
+    텔레그램 유량에도 걸린다. 실제로 겪었다.
     """
     if item.exit_rule is None:
         raise ValueError("approval proposals require an exit_rule (entry candidates only)")
@@ -115,7 +120,7 @@ def propose(
         if now >= existing.expires_at:
             _set_status(engine, existing.proposal_id, ApprovalStatus.EXPIRED)
             continue
-        return existing
+        return existing, False
 
     proposal_id = str(uuid.uuid4())
     expires_at = now + ttl
@@ -128,14 +133,17 @@ def propose(
                 expires_at=expires_at,
             )
         )
-    return Proposal(
-        proposal_id,
-        item.symbol,
-        item.weight,
-        item.exit_rule,
-        item.event_id,
-        ApprovalStatus.PENDING,
-        expires_at,
+    return (
+        Proposal(
+            proposal_id,
+            item.symbol,
+            item.weight,
+            item.exit_rule,
+            item.event_id,
+            ApprovalStatus.PENDING,
+            expires_at,
+        ),
+        True,
     )
 
 

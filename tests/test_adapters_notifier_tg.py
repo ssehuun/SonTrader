@@ -63,7 +63,7 @@ def test_send_message_posts_to_telegram_with_chat_id_and_text(db_engine):
 
 def test_send_approval_request_includes_inline_keyboard_with_proposal_id(db_engine):
     db.migrate(db_engine)
-    proposal = approval.propose(db_engine, entry_item(), now=NOW)
+    proposal, _ = approval.propose(db_engine, entry_item(), now=NOW)
     calls = []
 
     def responder(request):
@@ -91,7 +91,7 @@ def test_call_raises_telegram_error_when_ok_is_false(db_engine):
 
 def test_process_update_approves_proposal_on_callback(db_engine):
     db.migrate(db_engine)
-    proposal = approval.propose(db_engine, entry_item(), now=NOW)
+    proposal, _ = approval.propose(db_engine, entry_item(), now=NOW)
     notifier = make_notifier(db_engine, lambda request: ok_response())
 
     update = {
@@ -111,7 +111,7 @@ def test_process_update_still_confirms_when_answer_callback_query_fails(db_engin
     (실전 테스트 중 실제로 재현됨), 이미 반영된 결정의 확인 메시지는 여전히
     나가야 한다."""
     db.migrate(db_engine)
-    proposal = approval.propose(db_engine, entry_item(), now=NOW)
+    proposal, _ = approval.propose(db_engine, entry_item(), now=NOW)
     calls = []
 
     def responder(request):
@@ -133,7 +133,7 @@ def test_process_update_still_confirms_when_answer_callback_query_fails(db_engin
 
 def test_process_update_rejects_proposal_on_callback(db_engine):
     db.migrate(db_engine)
-    proposal = approval.propose(db_engine, entry_item(), now=NOW)
+    proposal, _ = approval.propose(db_engine, entry_item(), now=NOW)
     notifier = make_notifier(db_engine, lambda request: ok_response())
 
     update = {"callback_query": {"id": "cb-1", "data": f"reject:{proposal.proposal_id}"}}
@@ -162,7 +162,7 @@ def test_process_update_answers_error_for_unknown_proposal(db_engine):
 
 def test_process_update_answers_error_for_already_decided_proposal(db_engine):
     db.migrate(db_engine)
-    proposal = approval.propose(db_engine, entry_item(), now=NOW)
+    proposal, _ = approval.propose(db_engine, entry_item(), now=NOW)
     approval.decide(db_engine, proposal.proposal_id, approve=True, now=NOW)
     calls = []
 
@@ -184,7 +184,7 @@ def test_process_update_answers_error_for_already_decided_proposal(db_engine):
 
 def test_process_update_expired_proposal_is_not_approved(db_engine):
     db.migrate(db_engine)
-    proposal = approval.propose(db_engine, entry_item(), now=NOW, ttl=timedelta(hours=1))
+    proposal, _ = approval.propose(db_engine, entry_item(), now=NOW, ttl=timedelta(hours=1))
     notifier = make_notifier(db_engine, lambda request: ok_response())
 
     update = {"callback_query": {"id": "cb-1", "data": f"approve:{proposal.proposal_id}"}}
@@ -279,7 +279,7 @@ def test_approval_request_includes_the_symbol_name(db_engine):
     sent, notifier = _capture(db_engine)
 
     notifier.send_approval_request(
-        approval.propose(db_engine, entry_item(symbol="005930"), now=NOW)
+        approval.propose(db_engine, entry_item(symbol="005930"), now=NOW)[0]
     )
 
     assert "005930 삼성전자" in sent[0]["text"]
@@ -295,7 +295,7 @@ def test_missing_name_falls_back_to_the_code(db_engine):
     sent, notifier = _capture(db_engine)
 
     notifier.send_approval_request(
-        approval.propose(db_engine, entry_item(symbol="999999"), now=NOW)
+        approval.propose(db_engine, entry_item(symbol="999999"), now=NOW)[0]
     )
 
     assert "999999" in sent[0]["text"]
