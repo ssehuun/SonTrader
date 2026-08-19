@@ -132,6 +132,22 @@ def has_recent_halt(volumes: Sequence[int | None], *, bars: int = HALT_LOOKBACK_
     return any(v is None or v <= 0 for v in recent)
 
 
+def is_penny(closes: Sequence[float | None], *, min_price: int = MIN_BASE_PRICE) -> bool:
+    """마지막 종가가 하한 미만인가 (동전주).
+
+    `is_tradeable()`의 기준가 검사와 같은 목적이지만 **그날의 종가**를 본다.
+    마스터의 `base_price`는 오늘 값뿐이라 과거 스냅샷에 적용하면 "오늘 동전주인
+    회사는 2019년에도 제외"가 되어 생존 편향이 들어간다. 종가는 그 시점의
+    사실이므로 과거에도 그대로 유효하다.
+
+    값이 없으면 제외한다 — fail-closed.
+    """
+    if not closes:
+        return True
+    last = closes[-1]
+    return last is None or last < min_price
+
+
 def is_tradeable(info: SecurityInfo, *, min_base_price: int = MIN_BASE_PRICE) -> bool:
     # 핵심 안전 플래그가 NULL이면(마스터 미수집 행) 통과가 아니라 제외한다
     # — fail-closed. 정상 수집된 행은 항상 'Y'/'N' 같은 문자를 갖는다.

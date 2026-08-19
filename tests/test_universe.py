@@ -67,7 +67,8 @@ def flat_then_up(final_return, bars=7):
 
 
 def build(engine, **kwargs):
-    params = dict(as_of=AS_OF, lookback=5, skip=1, min_avg_trade_value=1_000_000_000)
+    # 픽스처 가격이 100원대라 동전주 필터를 끈다 — 그 필터는 아래에서 따로 본다.
+    params = dict(as_of=AS_OF, lookback=5, skip=1, min_avg_trade_value=1_000_000_000, min_close=0)
     params.update(kwargs)
     return universe.build_snapshot(engine, **params)
 
@@ -255,3 +256,21 @@ def test_tradeable_scope_remains_the_default(db_engine):
 
     # listing_date 없이도 기본 모드는 동작한다 (is_tradeable은 날짜를 안 본다)
     assert build(db_engine).candidates == 1
+
+
+def test_penny_stocks_are_excluded_by_that_days_close(db_engine):
+    """마스터의 base_price가 아니라 **그날 종가**로 판정한다.
+
+    base_price는 오늘 값뿐이라 과거 스냅샷에 쓰면 "오늘 동전주인 회사는
+    2019년에도 제외"가 되어 생존 편향이 된다. 종가는 그 시점의 사실이다.
+    """
+    db.migrate(db_engine)
+    seed_master(db_engine, "005930")
+    seed_master(db_engine, "000660")
+    seed_candles(db_engine, "005930", [x * 20 for x in flat_then_up(0.5)])  # 2,000원대
+    seed_candles(db_engine, "000660", flat_then_up(0.9))  # 100원대 — 동전주
+
+    result = build(db_engine, min_close=1000)
+
+    assert [e.symbol for e in result.entries] == ["005930"]
+    assert result.penny == 1

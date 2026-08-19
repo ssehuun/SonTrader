@@ -48,7 +48,16 @@ fi
 # 실패한 cron 실행을 나중에 추적하려면 무엇이 언제 돌았는지 남아야 한다.
 echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] daily_collect 시작 (uv=$UV)"
 
+# --universe-scope structural: 과거 스냅샷 1,863일치와 같은 필터를 쓴다.
+# 기본값 tradeable은 symbol_master의 **오늘** 플래그(관리종목·영업이익 등)를
+# 보는데, 과거 마스터가 존재하지 않아 백테스트 이력은 structural로만 만들 수
+# 있다. 여기만 tradeable로 두면 "백테스트가 샀을 종목을 실전은 안 사는" 괴리가
+# 생겨, 성과 차이의 원인이 전략인지 필터인지 구분할 수 없게 된다.
+#
+# tradeable이 추가로 막던 것 중 과거에도 판정 가능한 것들은 이미 point-in-time
+# 필터로 들어와 있다: 거래정지→volume==0, 저유동성→거래대금 하한,
+# 기준가→그날 종가(is_penny).
 "$UV" run sontrader collect-prices \
-  && "$UV" run sontrader build-universe
+  && "$UV" run sontrader build-universe --universe-scope structural
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] daily_collect 완료"

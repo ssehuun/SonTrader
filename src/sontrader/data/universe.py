@@ -18,12 +18,15 @@
    **4번이 이걸 잡지 못한다** — KIS는 정지일에도 봉을 준다(거래량 0, OHLC는
    직전 종가). 그래서 시계열이 멈추지 않고 신선도 게이트가 영영 발동하지
    않는다. 실측: 전체 봉의 3.2%, 2,463종목 중 433종목이 해당.
-6. 유동성 필터: 최근 20거래일 평균 거래대금 하한 (파라미터 — 설계 8절).
+6. 동전주 필터: 그날 종가가 하한(1,000원) 미만이면 제외. `is_tradeable`의
+   기준가 검사를 **과거에도 유효한 형태로** 옮긴 것이다 — 마스터의
+   base_price는 오늘 값뿐이라 과거 스냅샷에 쓰면 편향이 된다.
+7. 유동성 필터: 최근 20거래일 평균 거래대금 하한 (파라미터 — 설계 8절).
    5번과 겹쳐 보이지만 부족하다 — 20일 중 1~2일 정지는 평균을 10%쯤 낮출
    뿐이라 하한을 통과한다.
-7. 모멘텀 점수 (core.momentum) — 이력이 부족한 신규 상장은 자연 탈락
-8. 직전 스냅샷과 히스테리시스 (core.watchlist, 편입 30/이탈 42)
-9. watchlist_snapshots에 저장 — 같은 기준일 재실행이면 그날 행을 교체하므로,
+8. 모멘텀 점수 (core.momentum) — 이력이 부족한 신규 상장은 자연 탈락
+9. 직전 스냅샷과 히스테리시스 (core.watchlist, 편입 30/이탈 42)
+10. watchlist_snapshots에 저장 — 같은 기준일 재실행이면 그날 행을 교체하므로,
    입력 데이터가 같으면 결과도 같다 (검증 요건)
 
 이 필터는 **진입**만 막는다. 보유 중 정지된 종목의 청산은 체결 계층
@@ -46,10 +49,12 @@ from sqlalchemy.engine import Engine
 
 from sontrader.core.filters import (
     HALT_LOOKBACK_BARS,
+    MIN_BASE_PRICE,
     SecurityInfo,
     StructuralInfo,
     has_recent_halt,
     is_collectable,
+    is_penny,
     is_tradeable,
 )
 from sontrader.core.momentum import LOOKBACK_BARS, SKIP_BARS, momentum_score
@@ -99,6 +104,7 @@ class SnapshotResult:
     candidates: int  # 마스터 필터 통과 종목 수
     scored: int  # 모멘텀 점수가 산출된 종목 수 (신선도·정지·유동성 통과)
     halted: int = 0  # 최근 거래정지로 제외된 종목 수
+    penny: int = 0  # 동전주로 제외된 종목 수
 
 
 def build_snapshot(
@@ -111,6 +117,7 @@ def build_snapshot(
     skip: int = SKIP_BARS,
     min_avg_trade_value: int = MIN_AVG_TRADE_VALUE,
     halt_lookback: int = HALT_LOOKBACK_BARS,
+    min_close: int = MIN_BASE_PRICE,
     scope: UniverseScope = UniverseScope.TRADEABLE_NOW,
 ) -> SnapshotResult:
     effective = _effective_date(engine, as_of)
@@ -123,12 +130,18 @@ def build_snapshot(
 
     scores: dict[str, float] = {}
     halted = 0
+    penny = 0
     for symbol, s in series.items():
         if s.last_bar is None or (effective - s.last_bar).days > RECENCY_LIMIT_DAYS:
             continue  # 상장폐지·수집 실패로 시계열이 멈춘 종목
         # 거래정지는 신선도 게이트에 안 걸린다 — 정지일에도 봉이 오기 때문이다.
         if has_recent_halt(s.volumes, bars=halt_lookback):
             halted += 1
+            continue
+        # 동전주 제외. is_tradeable의 기준가 검사와 같은 목적이지만 그날 종가를
+        # 보므로 과거 스냅샷에도 편향 없이 적용된다 (UniverseScope 독스트링 참고).
+        if is_penny(s.closes, min_price=min_close):
+            penny += 1
             continue
         if not _is_liquid(s.trade_values, min_avg_trade_value):
             continue
@@ -146,6 +159,7 @@ def build_snapshot(
         candidates=len(candidates),
         scored=len(scores),
         halted=halted,
+        penny=penny,
     )
 
 

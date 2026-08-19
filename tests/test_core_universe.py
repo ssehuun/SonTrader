@@ -10,6 +10,7 @@ from sontrader.core.filters import (
     StructuralInfo,
     has_recent_halt,
     is_collectable,
+    is_penny,
     is_tradeable,
 )
 from sontrader.core.momentum import momentum_score
@@ -225,3 +226,21 @@ def test_halt_filter_rejects_empty_series():
 def test_halt_filter_uses_only_the_tail():
     """창보다 짧은 이력은 있는 만큼만 본다 (신규 상장은 모멘텀이 따로 거른다)."""
     assert has_recent_halt([1000, 1000], bars=20) is False
+
+
+# --- is_penny (동전주, point-in-time) -----------------------------------------
+
+
+@pytest.mark.parametrize("last,expected", [(999, True), (1000, False), (5000, False)])
+def test_penny_filter_uses_the_last_close(last, expected):
+    assert is_penny([5000, 3000, last]) is expected
+
+
+def test_penny_filter_ignores_earlier_closes():
+    """과거에 동전주였어도 지금 하한을 넘으면 통과한다 — 그 시점의 사실만 본다."""
+    assert is_penny([100, 200, 500, 1500]) is False
+
+
+def test_penny_filter_rejects_missing_or_empty():
+    assert is_penny([]) is True
+    assert is_penny([5000, None]) is True
