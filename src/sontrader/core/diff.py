@@ -44,7 +44,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
-from sontrader.core.types import Context, Order, OrderType, Side, Target, Urgency
+from sontrader.core.types import (
+    Context,
+    ExitRule,
+    Order,
+    OrderType,
+    Side,
+    Target,
+    Urgency,
+)
 
 
 @dataclass(frozen=True)
@@ -76,6 +84,8 @@ def to_orders(target: Target, ctx: Context, config: DiffConfig | None = None) ->
     # 1) 목표에서 빠졌거나 비중 0인 보유 종목 → 전량 청산.
     #    band·최소금액을 적용하지 않는다. 가격도 필요 없다.
     for pos in ctx.positions:
+        if pos.symbol in ctx.pending_order_symbols:
+            continue  # 이미 낸 청산 주문이 체결 대기 중 — 또 팔면 잔고 부족이다
         item = target.get(pos.symbol)
         if item is not None and item.weight > 0.0:
             continue
@@ -100,6 +110,11 @@ def to_orders(target: Target, ctx: Context, config: DiffConfig | None = None) ->
     for item in target:
         if item.weight <= 0.0:
             continue
+        if item.symbol in ctx.pending_order_symbols:
+            # 이 종목으로 낸 주문이 아직 체결 대기 중이다. 브로커 잔고에는
+            # 안 잡혀 있어 current_qty가 0으로 보이므로, 건너뛰지 않으면
+            # 같은 종목을 한 번 더 산다 (`Context.pending_order_symbols` 참고).
+            continue
         bar = ctx.bars.latest(item.symbol)
         if bar is None or bar.close <= 0:
             # 가격을 모르면 수량을 정할 수 없다. 다음 사이클에 다시 시도한다.
@@ -119,14 +134,18 @@ def to_orders(target: Target, ctx: Context, config: DiffConfig | None = None) ->
         if value / ctx.equity < cfg.no_trade_band:
             continue
 
+        side = Side.BUY if delta > 0 else Side.SELL
         rest.append(
             _order(
                 symbol=item.symbol,
-                side=Side.BUY if delta > 0 else Side.SELL,
+                side=side,
                 qty=abs(delta),
                 urgency=item.urgency,
                 now=ctx.now,
                 event_id=item.event_id,
+                # 매수만 청산 조건을 싣는다. 체결 시차 때문에 주문이 직접
+                # 들고 가야 한다 — `core.types.Order` 참고.
+                exit_rule=item.exit_rule if side is Side.BUY else None,
             )
         )
 
@@ -141,6 +160,7 @@ def _order(
     urgency: Urgency,
     now: datetime,
     event_id: str | None,
+    exit_rule: ExitRule | None = None,
 ) -> Order:
     # 진입도 청산도 시장가다. 차이는 타이밍(urgency)뿐이며, 그 해석은 집행기가
     # 한다 — IMMEDIATE는 장중 즉시, NEXT_OPEN은 다음 개장 시가 (설계 1.3절).
@@ -153,4 +173,5 @@ def _order(
         urgency=urgency,
         ts=now,
         event_id=event_id,
+        exit_rule=exit_rule,
     )

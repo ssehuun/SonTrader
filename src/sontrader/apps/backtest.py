@@ -72,6 +72,7 @@ from sontrader.core.types import (
     Side,
 )
 from sontrader.data import db
+from sontrader.engine import fills
 from sontrader.engine.context import InMemoryBarView
 from sontrader.engine.loop import CycleConfig, Deps, run_cycle
 
@@ -260,60 +261,41 @@ def _reconstruct_positions(
 
 
 def _apply_fills(result, held, used_event_ids, last_exit_at, fills_out, closed_trades_out) -> None:
-    for order_result in result.order_results:
-        if order_result.status not in (OrderStatus.FILLED, OrderStatus.PARTIAL):
-            continue
-        order = order_result.order
-        fills_out.extend(order_result.fills)
-        fill = order_result.fills[0]
+    """체결을 메모리 부기에 반영한다.
 
-        if order.side is Side.BUY:
-            if order.event_id is not None:
-                used_event_ids.add(order.event_id)
-            if order.symbol not in held:
-                # 진입 시점에 확정된 청산 조건은 게이트를 통과한 최종 target에
-                # 남아 있다(gate._clamp가 exit_rule을 그대로 보존한다).
-                item = result.target.get(order.symbol)
-                exit_rule = (
-                    item.exit_rule
-                    if item is not None and item.exit_rule is not None
-                    else ExitRule()
-                )
-                held[order.symbol] = _HeldMeta(fill.ts, fill.price, exit_rule, order.event_id)
-            # 이미 보유 중인 종목의 추가 체결(드리프트 리밸런싱)은 진입시각·
-            # 진입가·청산조건을 갈아끼우지 않는다 — "진입 시 확정, 보유 중 불변".
-        else:  # SELL
-            remaining = _remaining_qty(order_result)
-            if remaining <= 0:
-                meta = held.pop(order.symbol, None)
-                last_exit_at[order.symbol] = fill.ts
-                if meta is None:
-                    # 브로커가 보유분을 청산했는데 우리 쪽 부기에 진입 정보가
-                    # 없다 — 어딘가에서 상태가 어긋난 것이므로 조용히 넘기지 않는다.
-                    raise ValueError(f"closing {order.symbol!r} but no entry metadata was tracked")
-                closed_trades_out.append(
-                    ClosedTrade(
-                        symbol=order.symbol,
-                        entered_at=meta.entered_at,
-                        exit_at=fill.ts,
-                        entry_price=meta.entry_price,
-                        exit_price=fill.price,
-                        qty=fill.qty,
-                    )
-                )
-
-
-def _remaining_qty(order_result) -> int:
-    """이 매도 체결 후 남은 보유 수량. broker가 이미 계산한 결과를 다시 묻지
-    않는다 — 체결 수량과 원 주문 수량을 비교해 전량 청산 여부만 판단한다.
-
-    부분체결(PARTIAL)은 SimBroker에서 자금 부족으로만 발생하는데, 그건 매수
-    쪽 얘기다(매도는 항상 전량 아니면 예외). 그래서 매도는 사실상 항상
-    전량 체결이지만, 향후 유동성 부분체결(broker_kis)에 대비해 수량으로
-    판단한다.
+    포지션 변경 판정 자체는 `engine/fills.py`가 한다 — 실전(`apps/live.py`)이
+    같은 규칙을 DB에 반영하므로, 규칙을 여기 복제하면 두 경로가 갈라진다.
+    여기서는 백테스트에만 필요한 것(체결 로그, 종료된 거래 기록)을 더한다.
     """
-    filled_qty = sum(f.qty for f in order_result.fills)
-    return order_result.order.qty - filled_qty
+    for order_result in result.order_results:
+        if order_result.status in (OrderStatus.FILLED, OrderStatus.PARTIAL):
+            fills_out.extend(order_result.fills)
+            if order_result.order.side is Side.BUY and order_result.order.event_id is not None:
+                used_event_ids.add(order_result.order.event_id)
+
+    for change in fills.position_changes(result.order_results, held=frozenset(held)):
+        if isinstance(change, fills.Opened):
+            held[change.symbol] = _HeldMeta(
+                change.entered_at, change.entry_price, change.exit_rule, change.event_id
+            )
+            continue
+
+        meta = held.pop(change.symbol, None)
+        last_exit_at[change.symbol] = change.exited_at
+        if meta is None:
+            # 브로커가 보유분을 청산했는데 우리 쪽 부기에 진입 정보가 없다 —
+            # 어딘가에서 상태가 어긋난 것이므로 조용히 넘기지 않는다.
+            raise ValueError(f"closing {change.symbol!r} but no entry metadata was tracked")
+        closed_trades_out.append(
+            ClosedTrade(
+                symbol=change.symbol,
+                entered_at=meta.entered_at,
+                exit_at=change.exited_at,
+                entry_price=meta.entry_price,
+                exit_price=change.exit_price,
+                qty=change.qty,
+            )
+        )
 
 
 # --- DB 로딩 ---------------------------------------------------------------

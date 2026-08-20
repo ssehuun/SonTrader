@@ -253,6 +253,13 @@ class Order:
     (`adapters/broker_sim.py`, 5단계)가 "이 주문 다음 봉"을 찾는 기준이 된다 —
     신호가 발생한 봉의 가격으로 즉시 체결하면 look-ahead이므로, 체결은 항상
     이 시각 이후의 봉에서 일어나야 한다(01문서 §4.1).
+
+    `exit_rule`은 **이 주문이 체결되면 붙일 청산 조건**이다(매수만; 매도는 None).
+    주문이 들고 가야 하는 이유는 실전의 체결 시차 때문이다 — 08:35에 낸 주문이
+    09:00 시초가에 체결되면, 체결을 확인하는 사이클의 목표 포트폴리오에는 그
+    종목이 이미 없을 수 있다. 그러면 청산 조건을 복원할 방법이 사라지고,
+    포지션이 스톱 없이 방치된다. 백테스트는 즉시 체결이라 이 문제를 겪지 않아
+    `CycleResult.target`에서 꺼내 써 왔지만, 그 방식은 실전에서 성립하지 않는다.
     """
 
     idempotency_key: str
@@ -265,6 +272,7 @@ class Order:
     limit_price: int | None = None
     event_id: str | None = None
     order_id: str | None = None
+    exit_rule: ExitRule | None = None
 
     def __post_init__(self) -> None:
         if self.qty <= 0:
@@ -342,6 +350,20 @@ class Context:
     used_event_ids: frozenset[str] = frozenset()
     # 종목 → 마지막 청산 시각. 게이트의 시간 기반 쿨다운 판정 근거.
     last_exit_at: Mapping[str, datetime] = field(default_factory=dict)
+    # 주문을 냈지만 체결이 아직 확인되지 않은 종목 (미체결).
+    #
+    # **`positions`와 함께 "현재 상태"를 이룬다.** 브로커 잔고에는 체결된 것만
+    # 잡히므로, 이 집합이 없으면 주문 직후 사이클이 "아직 아무것도 없다"고
+    # 판단해 같은 종목을 다시 산다. 실전에서 실제로 겪었다 — 08:35 매수 5건이
+    # 미체결인 동안 08:39에 같은 5종목을 또 주문했다.
+    #
+    # 멱등 키로는 막지 못한다. 키에 사이클 시각이 들어가 있어 다른 사이클이면
+    # 다른 키다 — 멱등 키는 "같은 사이클의 재전송"을 막지, "다음 사이클의 중복
+    # 진입"을 막지 않는다.
+    #
+    # 백테스트는 체결이 즉시라 항상 비어 있다(`broker_sim`이 submit 안에서
+    # 체결한다). 그래서 이 필드는 실전에서만 값이 찬다.
+    pending_order_symbols: frozenset[str] = frozenset()
 
     def position(self, symbol: str) -> Position | None:
         for pos in self.positions:
