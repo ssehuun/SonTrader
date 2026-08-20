@@ -320,7 +320,7 @@ def _run_collect_prices(limit: int | None, pace: float | None, lookback_days: in
 
     from sontrader.data.db import migrate
     from sontrader.data.master import load_collectable_symbols
-    from sontrader.data.prices import collect_daily_all
+    from sontrader.data.prices import CollectionAborted, collect_daily_all
 
     try:
         settings = load_settings()
@@ -359,17 +359,26 @@ def _run_collect_prices(limit: int | None, pace: float | None, lookback_days: in
             if index % 100 == 0 or index == total:
                 print(f"  {index}/{total}", flush=True)
 
-        with KisClient(settings) as client:
-            results, failures = collect_daily_all(
-                engine,
-                client,
-                symbols,
-                today=today,
-                lookback_days=lookback_days,
-                pace_seconds=pace_seconds,
-                on_progress=on_progress,
-                include_today=include_today,
-            )
+        try:
+            with KisClient(settings) as client:
+                results, failures = collect_daily_all(
+                    engine,
+                    client,
+                    symbols,
+                    today=today,
+                    lookback_days=lookback_days,
+                    pace_seconds=pace_seconds,
+                    on_progress=on_progress,
+                    include_today=include_today,
+                )
+        except CollectionAborted as exc:
+            # 공통 원인으로 전부 실패하는 상황 — 남은 종목을 계속 시도해도
+            # 시간과 API 유량만 쓴다. 이미 저장된 분량은 보고한다.
+            print(f"error: 수집 중단 — {exc}", file=sys.stderr)
+            print(f"  중단 시점까지 {len(exc.results)}종목 저장됨", file=sys.stderr)
+            for symbol, failure in exc.failures[-3:]:
+                print(f"  실패 {symbol}: {_first_line(failure)}", file=sys.stderr)
+            return 1
         full_count = sum(1 for r in results if r.full)
         print(f"수집 완료: {len(results)}종목 (전체수집 {full_count}, 실패 {len(failures)})")
         for symbol, exc in failures[:5]:

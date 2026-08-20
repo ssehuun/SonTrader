@@ -45,8 +45,14 @@ if [ -z "$UV" ] || [ ! -x "$UV" ]; then
     exit 127
 fi
 
+ts() { date '+%Y-%m-%d %H:%M:%S %Z'; }
+
+# 어느 단계에서 죽었든 반드시 흔적을 남긴다. cron은 조용히 실패하면 아무도
+# 모르고, 그날 워치리스트가 없는 채로 다음 날 아침을 맞는다.
+trap 'code=$?; [ "$code" -ne 0 ] && echo "[$(ts)] daily_collect 중단 (종료코드 $code)" >&2' EXIT
+
 # 실패한 cron 실행을 나중에 추적하려면 무엇이 언제 돌았는지 남아야 한다.
-echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] daily_collect 시작 (uv=$UV)"
+echo "[$(ts)] daily_collect 시작 (uv=$UV)"
 
 # --universe-scope structural: 과거 스냅샷 1,863일치와 같은 필터를 쓴다.
 # 기본값 tradeable은 symbol_master의 **오늘** 플래그(관리종목·영업이익 등)를
@@ -57,7 +63,12 @@ echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] daily_collect 시작 (uv=$UV)"
 # tradeable이 추가로 막던 것 중 과거에도 판정 가능한 것들은 이미 point-in-time
 # 필터로 들어와 있다: 거래정지→volume==0, 저유동성→거래대금 하한,
 # 기준가→그날 종가(is_penny).
-"$UV" run sontrader collect-prices \
-  && "$UV" run sontrader build-universe --universe-scope structural
+#
+# `&&`로 잇지 않는다. `set -e`는 `&&` 리스트 안에서 실패한 명령에 반응하지
+# 않아서(POSIX), 아래 두 줄을 `a && b`로 쓰면 a가 실패해도 스크립트가
+# 계속 진행해 "완료"를 찍고 exit 0으로 끝난다 — cron은 성공으로 본다.
+# 실제로 그 상태였다. 순차 실행이면 set -e가 정상 동작한다.
+"$UV" run sontrader collect-prices
+"$UV" run sontrader build-universe --universe-scope structural
 
-echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] daily_collect 완료"
+echo "[$(ts)] daily_collect 완료"

@@ -2,6 +2,7 @@
 
 from datetime import date, timedelta
 
+import pytest
 import sqlalchemy as sa
 
 from sontrader.data import db, prices
@@ -498,3 +499,88 @@ def test_include_today_false_also_applies_to_self_heal(db_engine):
 
     assert result.full is True
     assert TODAY not in dict(stored_closes(db_engine))
+
+
+# --- 연속 실패 시 중단 ---------------------------------------------------------
+
+
+class BrokenClient:
+    """항상 실패하는 시세 소스 — 인증 만료·DB 다운 같은 공통 원인 재현."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def get_daily_candles(self, code, start, end, adjusted=True):
+        self.calls += 1
+        raise RuntimeError("boom")
+
+
+def test_collect_aborts_after_consecutive_failures(db_engine):
+    """전부 실패하는 상황에서 끝까지 갈아 넣지 않는다.
+
+    종목 단위 격리는 "한 종목의 일시 오류가 전체를 멈추지 않게" 하려는 것이지,
+    모든 종목이 실패하는데도 2,463종목을 다 돌라는 뜻이 아니다 — 30분을 버리고
+    KIS를 그만큼 두들긴 뒤에야 실패를 알리게 된다.
+    """
+    db.migrate(db_engine)
+    client = BrokenClient()
+    symbols = [f"{i:06d}" for i in range(100)]
+
+    with pytest.raises(prices.CollectionAborted) as excinfo:
+        prices.collect_daily_all(
+            db_engine, client, symbols, today=TODAY, max_consecutive_failures=5
+        )
+
+    assert len(excinfo.value.failures) == 5
+    assert excinfo.value.results == []
+    # 100종목을 다 돌지 않고 5종목에서 멈췄다
+    assert client.calls == 5
+
+
+def test_scattered_failures_do_not_abort(db_engine):
+    """일시 오류는 흩어져서 나온다 — 실측으로 2,463종목 중 3건이었고 연속된 적이 없다."""
+    db.migrate(db_engine)
+    days = business_days(TODAY, 5)
+    rows = {d: raw_row(d, 1000) for d in days}
+
+    class Flaky(FakeClient):
+        def get_daily_candles(self, code, start, end, adjusted=True):
+            if code.endswith("3"):  # 10종목 중 1개만 실패 — 연속되지 않는다
+                raise RuntimeError("transient")
+            return super().get_daily_candles(code, start, end, adjusted)
+
+    results, failures = prices.collect_daily_all(
+        db_engine,
+        Flaky(rows),
+        [f"{i:06d}" for i in range(30)],
+        today=TODAY,
+        max_consecutive_failures=5,
+    )
+
+    assert len(failures) == 3  # 003, 013, 023
+    assert len(results) == 27
+
+
+def test_consecutive_counter_resets_on_success(db_engine):
+    """성공 하나가 끼면 연속 카운터가 초기화된다."""
+    db.migrate(db_engine)
+    days = business_days(TODAY, 5)
+    rows = {d: raw_row(d, 1000) for d in days}
+
+    class MostlyBroken(FakeClient):
+        def get_daily_candles(self, code, start, end, adjusted=True):
+            if code != "000004":  # 5번째만 성공
+                raise RuntimeError("boom")
+            return super().get_daily_candles(code, start, end, adjusted)
+
+    results, failures = prices.collect_daily_all(
+        db_engine,
+        MostlyBroken(rows),
+        [f"{i:06d}" for i in range(9)],
+        today=TODAY,
+        max_consecutive_failures=5,
+    )
+
+    # 0~3 실패(4연속) → 4 성공(리셋) → 5~8 실패(4연속) → 임계 미달로 완주
+    assert len(results) == 1
+    assert len(failures) == 8

@@ -39,6 +39,34 @@ WINDOW_DAYS = 100  # 호출당 조회 폭 — 100행 응답 한도를 달력일�
 # 거기서 멈추면 그보다 과거를 영영 못 받는다.
 BACKFILL_EMPTY_TOLERANCE = 3
 
+# 연속 실패가 이 횟수를 넘으면 수집을 중단한다.
+#
+# 종목 단위 격리는 "한 종목의 일시 오류가 전체를 멈추지 않게" 하려는 것이지,
+# **모든 종목이 실패하는데도 끝까지 갈아 넣으라는 뜻이 아니다.** 인증 만료·DB
+# 다운·유량 고갈처럼 전부 실패하는 상황에서 2,463종목을 다 돌면 30분을 버리고
+# KIS를 그만큼 두들긴 뒤에야 실패를 알린다.
+#
+# 연속(consecutive)으로 세는 것이 요점이다. 일시 오류는 흩어져서 나온다 —
+# 실측으로 2,463종목 중 3건이었고 연속된 적은 없다. 10회 연속은 개별 종목
+# 문제가 아니라 공통 원인이 있다는 신호다.
+MAX_CONSECUTIVE_FAILURES = 10
+
+
+class CollectionAborted(RuntimeError):
+    """연속 실패로 수집을 중단했다. 중단 시점까지의 결과를 함께 싣는다 —
+    이미 저장된 종목이 있으므로 호출자가 그 사실을 보고해야 한다."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        results: list[CollectResult] | None = None,
+        failures: list[tuple[str, Exception]] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.results = results or []
+        self.failures = failures or []
+
 
 class DailyCandleSource(Protocol):
     """KisClient가 만족하는 시세 소스 (테스트에서는 스텁으로 대체)."""
@@ -235,10 +263,16 @@ def collect_daily_all(
     sleep: Callable[[float], None] = time_module.sleep,
     on_progress: Callable[[int, int], None] | None = None,
     include_today: bool = True,
+    max_consecutive_failures: int = MAX_CONSECUTIVE_FAILURES,
 ) -> tuple[list[CollectResult], list[tuple[str, Exception]]]:
-    """여러 종목 수집. 한 종목의 실패가 전체를 중단시키지 않는다."""
+    """여러 종목 수집. 한 종목의 실패가 전체를 중단시키지 않는다.
+
+    다만 **연속 실패가 이어지면 중단한다**(`CollectionAborted`) — 자세한 이유는
+    `MAX_CONSECUTIVE_FAILURES` 참고.
+    """
     results: list[CollectResult] = []
     failures: list[tuple[str, Exception]] = []
+    consecutive = 0
     for index, symbol in enumerate(symbols, start=1):
         try:
             results.append(
@@ -253,8 +287,17 @@ def collect_daily_all(
                     include_today=include_today,
                 )
             )
+            consecutive = 0
         except Exception as exc:  # noqa: BLE001 — 종목 단위 격리가 목적
             failures.append((symbol, exc))
+            consecutive += 1
+            if consecutive >= max_consecutive_failures:
+                raise CollectionAborted(
+                    f"{consecutive}종목 연속 실패 — {index}/{len(symbols)}에서 중단. "
+                    f"마지막 사유: {exc}",
+                    results=results,
+                    failures=failures,
+                ) from exc
         if on_progress is not None:
             on_progress(index, len(symbols))
     return results, failures
