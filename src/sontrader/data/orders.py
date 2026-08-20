@@ -22,7 +22,7 @@ from datetime import datetime
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine
 
-from sontrader.core.types import Fill, Order, OrderStatus, OrderType, Side, Urgency
+from sontrader.core.types import ExitRule, Fill, Order, OrderStatus, OrderType, Side, Urgency
 from sontrader.data import db
 
 # 재시작 시 결과를 다시 확인해야 하는 상태 — 아직 최종 상태(체결/거부/취소)로
@@ -43,6 +43,7 @@ class OrderRecord:
     event_id: str | None
     broker_order_no: str | None
     created_at: datetime
+    exit_rule: ExitRule | None = None
 
 
 def find_by_idempotency_key(engine: Engine, idempotency_key: str) -> OrderRecord | None:
@@ -86,6 +87,7 @@ def insert(
                 event_id=order.event_id,
                 broker_order_no=broker_order_no,
                 created_at=created_at,
+                exit_rule_json=order.exit_rule.to_dict() if order.exit_rule else None,
             )
         )
 
@@ -164,4 +166,5 @@ def _to_record(row) -> OrderRecord:
         event_id=row.event_id,
         broker_order_no=row.broker_order_no,
         created_at=row.created_at,
+        exit_rule=ExitRule.from_dict(row.exit_rule_json) if row.exit_rule_json else None,
     )

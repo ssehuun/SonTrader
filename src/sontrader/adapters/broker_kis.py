@@ -204,4 +204,5 @@ def _order_from_record(record: OrderRecord) -> Order:
         ts=record.created_at,
         event_id=record.event_id,
         order_id=record.order_id,
+        exit_rule=record.exit_rule,
     )

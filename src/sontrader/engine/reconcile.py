@@ -19,12 +19,20 @@
    걸 수 없다(01문서 §6.5, 02문서 §6 "정합성 테스트: 잔고 불일치 주입 →
    매매 중단 확인").
 
+## DB에 쓰는 것: 해소된 체결만
+
+기동 시 1회 판단이라는 성격상 이 모듈은 상태를 만들지 않는 게 원칙이었지만,
+1번 단계의 "체결 반영"만은 예외다. 해소된 체결을 `positions`에 남기지 않으면
+바로 다음 단계의 대조가 스스로 어긋나기 때문이다 — 판정 함수가 자기 입력을
+오염시키는 셈이 된다.
+
 ## 왜 매매 중단을 별도 플래그로 저장하지 않는가
 
-`ReconcileReport.halt`는 매 사이클 확인하는 지속 상태가 아니라 **기동 시
-1회 판단**이다. 미스매치가 있으면 그 결과를 반환할 뿐이고, 그걸 보고
-루프에 진입할지 말지 정하는 건 호출자(미착수 `apps/live.py`)의 몫이다 —
-이 모듈은 DB에 새 상태를 만들지 않는다(02문서 §7 YAGNI).
+`ReconcileReport.halt`는 지속 상태가 아니라 **그 시점의 판단**이다. 미스매치가
+있으면 그 결과를 반환할 뿐이고, 그걸 보고 루프에 진입할지 말지 정하는 건
+호출자(`apps/live.py`)의 몫이다 — 이 모듈은 중단 여부를 DB에 남기지 않는다.
+`apps/live.py`는 기동 시 1회가 아니라 **매 사이클** 호출한다: 장중에 계좌 밖
+수동 거래가 생기는 등, 부팅 이후에도 같은 위험이 계속 있기 때문이다.
 """
 
 from __future__ import annotations
@@ -38,6 +46,7 @@ from sontrader.adapters.broker import OrderResult
 from sontrader.adapters.broker_kis import KisBroker
 from sontrader.core.types import Position
 from sontrader.data import positions as positions_repo
+from sontrader.engine import fills
 
 MismatchReason = Literal["broker_only", "db_only"]
 
@@ -50,6 +59,36 @@ class PositionMismatch:
     reason: MismatchReason
     broker_qty: int | None
     db_qty: int | None
+
+
+def _record_resolved_positions(engine: Engine, resolved: list[OrderResult]) -> None:
+    """방금 확정된 체결을 `positions`에 반영한다.
+
+    이 모듈 상단이 말하는 처리 순서 1번의 실제 알맹이다 — 이걸 하지 않으면
+    "방금 체결된 포지션이 아직 DB에 반영되지 않은 채로 대조가 어긋난다"는
+    바로 그 상황이 매번 벌어진다. 브로커 잔고에는 새 포지션이 있는데 DB에는
+    없으니 `broker_only` 불일치가 뜨고, **체결 한 번에 매매가 영구 중단된다.**
+    2026-08-20 첫 실전 운영이 이 상태였다.
+
+    무엇을 바꿀지는 `engine/fills.py`가 판정한다. 백테스트가 같은 판정을
+    메모리에 반영하므로, 규칙을 여기 복제하면 두 경로가 갈라진다.
+    """
+    if not resolved:
+        return
+    held = frozenset(p.symbol for p in positions_repo.load_all(engine))
+    for change in fills.position_changes(resolved, held=held):
+        if isinstance(change, fills.Opened):
+            positions_repo.upsert(
+                engine,
+                symbol=change.symbol,
+                qty=change.qty,
+                avg_price=float(change.entry_price),
+                entered_at=change.entered_at,
+                exit_rule=change.exit_rule,
+                event_id=change.event_id,
+            )
+        else:
+            positions_repo.delete(engine, change.symbol)
 
 
 @dataclass(frozen=True)
@@ -66,6 +105,7 @@ class ReconcileReport:
 
 def reconcile(engine: Engine, broker: KisBroker) -> ReconcileReport:
     resolved = broker.resolve_unknown()
+    _record_resolved_positions(engine, resolved)
 
     broker_positions = {p.symbol: p for p in broker.positions()}
     db_positions = {p.symbol: p for p in positions_repo.load_all(engine)}

@@ -106,6 +106,12 @@ orders = Table(
     ),
     Column("event_id", String(32), ForeignKey("events.event_id"), comment="청산 주문은 NULL"),
     Column("broker_order_no", String(20), comment="KIS 주문번호(ODNO) — 미체결 조회·취소용"),
+    Column(
+        "exit_rule_json",
+        _JSON,
+        comment="체결되면 붙일 청산 조건 (매수만). 체결 확인이 다음 사이클로 밀리면 "
+        "그때의 목표에는 종목이 없을 수 있어, 주문이 직접 들고 있어야 복원된다",
+    ),
     Column("created_at", DateTime, nullable=False),
 )
 

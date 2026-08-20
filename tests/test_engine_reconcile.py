@@ -16,6 +16,7 @@ from sontrader.client import KisClient
 from sontrader.core.types import ExitRule, OrderStatus, OrderType, Side, Urgency
 from sontrader.core.types import Order as CoreOrder
 from sontrader.data import db, orders
+from sontrader.data import positions as positions_repo
 from sontrader.engine.reconcile import reconcile
 from tests.conftest import TOKEN_RESPONSE
 
@@ -171,3 +172,102 @@ def test_reconcile_reports_no_mismatches_when_nothing_held(db_engine, settings):
     assert report.positions == ()
     assert report.mismatches == ()
     assert report.resolved_orders == ()
+
+
+# --- 체결 → positions 반영 (T1) ------------------------------------------------
+
+
+def seed_submitted_order(
+    db_engine, *, symbol: str, odno: str, side=Side.BUY, qty: int = 10, exit_rule=None
+) -> None:
+    orders.insert(
+        db_engine,
+        CoreOrder(
+            idempotency_key=f"{symbol}:{side.value}:{NOW.isoformat()}",
+            symbol=symbol,
+            side=side,
+            qty=qty,
+            order_type=OrderType.MARKET,
+            urgency=Urgency.NEXT_OPEN,
+            ts=NOW,
+            exit_rule=exit_rule,
+        ),
+        order_id=f"ord-{odno}",
+        status=OrderStatus.SUBMITTED,
+        created_at=NOW,
+        broker_order_no=odno,
+    )
+
+
+def test_resolved_buy_is_recorded_so_the_next_cycle_does_not_halt(db_engine, settings):
+    """체결이 positions에 남지 않으면 브로커에만 있는 종목이 되어 매매가 영구 중단된다.
+
+    2026-08-20 첫 실전 운영이 정확히 이 상태였다 — positions에 쓰는 코드가
+    아예 없어서, 체결 한 번이면 다음 사이클부터 halt였다.
+    """
+    db.migrate(db_engine)
+    rule = ExitRule(stop_loss_pct=-0.08, max_hold_days=45)
+    seed_submitted_order(db_engine, symbol="005930", odno="0001", exit_rule=rule)
+
+    def responder(request):
+        if "inquire-daily-ccld" in request.url.path:
+            return daily_ccld_response([execution_row(odno="0001")])
+        return balance_response([holding("005930", 10, "71000")])
+
+    report = reconcile(db_engine, make_broker(settings, db_engine, responder))
+
+    assert not report.halt
+    [position] = report.positions
+    assert position.symbol == "005930"
+    # 진입 시점에 확정한 청산 조건이 살아남아야 스톱을 걸 수 있다
+    assert position.exit_rule == rule
+
+
+def test_resolved_sell_removes_the_position(db_engine, settings):
+    db.migrate(db_engine)
+    seed_position(db_engine, symbol="005930", qty=10)
+    seed_submitted_order(db_engine, symbol="005930", odno="0002", side=Side.SELL, qty=10)
+
+    def responder(request):
+        if "inquire-daily-ccld" in request.url.path:
+            return daily_ccld_response([execution_row(odno="0002")])
+        return balance_response([])  # 전량 매도돼 잔고에서 사라졌다
+
+    report = reconcile(db_engine, make_broker(settings, db_engine, responder))
+
+    assert not report.halt
+    assert report.positions == ()
+    assert positions_repo.load_all(db_engine) == []
+
+
+def test_partial_sell_keeps_the_position(db_engine, settings):
+    """부분 매도는 보유를 유지한다 — 전량 체결에만 청산으로 본다."""
+    db.migrate(db_engine)
+    seed_position(db_engine, symbol="005930", qty=10)
+    seed_submitted_order(db_engine, symbol="005930", odno="0003", side=Side.SELL, qty=10)
+
+    def responder(request):
+        if "inquire-daily-ccld" in request.url.path:
+            return daily_ccld_response([execution_row(odno="0003", tot_ccld_qty=4)])
+        return balance_response([holding("005930", 6, "70000")])
+
+    report = reconcile(db_engine, make_broker(settings, db_engine, responder))
+
+    assert not report.halt
+    assert [p.symbol for p in positions_repo.load_all(db_engine)] == ["005930"]
+
+
+def test_buy_without_exit_rule_falls_back_to_default(db_engine, settings):
+    """청산 조건 없는 포지션은 스톱이 영영 발동하지 않는다 — 기본값을 붙인다."""
+    db.migrate(db_engine)
+    seed_submitted_order(db_engine, symbol="005930", odno="0004", exit_rule=None)
+
+    def responder(request):
+        if "inquire-daily-ccld" in request.url.path:
+            return daily_ccld_response([execution_row(odno="0004")])
+        return balance_response([holding("005930", 10, "71000")])
+
+    report = reconcile(db_engine, make_broker(settings, db_engine, responder))
+
+    [position] = report.positions
+    assert position.exit_rule == ExitRule()
