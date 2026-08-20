@@ -1,7 +1,11 @@
 """engine/live_context.py 테스트."""
 
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 
+import pytest
+
+from sontrader.core.diff import to_orders
 from sontrader.core.types import (
     ExitRule,
     Order,
@@ -9,6 +13,8 @@ from sontrader.core.types import (
     OrderType,
     Position,
     Side,
+    Target,
+    TargetItem,
     Urgency,
 )
 from sontrader.data import db
@@ -44,7 +50,14 @@ def seed_event(db_engine, *, event_id: str, symbol: str = "005930", ingested_at=
 
 
 def seed_order(
-    db_engine, *, order_id: str, symbol: str, side: Side, event_id: str | None, created_at: datetime
+    db_engine,
+    *,
+    order_id: str,
+    symbol: str,
+    side: Side,
+    event_id: str | None,
+    created_at: datetime,
+    status: OrderStatus = OrderStatus.FILLED,
 ) -> None:
     order = Order(
         idempotency_key=f"{symbol}:{side.value}:{created_at.isoformat()}:{order_id}",
@@ -56,9 +69,7 @@ def seed_order(
         ts=created_at,
         event_id=event_id,
     )
-    orders_repo.insert(
-        db_engine, order, order_id=order_id, status=OrderStatus.FILLED, created_at=created_at
-    )
+    orders_repo.insert(db_engine, order, order_id=order_id, status=status, created_at=created_at)
 
 
 def make_position(symbol: str = "005930", *, qty=10, avg_price=70000.0, event_id=None) -> Position:
@@ -256,3 +267,111 @@ def test_build_context_passes_watchlist_through(db_engine):
     )
 
     assert ctx.watchlist == ("005930", "000660")
+
+
+# --- 미체결 주문 (T2) ----------------------------------------------------------
+
+
+def test_pending_order_symbols_is_empty_when_everything_is_filled(db_engine):
+    db.migrate(db_engine)
+    seed_order(
+        db_engine,
+        order_id="o1",
+        symbol="005930",
+        side=Side.BUY,
+        event_id=None,
+        created_at=NOW,
+        status=OrderStatus.FILLED,
+    )
+
+    ctx = build_context(
+        db_engine, now=NOW, positions=(), cash=0, watchlist=(), judge=lambda _e: None
+    )
+
+    assert ctx.pending_order_symbols == frozenset()
+
+
+@pytest.mark.parametrize(
+    "status", [OrderStatus.SUBMITTED, OrderStatus.UNKNOWN, OrderStatus.PARTIAL]
+)
+def test_unresolved_orders_become_pending_symbols(db_engine, status):
+    """접수됐지만 체결이 확인되지 않은 주문은 '현재 상태'의 일부다.
+
+    2026-08-20 실전에서 08:35 매수 5건이 미체결인 동안 08:39에 같은 5종목을
+    또 주문했다. 브로커 잔고에는 체결된 것만 잡혀 "아직 아무것도 없다"로
+    보였기 때문이다. PARTIAL도 포함해야 잔량이 있는데 부족분을 또 사지 않는다.
+    """
+    db.migrate(db_engine)
+    seed_order(
+        db_engine,
+        order_id="o1",
+        symbol="005930",
+        side=Side.BUY,
+        event_id=None,
+        created_at=NOW,
+        status=status,
+    )
+
+    ctx = build_context(
+        db_engine, now=NOW, positions=(), cash=0, watchlist=(), judge=lambda _e: None
+    )
+
+    assert ctx.pending_order_symbols == frozenset({"005930"})
+
+
+def test_pending_buy_stops_the_next_cycle_from_ordering_again(db_engine):
+    """T2 재현: 미체결 매수가 있으면 diff가 같은 종목을 다시 사지 않는다."""
+    db.migrate(db_engine)
+    seed_bar(db_engine, symbol="005930", day=date(2026, 3, 9), close=10_000)
+    seed_order(
+        db_engine,
+        order_id="o1",
+        symbol="005930",
+        side=Side.BUY,
+        event_id=None,
+        created_at=NOW,
+        status=OrderStatus.SUBMITTED,
+    )
+    ctx = build_context(
+        db_engine,
+        now=NOW,
+        positions=(),
+        cash=10_000_000,
+        watchlist=("005930",),
+        judge=lambda _e: None,
+    )
+    target = Target((TargetItem("005930", 0.2, Urgency.NEXT_OPEN, exit_rule=ExitRule()),))
+
+    assert to_orders(target, ctx) == []
+
+    # 대조군: 미체결이 없으면 정상적으로 주문이 나간다
+    empty = replace(ctx, pending_order_symbols=frozenset())
+    assert [o.symbol for o in to_orders(target, empty)] == ["005930"]
+
+
+def test_pending_sell_stops_a_duplicate_liquidation(db_engine):
+    """미체결 매도가 있는데 또 팔면 잔고 부족으로 거부된다."""
+    db.migrate(db_engine)
+    seed_bar(db_engine, symbol="005930", day=date(2026, 3, 9), close=10_000)
+    seed_order(
+        db_engine,
+        order_id="o1",
+        symbol="005930",
+        side=Side.SELL,
+        event_id=None,
+        created_at=NOW,
+        status=OrderStatus.SUBMITTED,
+    )
+    ctx = build_context(
+        db_engine,
+        now=NOW,
+        positions=(make_position("005930"),),
+        cash=0,
+        watchlist=(),
+        judge=lambda _e: None,
+    )
+
+    assert to_orders(Target(()), ctx) == []
+    assert [
+        o.symbol for o in to_orders(Target(()), replace(ctx, pending_order_symbols=frozenset()))
+    ] == ["005930"]

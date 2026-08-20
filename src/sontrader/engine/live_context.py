@@ -40,6 +40,7 @@ from sqlalchemy.engine import Engine
 
 from sontrader.core.types import Bar, Context, Event, Judgment, Position
 from sontrader.data import db
+from sontrader.data import orders as orders_repo
 from sontrader.engine.context import InMemoryBarView
 
 _SYMBOL_CHUNK = 500  # IN 절 바인드 변수 한도 대비 — apps/backtest.py와 동일한 규약
@@ -87,7 +88,25 @@ def build_context(
         equity=equity,
         used_event_ids=used_event_ids,
         last_exit_at=last_exit_at,
+        pending_order_symbols=_load_pending_order_symbols(engine),
     )
+
+
+def _load_pending_order_symbols(engine: Engine) -> frozenset[str]:
+    """주문을 냈지만 체결이 아직 확인되지 않은 종목.
+
+    `positions`와 합쳐야 "현재 상태"가 완성된다. 브로커 잔고에는 체결된 것만
+    잡히므로, 이게 없으면 주문 직후 사이클이 "아직 아무것도 없다"고 판단해
+    같은 종목을 다시 산다 (`core.types.Context.pending_order_symbols` 참고).
+
+    호출 순서가 중요하다. `apps/live.py`는 `reconcile()`을 먼저 돌려 체결된
+    주문을 FILLED로 확정하므로, 여기 남는 것은 **정말로 아직 미체결인 주문**
+    뿐이다. 순서가 뒤집히면 이미 체결된 종목까지 막아 진입이 한 사이클 밀린다.
+
+    PARTIAL도 포함한다. 일부만 체결된 매수의 잔량은 여전히 시장에 나가 있어,
+    부족분을 다시 주문하면 결국 목표보다 많이 사게 된다.
+    """
+    return frozenset(record.symbol for record in orders_repo.list_unresolved(engine))
 
 
 def _load_recent_daily_bars(
