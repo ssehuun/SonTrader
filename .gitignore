@@ -1,5 +1,8 @@
-# Secrets — never commit KIS credentials
-.env
+# Secrets — never commit KIS credentials.
+# .env* 로 두는 이유: 편집·백업 과정에서 .env.bak / .env.tmp / .env.paper 같은
+# 파일이 생기는데, ".env"만 무시하면 그것들이 추적 대상이 되어 자격증명이
+# 커밋된다. env.example은 점으로 시작하지 않아 이 패턴에 걸리지 않는다.
+.env*
 
 # Python
 __pycache__/
