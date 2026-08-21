@@ -56,7 +56,14 @@ class KisClient:
         sleep: Callable[[float], None] = time_module.sleep,
     ):
         self._settings = settings
-        self._http = httpx.Client(base_url=settings.base_url, timeout=10.0, transport=transport)
+        # read를 connect보다 길게 잡는다. 잔고조회(TTTC8434R)는 KIS 원장을 타서
+        # 장 시작·마감 직후 응답이 수 초로 튀는데, 전체 10초로는 서버가 살아
+        # 있는데도 ReadTimeout이 났다.
+        self._http = httpx.Client(
+            base_url=settings.base_url,
+            timeout=httpx.Timeout(10.0, read=20.0),
+            transport=transport,
+        )
         self._tokens = TokenManager(settings, self._http)
         self._sleep = sleep
 
@@ -269,10 +276,25 @@ class KisClient:
         # 요청이 지나는 이 지점 하나에 둔다.
         #
         # 주문에도 안전하다: `auth.TRANSIENT_ERROR_CODES`는 전부 KIS가 주문을
-        # **접수하기 전에** 거절한 경우다. 접수 여부가 불분명한 타임아웃은
-        # httpx 예외로 올라와 여기서 잡지 않으므로 재전송되지 않는다.
+        # **접수하기 전에** 거절한 경우다.
         for attempt in range(1, _RETRIES + 1):
-            response = self._http.request(method, path, headers=headers, params=params, json=json)
+            try:
+                response = self._http.request(
+                    method, path, headers=headers, params=params, json=json
+                )
+            except httpx.TransportError:
+                # 응답을 아예 못 받은 경우(ReadTimeout 등)는 **조회만** 재시도한다.
+                # KIS가 요청을 받았는지 알 수 없으니 POST(주문)를 재전송하면 중복
+                # 체결 위험이 있다 — 그쪽은 예외를 그대로 올려 `broker_kis.submit()`
+                # 의 UNKNOWN 경로가 "접수 불명"으로 처리한다.
+                #
+                # 조회에서 이 재시도가 필요한 이유: 60초 주기로 상시 가동하면
+                # 장중 1,000건 이상을 부르는데, 그중 한 번의 ReadTimeout이
+                # live.py의 매매 루프를 그대로 죽였다.
+                if method != "GET" or attempt == _RETRIES:
+                    raise
+                self._sleep(_RETRY_BACKOFF * attempt)
+                continue
             try:
                 # 상태 코드보다 본문을 먼저 본다 — 이유는 raise_for_kis_error() 참고.
                 raise_for_kis_error(response)

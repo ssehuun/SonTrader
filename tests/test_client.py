@@ -303,6 +303,50 @@ def test_transient_errors_are_retried_at_the_client_level(settings):
     assert len(attempts) == 3
 
 
+def test_read_timeout_is_retried_for_queries(settings):
+    """응답을 못 받은 조회는 재시도한다.
+
+    상시 가동(live.py)은 60초 주기로 장중 1,000건 넘게 부른다. 그중 한 번의
+    ReadTimeout이 매매 루프 전체를 죽였다 — KIS가 keep-alive 커넥션을 조용히
+    버리면 재사용한 요청이 응답 없이 타임아웃한다.
+    """
+    attempts = []
+
+    def handler(request):
+        if request.url.path == "/oauth2/tokenP":
+            return httpx.Response(200, json=TOKEN_RESPONSE)
+        attempts.append(request)
+        if len(attempts) < 2:
+            raise httpx.ReadTimeout("The read operation timed out", request=request)
+        return httpx.Response(200, json={"rt_cd": "0", "output": {"stck_prpr": "71000"}})
+
+    client = KisClient(settings, transport=httpx.MockTransport(handler), sleep=lambda _s: None)
+    with client:
+        assert client.get_quote("005930")["stck_prpr"] == "71000"
+    assert len(attempts) == 2
+
+
+def test_read_timeout_is_not_retried_for_orders(settings):
+    """주문은 재전송하지 않는다 — KIS가 접수했는지 알 수 없어 중복 체결 위험.
+
+    예외를 그대로 올려 `broker_kis.submit()`이 UNKNOWN("접수 불명")으로
+    기록하게 둔다.
+    """
+    attempts = []
+
+    def handler(request):
+        if request.url.path == "/oauth2/tokenP":
+            return httpx.Response(200, json=TOKEN_RESPONSE)
+        attempts.append(request)
+        raise httpx.ReadTimeout("The read operation timed out", request=request)
+
+    client = KisClient(settings, transport=httpx.MockTransport(handler), sleep=lambda _s: None)
+    with client:
+        with pytest.raises(httpx.ReadTimeout):
+            client.order("buy", "005930", 1, price=70000)
+    assert len(attempts) == 1
+
+
 def test_permanent_errors_are_not_retried(settings):
     attempts = []
 
