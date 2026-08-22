@@ -136,22 +136,14 @@ positions = Table(
     Column("exit_rule_json", _JSON, nullable=False, comment="진입 시 확정된 청산 조건"),
 )
 
-approvals = Table(
-    "approvals",
-    metadata,
-    Column("proposal_id", String(36), primary_key=True),
-    Column("payload_json", _JSON, nullable=False),
-    Column(
-        "status",
-        String(10),
-        nullable=False,
-        comment="pending/approved/rejected/expired/consumed",
-    ),
-    Column("expires_at", DateTime, nullable=False, comment="TTL — 만료 시 폐기"),
-)
+# `approvals`(진입 승인 큐)는 삭제했다 — 사람이 건별로 매매를 승인·거부하면
+# 실전이 백테스트가 검증한 전략과 달라진다(01문서 §1.1 원칙 1, §1.3).
+# 기존 DB에 남아 있는 테이블은 `migrate()`가 지우지 않는다. 아무도 쓰지 않으니
+# 해가 없고, 삭제는 사람이 판단해서 수동 DDL로 한다.
 
 # 킬 스위치 — 계좌가 하나뿐이라 전역 온/오프 단일 행이면 충분하다(id는 항상
-# 'singleton'). 재시작 후에도 유지돼야 하므로 DB에 둔다(설계 2.5절).
+# 'singleton'). 승인 큐가 사라진 뒤로 사람이 매매에 개입할 수 있는 유일한
+# 지점이다. 재시작 후에도 유지돼야 하므로 DB에 둔다(설계 2.5절).
 kill_switch = Table(
     "kill_switch",
     metadata,
@@ -309,12 +301,18 @@ cycle_log = Table(
     Column("positions_n", Integer, nullable=False),
     Column("cash", BigInteger, nullable=False),
     Column("equity", BigInteger, nullable=False),
-    Column("pending_n", Integer, nullable=False, comment="승인 대기 중인 제안 수"),
+    Column(
+        "killswitch_engaged",
+        Boolean,
+        nullable=False,
+        comment="이 사이클에 킬 스위치가 걸려 있었는가",
+    ),
     Column("orders_n", Integer, nullable=False, comment="이번 사이클에 제출한 주문 수"),
     Column(
         "rejections",
         _JSON,
-        comment="게이트가 스킵한 신규 진입 [{symbol, reason, event_id}]. '왜 안 샀나'의 근거",
+        comment="게이트·킬 스위치가 스킵한 신규 진입 [{symbol, reason, event_id}]. "
+        "'왜 안 샀나'의 근거",
     ),
     Column(
         "halted",
@@ -363,6 +361,36 @@ def migrate(engine: Engine) -> list[str]:
                     index.create(conn)
                     actions.append(f"created index {index.name}")
 
+        actions += _relax_dropped_columns(conn, inspector, before)
+
+    return actions
+
+
+# 메타데이터에서 사라졌지만 예전 DB에는 남아 있는 NOT NULL 컬럼.
+# 승인 큐 삭제(01문서 §1.3)로 `cycle_log.pending_n`이 여기 해당한다.
+_DROPPED_NOT_NULL_COLUMNS = (("cycle_log", "pending_n"),)
+
+
+def _relax_dropped_columns(
+    conn: Connection, inspector: sa.Inspector, existing_tables: set[str]
+) -> list[str]:
+    """더 이상 쓰지 않는 NOT NULL 컬럼의 제약만 푼다. 컬럼과 값은 남긴다.
+
+    `migrate()`는 추가만 하므로 이런 컬럼을 지우지 않는다. 그런데 NOT NULL이고
+    기본값이 없으면, 그 컬럼을 채우지 않는 새 코드의 INSERT가 전부 실패한다 —
+    실전 루프가 사이클 기록을 못 남기고 죽는다. 제약만 푸는 이유는 DROP COLUMN이
+    되돌릴 수 없기 때문이다. 실제 삭제는 사람이 판단해서 수동 DDL로 한다.
+    """
+    actions: list[str] = []
+    for table_name, column_name in _DROPPED_NOT_NULL_COLUMNS:
+        if table_name not in existing_tables:
+            continue
+        for col in inspector.get_columns(table_name):
+            if col["name"] == column_name and not col["nullable"]:
+                conn.execute(
+                    sa.text(f"ALTER TABLE {table_name} ALTER COLUMN {column_name} DROP NOT NULL")
+                )
+                actions.append(f"relaxed NOT NULL on {table_name}.{column_name} (unused)")
     return actions
 
 

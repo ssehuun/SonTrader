@@ -6,50 +6,42 @@
 된다." 웹훅 대신 `getUpdates` 롱폴링을 쓰는 이유가 이것이다 — 이 프로세스는
 텔레그램 서버로 나가는 연결만 열고, 들어오는 연결은 받지 않는다.
 
-## 이 어댑터가 하는 일
+## 매매 지시 수단이 아니다
 
-01문서 §6.3 표의 4가지: 진입 승인/거부(인라인 버튼), 체결·손절·장애
-알림(푸시), 킬 스위치(명령어), 포지션·스톱 상태 조회(명령어). 백테스트
-결과(로컬 HTML 리포트)는 텔레그램과 무관하므로 여기 없다.
+01문서 §6.3 표의 3가지만 한다: 체결·손절·장애 알림(푸시), 킬 스위치(명령어),
+포지션·스톱 상태 조회(명령어). 백테스트 결과(로컬 HTML 리포트)는 텔레그램과
+무관하므로 여기 없다.
+
+진입 승인 버튼은 없다 — 사람이 건별로 매매를 승인·거부하면 실전이 백테스트가
+검증한 전략과 달라진다(01문서 §1.1 원칙 1). 이 봇이 매매에 영향을 줄 수 있는
+경로는 킬 스위치, 즉 신규 진입 전체를 세우는 것 하나뿐이다. 봇이 죽어도
+매매는 그대로 돈다.
 
 ## `process_update()`가 DB와 HTTP를 함께 다루는 이유
 
 `adapters/broker_kis.py`와 같은 이유다 — 이 어댑터는 텔레그램이라는 특정
-외부 시스템과 그에 관련된 도메인 상태(승인 큐, 킬 스위치)를 함께 다룬다.
-결정 자체(`engine/approval.py`, `engine/killswitch.py`)는 순수 DB 로직이고,
-여기서는 그 결과를 텔레그램 사용자에게 확인해 주는 부분만 얹는다.
+외부 시스템과 그에 관련된 도메인 상태(킬 스위치)를 함께 다룬다. 상태 변경
+자체(`engine/killswitch.py`)는 순수 DB 로직이고, 여기서는 그 결과를 텔레그램
+사용자에게 확인해 주는 부분만 얹는다.
 
 ## 아직 하지 않는 것
 
 `/positions`, `/stops`(포지션·스톱 상태 조회)는 봉 데이터(`BarView`)가
 있어야 트레일링 스톱을 계산할 수 있는데, 이 어댑터는 DB만 안다. 지금은
-대기 중인 승인과 킬 스위치 상태만 보여주는 `/status`로 대신한다 — 실제
-포지션·스톱 조회는 `apps/live.py`가 `Context`를 조립할 수 있게 된 다음
-슬라이스로 미룬다(YAGNI, 02문서 §7). `propose()`를 실행 루프에 연결하는
-일과 킬 스위치로 신규 진입을 실제로 거르는 일도 마찬가지로 다음 슬라이스다.
+킬 스위치 상태만 보여주는 `/status`로 대신한다 — 실제 포지션·스톱 조회는
+`apps/live.py`가 `Context`를 조립할 수 있게 된 다음 슬라이스로 미룬다
+(YAGNI, 02문서 §7).
 """
 
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Protocol
+from typing import Any
 
 import httpx
 from sqlalchemy.engine import Engine
 
-from sontrader.engine import approval, killswitch
-
-
-class Notifier(Protocol):
-    """`engine/loop.py`가 필요로 하는 만큼만 — 알림 발송 두 가지.
-
-    구현체는 `TelegramNotifier` 하나뿐이지만, `engine/loop.py`가 이 어댑터
-    모듈에 직접 묶이지 않도록(엔진 계층이 구체 구현이 아니라 프로토콜에
-    의존하도록) 여기 별도로 둔다.
-    """
-
-    def send_message(self, text: str) -> None: ...
-    def send_approval_request(self, proposal: approval.Proposal) -> None: ...
+from sontrader.engine import killswitch
 
 
 class TelegramError(RuntimeError):
@@ -66,7 +58,6 @@ class TelegramNotifier:
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self._chat_id = chat_id
-        self._names: dict[str, str] = {}  # 종목코드 → 이름 캐시
         self._engine = engine
         self._http = httpx.Client(
             base_url=f"https://api.telegram.org/bot{bot_token}",
@@ -83,56 +74,9 @@ class TelegramNotifier:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
-    def _label(self, symbol: str) -> str:
-        """`005930 삼성전자` 형태. 코드만으로는 어느 종목인지 즉시 알 수 없어
-        승인 판단이 느려진다.
-
-        이름을 못 찾으면 **코드만 돌려주고 절대 예외를 내지 않는다.** 이 알림은
-        사람이 승인해야 주문이 나가는 경로라, 이름 조회 실패로 알림이 끊기면
-        매매가 통째로 멈춘다 — 부가 정보 때문에 본 기능을 잃을 수는 없다.
-
-        이름은 상장 기간 중 거의 바뀌지 않으므로 프로세스 수명 동안 캐시한다.
-        """
-        if symbol not in self._names:
-            try:
-                from sontrader.data.master import load_names
-
-                self._names.update(load_names(self._engine, [symbol]))
-            except Exception:  # noqa: BLE001 — 알림이 우선이다
-                pass
-        name = self._names.get(symbol)
-        return f"{symbol} {name}" if name else symbol
-
     def send_message(self, text: str) -> None:
         """체결·손절·장애 알림 등 단방향 푸시."""
         self._call("sendMessage", {"chat_id": self._chat_id, "text": text})
-
-    def send_approval_request(self, proposal: approval.Proposal) -> None:
-        """진입 승인 요청 — 인라인 버튼 2개(승인/거부). `callback_data`에
-        `동작:proposal_id`를 실어 보내고, `process_update()`가 콜백을 받으면
-        그대로 파싱해 `engine.approval.decide()`를 호출한다."""
-        text = (
-            f"진입 승인 요청\n"
-            f"종목: {self._label(proposal.symbol)}\n"
-            f"비중: {proposal.weight:.0%}\n"
-            f"만료: {proposal.expires_at.isoformat()}"
-        )
-        keyboard = {
-            "inline_keyboard": [
-                [
-                    {"text": "승인", "callback_data": f"approve:{proposal.proposal_id}"},
-                    {"text": "거부", "callback_data": f"reject:{proposal.proposal_id}"},
-                ]
-            ]
-        }
-        self._call(
-            "sendMessage", {"chat_id": self._chat_id, "text": text, "reply_markup": keyboard}
-        )
-
-    def answer_callback_query(self, callback_query_id: str, text: str = "") -> None:
-        """버튼을 누른 사용자 화면의 로딩 스피너를 해제한다 — 텔레그램이
-        요구하는 절차이며, 안 부르면 클라이언트에서 계속 로딩 중으로 보인다."""
-        self._call("answerCallbackQuery", {"callback_query_id": callback_query_id, "text": text})
 
     def get_updates(self, *, offset: int | None = None, timeout: int = 0) -> list[dict[str, Any]]:
         params: dict[str, Any] = {"timeout": timeout}
@@ -141,48 +85,13 @@ class TelegramNotifier:
         return self._call("getUpdates", params)
 
     def process_update(self, update: dict[str, Any], *, now: datetime) -> None:
-        """`get_updates()`가 돌려준 항목 하나를 처리한다."""
-        if "callback_query" in update:
-            self._process_callback(update["callback_query"], now=now)
-        elif "message" in update:
-            self._process_command(update["message"], now=now)
+        """`get_updates()`가 돌려준 항목 하나를 처리한다.
 
-    def _process_callback(self, callback_query: dict[str, Any], *, now: datetime) -> None:
-        data = callback_query.get("data", "")
-        action, _, proposal_id = data.partition(":")
-        query_id = callback_query["id"]
-        if action not in ("approve", "reject") or not proposal_id:
-            self._safe_answer_callback_query(query_id, "알 수 없는 요청입니다.")
-            return
-
-        try:
-            proposal = approval.decide(
-                self._engine, proposal_id, approve=(action == "approve"), now=now
-            )
-        except approval.ProposalNotFoundError:
-            self._safe_answer_callback_query(query_id, "존재하지 않는 제안입니다.")
-            return
-        except approval.ProposalNotPendingError:
-            self._safe_answer_callback_query(query_id, "이미 처리됐거나 만료된 제안입니다.")
-            return
-
-        verb = "승인" if action == "approve" else "거부"
-        self._safe_answer_callback_query(query_id, f"{proposal.symbol} {verb}했습니다.")
-        self.send_message(f"{proposal.symbol} 진입 {verb}됨 (제안 {proposal.proposal_id[:8]})")
-
-    def _safe_answer_callback_query(self, callback_query_id: str, text: str = "") -> None:
-        """`answer_callback_query()`가 실패해도 무시한다.
-
-        텔레그램의 콜백은 유효시간이 있어 응답이 늦으면(폴링 주기가 길거나
-        일시적으로 밀리면) HTTP 400으로 거절될 수 있다. 이건 버튼의 로딩
-        스피너를 못 지우는 UX 문제일 뿐이다 — `approval.decide()`는 이미
-        반영됐으므로, 이 실패 때문에 뒤따르는 `send_message()` 확인 알림까지
-        막히면 안 된다(실전 테스트 중 실제로 이 순서로 재현됐다).
+        받는 것은 명령어 메시지뿐이다. 인라인 버튼을 보내지 않으므로
+        `callback_query`를 비롯한 나머지 갱신은 무시한다.
         """
-        try:
-            self.answer_callback_query(callback_query_id, text)
-        except (TelegramError, httpx.HTTPError):
-            pass
+        if "message" in update:
+            self._process_command(update["message"], now=now)
 
     def _process_command(self, message: dict[str, Any], *, now: datetime) -> None:
         text = (message.get("text") or "").strip()
@@ -199,17 +108,7 @@ class TelegramNotifier:
 
     def _status_text(self) -> str:
         engaged = killswitch.is_engaged(self._engine)
-        pending = approval.list_pending(self._engine)
-        lines = [
-            f"킬 스위치: {'작동 중' if engaged else '해제'}",
-            f"대기 중 승인: {len(pending)}건",
-        ]
-        for proposal in pending:
-            lines.append(
-                f"  - {self._label(proposal.symbol)} ({proposal.weight:.0%}, "
-                f"만료 {proposal.expires_at.isoformat()})"
-            )
-        return "\n".join(lines)
+        return f"킬 스위치: {'작동 중' if engaged else '해제'}"
 
     def _call(self, method: str, payload: dict[str, Any]) -> Any:
         response = self._http.post(f"/{method}", json=payload)

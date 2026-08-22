@@ -1,5 +1,5 @@
 """장중 실행 진입점 (구현 계획에 번호 없음). 지금까지 만든 부품
-(`broker_kis`, `reconcile`, `approval`, `killswitch`, `notifier_tg`,
+(`broker_kis`, `reconcile`, `killswitch`, `notifier_tg`,
 `live_ws`, `live_context`, `loop`)을 한 프로세스로 조립한다.
 
 ## 최소 구현
@@ -47,13 +47,13 @@ from sontrader.config import (
 )
 from sontrader.core.strategy import EntryTrigger, StrategyConfig
 from sontrader.data import calendar, cycle_log, db, live_bars
-from sontrader.engine import approval
+from sontrader.engine import killswitch
 from sontrader.engine import reconcile as reconcile_mod
 from sontrader.engine.live_context import JudgeFn, build_context
 from sontrader.engine.loop import CycleConfig, Deps, run_cycle
 from sontrader.engine.reconcile import ReconcileReport
 
-CYCLE_INTERVAL = 60.0  # 초 — 텔레그램 폴링·이벤트/승인 확인 주기
+CYCLE_INTERVAL = 60.0  # 초 — 텔레그램 폴링·이벤트 확인 주기
 WS_URL_REAL = "ws://ops.koreainvestment.com:21000"
 WS_URL_PAPER = "ws://ops.koreainvestment.com:31000"
 
@@ -138,9 +138,7 @@ def main() -> None:
                 watchlist=watchlist,
                 judge=judge or (lambda event: None),
             )
-            result = run_cycle(
-                ctx, Deps(broker=broker, engine=engine, notifier=notifier), cycle_config
-            )
+            result = run_cycle(ctx, Deps(broker=broker, engine=engine), cycle_config)
             # 사이클마다 무조건 남긴다. "변화가 있을 때만" 조건을 걸면 정작
             # 필요한 "아무 일도 없었다"는 사실이 사라지고, 로그의 구멍이
             # 다운타임인지 무거래인지 구분할 수 없게 된다.
@@ -151,7 +149,7 @@ def main() -> None:
                 positions_n=len(ctx.positions),
                 cash=ctx.cash,
                 equity=ctx.equity,
-                pending_n=len(approval.list_pending(engine)),
+                killswitch_engaged=killswitch.is_engaged(engine),
                 orders_n=len(result.orders),
                 rejections=result.rejections,
             )

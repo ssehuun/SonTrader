@@ -30,7 +30,7 @@ def test_records_a_cycle(db_engine):
         positions_n=2,
         cash=1_000,
         equity=9_500_000,
-        pending_n=3,
+        killswitch_engaged=False,
         orders_n=1,
     )
 

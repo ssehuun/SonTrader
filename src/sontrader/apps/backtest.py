@@ -174,8 +174,8 @@ def replay(
     # 유지한다: 백테스트에서 승인 큐를 켜면 Deps.engine이 없어 즉시 에러이거나,
     # 있어도 사람 없이는 영원히 승인되지 않아 매매가 멈춘다.
     cycle_config = cycle_config or CycleConfig()
-    if cycle_config.require_approval:
-        cycle_config = replace(cycle_config, require_approval=False)
+    if cycle_config.check_killswitch:
+        cycle_config = replace(cycle_config, check_killswitch=False)
 
     judge = judge or (lambda _event: None)
     bar_view = InMemoryBarView(bars)

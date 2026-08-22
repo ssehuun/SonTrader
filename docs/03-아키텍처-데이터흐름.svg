@@ -59,8 +59,8 @@
   <text x="790" y="410" font-size="11" fill="#92400e" text-anchor="middle">fills · 멱등 키</text>
 
   <rect x="895" y="360" width="180" height="72" rx="6" fill="#ffffff" stroke="#d97706"/>
-  <text x="985" y="390" font-size="13" font-weight="600" fill="#78350f" text-anchor="middle">approvals</text>
-  <text x="985" y="410" font-size="11" fill="#92400e" text-anchor="middle">승인 큐 · TTL</text>
+  <text x="985" y="390" font-size="13" font-weight="600" fill="#78350f" text-anchor="middle">kill_switch</text>
+  <text x="985" y="410" font-size="11" fill="#92400e" text-anchor="middle">전역 온/오프 단일 행</text>
 
   <rect x="1090" y="360" width="180" height="72" rx="6" fill="#ffffff" stroke="#d97706"/>
   <text x="1180" y="390" font-size="13" font-weight="600" fill="#78350f" text-anchor="middle">llm_judgments</text>
@@ -73,7 +73,7 @@
 
   <rect x="545" y="520" width="290" height="70" rx="8" fill="#e0f2fe" stroke="#0284c7" stroke-width="1.5"/>
   <text x="690" y="548" font-size="15" font-weight="600" fill="#0c4a6e" text-anchor="middle">텔레그램 봇</text>
-  <text x="690" y="570" font-size="12" fill="#0369a1" text-anchor="middle">진입 승인 · 알림 · 킬 스위치</text>
+  <text x="690" y="570" font-size="12" fill="#0369a1" text-anchor="middle">알림 · 킬 스위치 (매매 지시 아님)</text>
 
   <rect x="910" y="520" width="320" height="70" rx="8" fill="#ede9fe" stroke="#7c3aed" stroke-width="2"/>
   <text x="1070" y="548" font-size="16" font-weight="700" fill="#4c1d95" text-anchor="middle">백테스트 러너 (로컬 PC)</text>

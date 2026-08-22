@@ -14,7 +14,6 @@ NEW_TABLES = {
     "orders",
     "fills",
     "positions",
-    "approvals",
     "kill_switch",
     "symbol_master",
     "stock_candles_1d",
@@ -87,18 +86,18 @@ def test_migrate_adds_missing_columns_to_owned_tables(db_engine):
     with db_engine.begin() as conn:
         conn.execute(
             sa.text(
-                "CREATE TABLE approvals ("
-                "proposal_id VARCHAR(36) PRIMARY KEY, "
-                "payload_json JSON NOT NULL, "
-                "status VARCHAR(10) NOT NULL)"
+                "CREATE TABLE positions ("
+                "symbol VARCHAR(20) PRIMARY KEY, "
+                "qty INTEGER NOT NULL, "
+                "avg_price NUMERIC(16, 4) NOT NULL)"
             )
         )
 
     actions = db.migrate(db_engine)
 
-    assert "added column approvals.expires_at" in actions
-    cols = {c["name"] for c in sa.inspect(db_engine).get_columns("approvals")}
-    assert "expires_at" in cols
+    assert "added column positions.entered_at" in actions
+    cols = {c["name"] for c in sa.inspect(db_engine).get_columns("positions")}
+    assert "entered_at" in cols
     assert db.migrate(db_engine) == []
 
 

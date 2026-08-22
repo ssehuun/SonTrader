@@ -1,8 +1,9 @@
 # SonTrader
 
 [KIS 오픈 API](https://apiportal.koreainvestment.com) 기반 국내 주식 스윙 트레이딩 봇.
-모멘텀 워치리스트(기본) 또는 DART 공시로 후보를 뽑아, **진입은 텔레그램 승인 후 다음 개장
-시가, 청산은 완전 자동 즉시** 집행한다. 기본값은 모의투자 — 실전은 `KIS_PAPER=false` 명시.
+모멘텀 워치리스트(기본) 또는 DART 공시로 후보를 뽑아, **진입은 다음 개장 시가, 청산은 즉시**
+집행한다. 둘 다 완전 자동 — 사람은 매매 판단에 개입하지 않는다. 기본값은 모의투자,
+실전은 `KIS_PAPER=false` 명시.
 
 ## 설치
 
@@ -19,7 +20,7 @@ cp env.example .env     # 자격증명 입력 — 항목 설명은 env.example �
 | DB 명령 전체 (`migrate`, `collect-*`, `backtest`, 실전) | `DATABASE_URL` 또는 `POSTGRES_*` |
 | `collect-dart` | `DART_API_KEY` ([opendart.fss.or.kr](https://opendart.fss.or.kr), 무료) |
 | `backtest --llm`, 실전 `event` 트리거 | `ANTHROPIC_API_KEY` (백테스트는 `OPENAI_API_KEY`도 가능) |
-| 실전 승인 큐·알림·킬 스위치 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` |
+| 실전 알림·킬 스위치 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` |
 
 ### DB는 클라우드에, 백필 전에
 
@@ -78,11 +79,11 @@ uv run python -m sontrader.apps.live
 
 | 항목 | 동작 |
 |---|---|
-| 진입 | 텔레그램 인라인 버튼 승인 후 다음 사이클 |
+| 진입 | 게이트 통과 즉시 주문 (승인 절차 없음) |
 | 청산 | 완전 자동, LLM 불필요 |
 | 진입 트리거 | `SONTRADER_ENTRY_TRIGGER` — `watchlist`(기본) \| `event`(공시+LLM) |
 | 텔레그램 명령 | `/kill` 매매 중단 · `/resume` 재개 · `/status` 상태 |
-| 텔레그램 없을 때 | 동작은 하지만 승인·알림·킬 스위치 불가 |
+| 텔레그램 없을 때 | 매매는 그대로 돈다. 알림·킬 스위치만 없다 |
 | 1분봉 | 웹소켓으로 수집해 저장만 — 판정은 일봉 기준 |
 | 휴장일 | 실전 계좌만 캘린더 확인. 모의투자는 해당 API 미지원 |
 

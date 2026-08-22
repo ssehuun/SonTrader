@@ -40,7 +40,7 @@ Three layers, each in one module under `src/sontrader/`:
   `KisError`; HTTP failures raise `httpx.HTTPStatusError`.
 - `cli.py` — argparse CLI (`sontrader` entry point) over the client.
 - `data/db.py` — SQLAlchemy Core schema + `migrate()` for the trading-state tables (events,
-  llm_judgments, orders, fills, positions, approvals) in the PostgreSQL DB shared with the
+  llm_judgments, orders, fills, positions, kill_switch) in the PostgreSQL DB shared with the
   legacy kis_trading collectors (`DATABASE_URL`). Also adds adjusted-price columns to the
   legacy `stock_candles_1d`. Schema tests run on SQLite in-memory — no DB server needed.
 - `data/dart.py` — OpenDART 공시 수집기: `DartClient.list_disclosures()` (list.json, paginated,

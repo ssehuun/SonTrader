@@ -15,7 +15,7 @@
 
 같은 표의 나머지는 여기 없다. no-trade band와 최소 주문금액은 (목표 − 현재)
 편차에 걸리는 규칙이라 `core/diff.py`의 몫이고, D+2 결제·장 운영시간·휴장일·
-킬 스위치·승인 큐는 캘린더나 외부 상태가 필요해 core에 둘 수 없다 (구조 원칙 1).
+킬 스위치는 캘린더나 외부 상태가 필요해 core에 둘 수 없다 (구조 원칙 1).
 
 ## 게이트는 청산을 절대 막지 않는다
 
@@ -66,6 +66,9 @@ class RejectReason(str, Enum):
     SLOT_FULL = "slot_full"  # 보유 종목 수 상한 — 교체 없이 스킵
     DUPLICATE_EVENT = "duplicate_event"  # 동일 이벤트로 이미 진입한 적 있음
     COOLDOWN = "cooldown"  # 직전 청산 이후 쿨다운 미경과
+    # 킬 스위치는 core 밖(engine/loop.py)에서 붙인다. 이 enum에 값만 두는 이유는
+    # "왜 안 샀나"의 사유 목록이 한 군데 모여 있어야 하기 때문이다(01문서 §6.6.1).
+    KILL_SWITCH = "kill_switch"
 
 
 @dataclass(frozen=True)
@@ -87,7 +90,7 @@ def apply(target: Target, ctx: Context, config: GateConfig | None = None) -> Gat
     """목표 포트폴리오에 게이트를 적용한다.
 
     02 문서 §3.1의 `gate.apply(target, ctx) -> Target`에서 반환형만 넓혔다.
-    무엇이 왜 막혔는지는 승인 큐 알림과 백테스트 진단에 반드시 필요한데,
+    무엇이 왜 막혔는지는 텔레그램 알림과 백테스트 진단에 반드시 필요한데,
     Target만 돌려주면 그 정보가 사라진다. 호출부는 `.target`을 쓴다.
     """
     cfg = config or GateConfig()

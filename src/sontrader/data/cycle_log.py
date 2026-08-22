@@ -3,8 +3,8 @@
 ## 왜 텍스트 로그가 아니라 DB인가
 
 "2026-03-15에 왜 안 샀나"는 텍스트 로그를 grep해서 답할 수 있는 질문이 아니다.
-슬롯이 찼는지, 쿨다운이었는지, 승인이 안 났는지, 아니면 봇이 그냥 죽어
-있었는지를 구분하려면 **구조화된 행**이 필요하다.
+슬롯이 찼는지, 쿨다운이었는지, 킬 스위치가 걸려 있었는지, 아니면 봇이 그냥
+죽어 있었는지를 구분하려면 **구조화된 행**이 필요하다.
 
 `run_cycle()`이 `CycleResult.rejections`로 그 답을 이미 만들어 놓는데,
 `apps/live.py`가 반환값을 받지도 않고 버리고 있었다 — 백테스트는 이걸 모아
@@ -16,7 +16,8 @@
   60초 주기이므로 하루 약 420행이 정상이고, **그 시간대의 구멍이 곧
   다운타임**이다. 장외에는 사이클 자체를 건너뛰므로(`apps/live.py`의 장
   운영시간 게이트) 밤사이 행이 없는 것은 정상이다.
-- **왜 안 샀나** — `rejections`의 사유 (SLOT_FULL / COOLDOWN / DUPLICATE_EVENT)
+- **왜 안 샀나** — `rejections`의 사유
+  (SLOT_FULL / COOLDOWN / DUPLICATE_EVENT / KILL_SWITCH)
 - **실전 자산 곡선** — `equity`. 백테스트의 equity_curve와 같은 형태로 비교된다.
 - **언제부터 멈췄나** — `halted` 전이 시점
 
@@ -49,7 +50,7 @@ def record(
     positions_n: int,
     cash: int,
     equity: int,
-    pending_n: int = 0,
+    killswitch_engaged: bool = False,
     orders_n: int = 0,
     rejections: Sequence[Rejection] = (),
     halted: bool = False,
@@ -61,7 +62,7 @@ def record(
         "positions_n": positions_n,
         "cash": cash,
         "equity": equity,
-        "pending_n": pending_n,
+        "killswitch_engaged": killswitch_engaged,
         "orders_n": orders_n,
         "rejections": [
             {"symbol": r.symbol, "reason": r.reason.value, "event_id": r.event_id}
