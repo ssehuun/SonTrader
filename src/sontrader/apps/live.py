@@ -64,8 +64,7 @@ def main() -> None:
     client = KisClient(settings)
     broker = KisBroker(client, engine)
     notifier = _build_notifier(engine)
-    judge = _build_judge(engine)
-    cycle_config = _build_cycle_config(judge)
+    cycle_config, judge = _build_entry_config(engine)
     stop = _install_signal_handlers()
 
     tick_stream: LiveTickStream | None = None
@@ -171,23 +170,30 @@ def _build_notifier(engine: sa.engine.Engine) -> TelegramNotifier | None:
     return TelegramNotifier(token, chat_id, engine)
 
 
-def _build_cycle_config(judge: JudgeFn | None) -> CycleConfig:
-    """진입 트리거를 확정한다. 어느 쪽인지 기동 로그에 반드시 남긴다 —
-    전략이 조용히 바뀌는 것이 실전에서 가장 위험하다."""
+def _build_entry_config(engine: sa.engine.Engine) -> tuple[CycleConfig, JudgeFn | None]:
+    """진입 트리거를 확정하고, 그 트리거가 요구할 때만 judge를 만든다.
+
+    **judge를 만드는 조건이 곧 LLM을 호출하는 조건이다.** `build_context()`는
+    받은 judge를 트리거와 무관하게 모든 공시에 적용하므로, 워치리스트
+    모드에서 judge를 넘기면 쓰지도 않을 판단에 매 사이클 API 비용이 나간다.
+    그래서 트리거를 먼저 읽고 EVENT일 때만 만든다.
+
+    어느 쪽인지 기동 로그에 반드시 남긴다 — 전략이 조용히 바뀌는 것이
+    실전에서 가장 위험하다.
+    """
     trigger = load_entry_trigger()
-    if trigger == "event":
-        if judge is None:
-            raise RuntimeError(
-                "SONTRADER_ENTRY_TRIGGER=event 인데 ANTHROPIC_API_KEY가 없습니다 "
-                "— 이 조합은 신규 진입이 영원히 0건이라 조용히 청산만 돌게 됩니다."
-            )
-        entry = EntryTrigger.EVENT
-        print("진입 트리거: 공시 이벤트 + LLM 판단", flush=True)
-    else:
-        entry = EntryTrigger.WATCHLIST_RANK
-        note = " (ANTHROPIC_API_KEY가 있지만 쓰지 않습니다)" if judge is not None else ""
-        print(f"진입 트리거: 워치리스트 순위 — LLM 미사용{note}", flush=True)
-    return CycleConfig(strategy=StrategyConfig(entry_trigger=entry))
+    if trigger != "event":
+        print("진입 트리거: 워치리스트 순위 — LLM 호출 없음", flush=True)
+        return CycleConfig(strategy=StrategyConfig(entry_trigger=EntryTrigger.WATCHLIST_RANK)), None
+
+    judge = _build_judge(engine)
+    if judge is None:
+        raise RuntimeError(
+            "SONTRADER_ENTRY_TRIGGER=event 인데 ANTHROPIC_API_KEY가 없습니다 "
+            "— 이 조합은 신규 진입이 영원히 0건이라 조용히 청산만 돌게 됩니다."
+        )
+    print("진입 트리거: 공시 이벤트 + LLM 판단 (공시마다 API 호출)", flush=True)
+    return CycleConfig(strategy=StrategyConfig(entry_trigger=EntryTrigger.EVENT)), judge
 
 
 def _build_judge(engine: sa.engine.Engine) -> JudgeFn | None:

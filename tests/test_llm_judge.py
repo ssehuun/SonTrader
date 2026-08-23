@@ -1,4 +1,4 @@
-"""CachingJudge / cached_only_judge 테스트 (구현 계획 6단계).
+"""CachingJudge 테스트 (구현 계획 6단계).
 
 `LLMBackend`를 스텁으로 대체해 검증한다 — 캐싱·마스킹·fail-closed 파싱은
 어떤 제공자를 쓰든 동일해야 하므로, 여기서는 특정 벤더 SDK를 흉내내지
@@ -13,11 +13,11 @@ from datetime import datetime
 
 import pytest
 
-from sontrader.core.types import Event, ExitRule, Judgment
+from sontrader.core.types import Event
 from sontrader.data import db
 from sontrader.llm import cache
 from sontrader.llm.backend import BackendError
-from sontrader.llm.judge import CacheMissError, CachingJudge, cached_only_judge
+from sontrader.llm.judge import CachingJudge
 
 NOW = datetime(2026, 3, 10, 9, 30)
 
@@ -214,33 +214,3 @@ def test_backend_error_propagates(db_engine):
 
     with pytest.raises(BackendError):
         judge.judge(make_event())
-
-
-# --- cached_only_judge (백테스트 모드) ---------------------------------------------
-
-
-def test_cached_only_judge_returns_the_cached_judgment(db_engine):
-    db.migrate(db_engine)
-    seed_event(db_engine)
-    judgment = Judgment(
-        event_id="E1",
-        prompt_version="v1",
-        model="claude-opus-5",
-        verdict=True,
-        confidence=0.6,
-        exit_rule=ExitRule(),
-        rationale="근거",
-    )
-    cache.store(db_engine, judgment, created_at=NOW)
-    judge = cached_only_judge(db_engine, model="claude-opus-5")
-
-    assert judge(make_event()) == judgment
-
-
-def test_cached_only_judge_raises_on_cache_miss(db_engine):
-    db.migrate(db_engine)
-    seed_event(db_engine)
-    judge = cached_only_judge(db_engine, model="claude-opus-5")
-
-    with pytest.raises(CacheMissError):
-        judge(make_event())

@@ -7,13 +7,17 @@
 
 from datetime import date
 
+import pytest
+
 from sontrader.apps.live import (
+    _build_entry_config,
     _build_judge,
     _build_notifier,
     _halt,
     _load_watchlist,
     _poll_telegram,
 )
+from sontrader.core.strategy import EntryTrigger
 from sontrader.data import db
 from sontrader.engine.reconcile import PositionMismatch, ReconcileReport
 
@@ -149,3 +153,45 @@ def test_build_judge_returns_a_callable_when_key_present(monkeypatch, db_engine)
     judge = _build_judge(db_engine)
 
     assert callable(judge)
+
+
+# --- 진입 트리거와 LLM 호출 조건 -------------------------------------------------
+
+
+def test_watchlist_trigger_builds_no_judge_even_with_an_api_key(monkeypatch, db_engine):
+    """judge를 만드는 것이 곧 LLM을 호출하는 것이다.
+
+    `build_context()`는 받은 judge를 트리거와 무관하게 모든 공시에 적용하므로,
+    워치리스트 모드에서 judge를 넘기면 쓰지도 않을 판단에 매 사이클 API 비용이
+    나간다. 키가 있어도 만들지 않아야 한다.
+    """
+    monkeypatch.setattr("sontrader.config.load_dotenv", lambda: None)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.delenv("SONTRADER_ENTRY_TRIGGER", raising=False)
+
+    config, judge = _build_entry_config(db_engine)
+
+    assert judge is None
+    assert config.strategy.entry_trigger is EntryTrigger.WATCHLIST_RANK
+
+
+def test_event_trigger_builds_the_judge(monkeypatch, db_engine):
+    db.migrate(db_engine)
+    monkeypatch.setattr("sontrader.config.load_dotenv", lambda: None)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("SONTRADER_ENTRY_TRIGGER", "event")
+
+    config, judge = _build_entry_config(db_engine)
+
+    assert callable(judge)
+    assert config.strategy.entry_trigger is EntryTrigger.EVENT
+
+
+def test_event_trigger_without_an_api_key_fails_loudly(monkeypatch, db_engine):
+    """조용히 워치리스트로 폴백하면 전략이 바뀐 줄 모른 채 돌게 된다."""
+    monkeypatch.setattr("sontrader.config.load_dotenv", lambda: None)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("SONTRADER_ENTRY_TRIGGER", "event")
+
+    with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY"):
+        _build_entry_config(db_engine)

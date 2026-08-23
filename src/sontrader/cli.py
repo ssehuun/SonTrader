@@ -562,37 +562,30 @@ def _run_build_universe_range(
         return 0
 
 
-def _build_llm_backend(provider: str, model: str | None, base_url: str | None):
-    """--llm-provider에 맞는 LLMBackend를 구성한다. 실패 시 (None, 종료코드)."""
-    from sontrader.config import load_anthropic_api_key, load_openai_api_key
+def _build_cached_judge(engine, model: str):
+    """DB에 이미 저장된 LLM 판단만 읽어 오는 judge — API를 호출하지 않는다.
 
-    if provider == "anthropic":
-        from sontrader.llm.anthropic_backend import AnthropicBackend
+    백테스트는 LLM을 부르지 않는다. 부르는 순간 (1) 같은 구간을 두 번 돌린
+    결과가 달라질 수 있고, (2) 그 시점에 존재하지 않았던 모델의 판단이
+    과거 구간에 섞인다. 판단은 실전 루프(`apps/live.py`)가 그때그때
+    `llm_judgments`에 남긴 것만 쓴다.
 
-        api_key = load_anthropic_api_key()
-        if not api_key:
-            print("error: ANTHROPIC_API_KEY is not set. See env.example.", file=sys.stderr)
-            return None, 2
-        kwargs = {"model": model} if model else {}
-        return AnthropicBackend(api_key, **kwargs), 0
+    캐시에 없는 이벤트는 `None`(진입 안 함)으로 넘긴다. 호출자가 미스 건수를
+    셀 수 있도록 카운터를 함께 돌려준다 — 캐시가 비어 있으면 신규 진입이
+    0건이 되는데, 그게 전략의 결론인지 데이터가 없어서인지 구분되어야 한다.
+    """
+    from sontrader.llm import cache
+    from sontrader.llm.judge import PROMPT_VERSION
 
-    from sontrader.llm.openai_backend import OpenAICompatibleBackend
+    misses = {"n": 0}
 
-    api_key = load_openai_api_key()
-    if not api_key:
-        print("error: OPENAI_API_KEY is not set. See env.example.", file=sys.stderr)
-        return None, 2
-    if not model:
-        print("error: --llm-model is required with --llm-provider openai", file=sys.stderr)
-        return None, 2
-    kwargs = {"base_url": base_url} if base_url else {}
-    return OpenAICompatibleBackend(api_key, model=model, **kwargs), 0
+    def judge(event):
+        cached = cache.load(engine, event.event_id, PROMPT_VERSION, model)
+        if cached is None:
+            misses["n"] += 1
+        return cached
 
-
-def _build_judge(engine, backend):
-    from sontrader.llm.judge import CachingJudge
-
-    return CachingJudge(engine, backend).judge
+    return judge, misses
 
 
 def _build_cycle_config(entry_trigger: str, cooldown_days: int | None):
@@ -618,9 +611,7 @@ def _run_backtest(
     end_str: str,
     initial_cash: int,
     use_llm: bool,
-    llm_provider: str,
-    llm_model: str | None,
-    llm_base_url: str | None,
+    llm_model: str,
     entry_trigger: str,
     cooldown_days: int | None,
 ) -> int:
@@ -639,12 +630,15 @@ def _run_backtest(
     if start > end:
         print("error: --start must be <= --end", file=sys.stderr)
         return 2
-
-    backend = None
-    if use_llm:
-        backend, err = _build_llm_backend(llm_provider, llm_model, llm_base_url)
-        if backend is None:
-            return err
+    if use_llm and entry_trigger != "event":
+        # 조용히 무시하면 "LLM을 켠 결과"라고 믿고 해석하게 된다.
+        # watchlist 모드는 판단을 보지 않으므로 조합 자체가 성립하지 않는다.
+        print(
+            "error: --llm은 --entry-trigger event 와 함께 써야 합니다 "
+            f"(지금은 {entry_trigger}: 워치리스트 순위만 보고 LLM 판단은 무시됩니다).",
+            file=sys.stderr,
+        )
+        return 2
 
     engine = _open_engine()
     if engine is None:
@@ -653,13 +647,16 @@ def _run_backtest(
         for action in migrate(engine):
             print(action)
         judge = None
-        if backend is not None:
-            judge = _build_judge(engine, backend)
+        misses = None
+        if use_llm:
+            judge, misses = _build_cached_judge(engine, llm_model)
         cycle_config = _build_cycle_config(entry_trigger, cooldown_days)
         if entry_trigger == "watchlist":
             print("진입 트리거: 워치리스트 순위 (이벤트·LLM 미사용)")
-        elif backend is None:
+        elif judge is None:
             print("주의: --llm 미지정 — 이번 실행은 신규 진입 없이 청산 로직만 검증합니다.")
+        else:
+            print(f"진입 판단: 저장된 LLM 판단만 사용 (model={llm_model}, API 호출 없음)")
         result = run_backtest(
             engine,
             start=start,
@@ -676,6 +673,13 @@ def _run_backtest(
         )
         if result.rejections:
             print(f"거부 {len(result.rejections)}건 (슬롯/중복이벤트/쿨다운 등)")
+        if misses and misses["n"]:
+            # 캐시 미스를 조용히 넘기면 "신규 진입 0건"이 전략의 결론인지
+            # 판단 데이터가 없어서인지 구분되지 않는다.
+            print(
+                f"주의: 저장된 판단이 없는 이벤트 {misses['n']}건 — 그만큼 진입 후보에서"
+                f" 빠졌습니다 (model={llm_model})."
+            )
 
         report = build_report(result, initial_cash=initial_cash)
         _print_report(report)
@@ -779,10 +783,10 @@ def main(argv: list[str] | None = None) -> int:
     backtest.add_argument("--end", required=True, help="종료일 YYYYMMDD")
     backtest.add_argument(
         "--entry-trigger",
-        choices=["event", "watchlist"],
-        default="event",
-        help="진입 촉발 조건. event=공시+LLM(기본), "
-        "watchlist=워치리스트 순위만 (이벤트·LLM 미사용, 비교 기준선)",
+        choices=["watchlist", "event"],
+        default="watchlist",
+        help="진입 촉발 조건. watchlist=워치리스트 순위만 (기본, LLM 미개입), "
+        "event=공시 + 저장된 LLM 판단",
     )
     backtest.add_argument(
         "--cooldown-days",
@@ -796,23 +800,13 @@ def main(argv: list[str] | None = None) -> int:
     backtest.add_argument(
         "--llm",
         action="store_true",
-        help="LLM으로 진입 판단; 생략하면 신규 진입 없이 청산 로직만 검증",
-    )
-    backtest.add_argument(
-        "--llm-provider",
-        choices=["anthropic", "openai"],
-        default="anthropic",
-        help="LLM 제공자 (기본 anthropic; openai는 Azure OpenAI·Ollama 등 호환 서버도 포함)",
+        help="저장된 LLM 판단(llm_judgments)으로 진입 판단; "
+        "생략하면 신규 진입 없이 청산 로직만 검증. API는 호출하지 않는다",
     )
     backtest.add_argument(
         "--llm-model",
-        default=None,
-        help="모델 ID (anthropic 생략 시 claude-opus-5; openai는 필수)",
-    )
-    backtest.add_argument(
-        "--llm-base-url",
-        default=None,
-        help="--llm-provider openai용 API 베이스 URL (Azure/로컬 서버 지정 시)",
+        default="claude-opus-5",
+        help="어느 모델의 판단을 읽을지 (llm_judgments 캐시 키의 일부)",
     )
 
     for side, korean in (("buy", "매수"), ("sell", "매도")):
@@ -851,9 +845,7 @@ def main(argv: list[str] | None = None) -> int:
             args.end,
             args.initial_cash,
             args.llm,
-            args.llm_provider,
             args.llm_model,
-            args.llm_base_url,
             args.entry_trigger,
             args.cooldown_days,
         )

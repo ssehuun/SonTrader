@@ -62,15 +62,6 @@ _PROMPT_DIR = Path(__file__).parent / "prompts"
 JudgeFn = Callable[[Event], Judgment | None]
 
 
-class CacheMissError(RuntimeError):
-    """캐시 전용 모드(백테스트)에서 캐시에 없는 이벤트를 판단하려 했다.
-
-    조용히 "진입 안 함"으로 넘기면 그날 우연히 캐시가 채워져 있었는지에
-    따라 백테스트 결과가 달라진다(02문서 §2.2) — 그래서 여기서는 무조건
-    실패한다.
-    """
-
-
 def _load_prompt(version: str) -> str:
     return (_PROMPT_DIR / f"{version}.txt").read_text(encoding="utf-8")
 
@@ -156,23 +147,3 @@ class CachingJudge:
             exit_rule=exit_rule,
             rationale=str(payload["근거"]),
         )
-
-
-def cached_only_judge(
-    engine: Engine, *, prompt_version: str = PROMPT_VERSION, model: str
-) -> JudgeFn:
-    """백테스트용 judge — 캐시에 없으면 조용히 넘어가지 않고 명시적으로 실패한다.
-
-    02문서 §2.2가 요구하는 "캐시 전용 (미스 시 에러)" LLMJudge 어댑터.
-    """
-
-    def judge(event: Event) -> Judgment:
-        cached = cache.load(engine, event.event_id, prompt_version, model)
-        if cached is None:
-            raise CacheMissError(
-                f"no cached judgment for event_id={event.event_id!r} "
-                f"(prompt_version={prompt_version!r}, model={model!r})"
-            )
-        return cached
-
-    return judge

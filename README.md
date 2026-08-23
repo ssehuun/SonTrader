@@ -19,7 +19,7 @@ cp env.example .env     # 자격증명 입력 — 항목 설명은 env.example �
 |---|---|
 | DB 명령 전체 (`migrate`, `collect-*`, `backtest`, 실전) | `DATABASE_URL` 또는 `POSTGRES_*` |
 | `collect-dart` | `DART_API_KEY` ([opendart.fss.or.kr](https://opendart.fss.or.kr), 무료) |
-| `backtest --llm`, 실전 `event` 트리거 | `ANTHROPIC_API_KEY` (백테스트는 `OPENAI_API_KEY`도 가능) |
+| 실전 `event` 트리거 (기본 아님) | `ANTHROPIC_API_KEY` (백테스트는 API 키가 필요 없다) |
 | 실전 알림·킬 스위치 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` |
 
 ### DB는 클라우드에, 백필 전에
@@ -59,13 +59,25 @@ uv run sontrader build-universe                 # 모멘텀 워치리스트 + �
 ### 백테스트
 
 ```sh
-uv run sontrader backtest --start 20250101 --end 20251231
-uv run sontrader backtest --start 20250101 --end 20251231 --llm   # LLM 진입 판단 포함
-uv run sontrader backtest --start 20250101 --end 20251231 --llm \
-  --llm-provider openai --llm-model gpt-5 --llm-base-url https://api.openai.com/v1
+uv run sontrader backtest --start 20250101 --end 20251231          # 워치리스트 순위 진입 (기본)
+uv run sontrader backtest --start 20250101 --end 20251231 --cooldown-days 5
+uv run sontrader backtest --start 20250101 --end 20251231 \
+  --entry-trigger event --llm                                       # 공시 + 저장된 LLM 판단
 ```
 
-`--llm` 없으면 청산 로직만 검증한다(신규 진입 없음). `--initial-cash` 기본 1,000만원.
+| 인자 | 기본 | 내용 |
+|---|---|---|
+| `--entry-trigger` | `watchlist` | 진입 촉발. `watchlist`=모멘텀 순위, `event`=공시 |
+| `--llm` | 꺼짐 | `event` 전용. `event`인데 생략하면 신규 진입 0건 (청산 로직만 검증) |
+| `--llm-model` | `claude-opus-5` | 어느 모델의 판단을 읽을지 (캐시 키의 일부) |
+| `--cooldown-days` | 없음 | 청산 후 재진입 금지 일수. `watchlist` 모드의 유일한 재진입 제동 |
+| `--initial-cash` | 1,000만원 | |
+
+**백테스트는 LLM API를 호출하지 않는다.** `--llm`은 `llm_judgments`에 이미 저장된
+판단만 읽는다 — 호출하면 재실행 결과가 달라지고, 그 시점에 없던 모델이 과거 구간에
+섞인다. 판단을 남기는 곳은 실전 루프뿐이라, 실전을 돌린 적 없는 구간은 대부분
+미스로 나온다(빠진 건수를 출력한다).
+
 결과: CAGR·샤프·MDD·승률·손익비·평균 보유일·거래비용 비중 (표본 30건 미만이면 경고).
 
 ### 실전 실행
@@ -81,7 +93,7 @@ uv run python -m sontrader.apps.live
 |---|---|
 | 진입 | 게이트 통과 즉시 주문 (승인 절차 없음) |
 | 청산 | 완전 자동, LLM 불필요 |
-| 진입 트리거 | `SONTRADER_ENTRY_TRIGGER` — `watchlist`(기본) \| `event`(공시+LLM) |
+| 진입 트리거 | `SONTRADER_ENTRY_TRIGGER` — `watchlist`(기본, LLM 호출 없음) \| `event`(공시마다 LLM API 호출) |
 | 텔레그램 명령 | `/kill` 매매 중단 · `/resume` 재개 · `/status` 상태 |
 | 텔레그램 없을 때 | 매매는 그대로 돈다. 알림·킬 스위치만 없다 |
 | 1분봉 | 웹소켓으로 수집해 저장만 — 판정은 일봉 기준 |
