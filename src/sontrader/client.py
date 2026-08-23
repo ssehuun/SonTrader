@@ -7,6 +7,7 @@ in _TR_IDS. API reference: https://apiportal.koreainvestment.com
 
 from __future__ import annotations
 
+import logging
 import time as time_module
 from collections.abc import Callable
 from datetime import date, datetime
@@ -16,6 +17,8 @@ import httpx
 
 from sontrader.auth import KisError, TokenManager, is_transient, raise_for_kis_error
 from sontrader.config import Settings
+
+log = logging.getLogger(__name__)
 
 # endpoint key -> (real tr_id, paper tr_id)
 # https://apiportal.koreainvestment.com/apiservice-apiservice?/uapi/domestic-stock/v1/trading/order-cash
@@ -276,6 +279,11 @@ class KisClient:
             except KisError as exc:
                 if not is_transient(exc) or attempt == _RETRIES:
                     raise
+                # 자동 복구되지만 반복되면 유량 설계가 틀렸다는 뜻이다(§6.6.2 WARN).
+                # 남기지 않으면 "느려진 이유"를 나중에 되짚을 방법이 없다.
+                log.warning(
+                    "일시 오류 재시도 %d/%d — %s %s: %s", attempt, _RETRIES, method, path, exc
+                )
                 self._sleep(_RETRY_BACKOFF * attempt)
                 continue
             response.raise_for_status()

@@ -23,8 +23,8 @@ ExitRule 파라미터가 검증되지 않았다).
 
 from __future__ import annotations
 
+import logging
 import signal
-import sys
 import threading
 from datetime import date
 
@@ -52,6 +52,9 @@ from sontrader.engine import reconcile as reconcile_mod
 from sontrader.engine.live_context import JudgeFn, build_context
 from sontrader.engine.loop import CycleConfig, Deps, run_cycle
 from sontrader.engine.reconcile import ReconcileReport
+from sontrader.logging_setup import configure as configure_logging
+
+log = logging.getLogger(__name__)
 
 CYCLE_INTERVAL = 60.0  # 초 — 텔레그램 폴링·이벤트 확인 주기
 WS_URL_REAL = "ws://ops.koreainvestment.com:21000"
@@ -59,6 +62,7 @@ WS_URL_PAPER = "ws://ops.koreainvestment.com:31000"
 
 
 def main() -> None:
+    configure_logging()
     settings = load_settings()
     engine = db.get_engine(load_database_url())
     client = KisClient(settings)
@@ -104,12 +108,12 @@ def main() -> None:
             # 킬 스위치·상태 조회는 24시간 살아 있어야 한다.
             if not calendar.is_market_hours(now):
                 if trading_open:  # 장중 → 장외 전이에만 남긴다
-                    print(f"[{now:%H:%M}] 장 마감 — 매매 사이클 중단", flush=True)
+                    log.info("장 마감 — 매매 사이클 중단")
                     trading_open = False
                 stop.wait(CYCLE_INTERVAL)
                 continue
             if not trading_open:
-                print(f"[{now:%H:%M}] 장 시작 — 매매 사이클 시작", flush=True)
+                log.info("장 시작 — 매매 사이클 시작")
                 trading_open = True
 
             report = reconcile_mod.reconcile(engine, broker)
@@ -183,7 +187,7 @@ def _build_entry_config(engine: sa.engine.Engine) -> tuple[CycleConfig, JudgeFn 
     """
     trigger = load_entry_trigger()
     if trigger != "event":
-        print("진입 트리거: 워치리스트 순위 — LLM 호출 없음", flush=True)
+        log.info("진입 트리거: 워치리스트 순위 — LLM 호출 없음")
         return CycleConfig(strategy=StrategyConfig(entry_trigger=EntryTrigger.WATCHLIST_RANK)), None
 
     judge = _build_judge(engine)
@@ -192,7 +196,7 @@ def _build_entry_config(engine: sa.engine.Engine) -> tuple[CycleConfig, JudgeFn 
             "SONTRADER_ENTRY_TRIGGER=event 인데 ANTHROPIC_API_KEY가 없습니다 "
             "— 이 조합은 신규 진입이 영원히 0건이라 조용히 청산만 돌게 됩니다."
         )
-    print("진입 트리거: 공시 이벤트 + LLM 판단 (공시마다 API 호출)", flush=True)
+    log.info("진입 트리거: 공시 이벤트 + LLM 판단 (공시마다 API 호출)")
     return CycleConfig(strategy=StrategyConfig(entry_trigger=EntryTrigger.EVENT)), judge
 
 
@@ -266,7 +270,7 @@ def _install_signal_handlers() -> threading.Event:
 def _halt(notifier: TelegramNotifier | None, report: ReconcileReport) -> None:
     detail = ", ".join(f"{m.symbol}({m.reason})" for m in report.mismatches)
     message = f"포지션 불일치 발견 — 매매를 중단합니다: {detail}"
-    print(message, file=sys.stderr)
+    log.error(message)
     if notifier is not None:
         notifier.send_message(message)
 

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 from collections.abc import Callable, Sequence
 
@@ -41,6 +42,8 @@ import websockets
 
 from sontrader.adapters.live_ticks import MinuteBarAggregator, parse_tick_message
 from sontrader.core.types import Bar
+
+log = logging.getLogger(__name__)
 
 TR_ID = "H0STCNT0"
 _TR_TYPE_SUBSCRIBE = "1"
@@ -111,12 +114,25 @@ class LiveTickStream:
         self._loop = asyncio.get_running_loop()
         self._task = asyncio.current_task()
         self._ready.set()
+        failures = 0
         try:
             while True:
                 try:
                     await self._connect_and_listen()
-                except Exception:
-                    pass  # 연결 오류 — 아래에서 대기 후 재연결한다
+                    failures = 0
+                except Exception as exc:  # noqa: BLE001 — 어떤 오류든 재연결한다
+                    # 조용히 삼키면 스트림이 죽은 것을 아무도 모른다(01문서 §6.4
+                    # "조용히 죽으면 인지조차 못 한다"). 첫 실패는 흔한 끊김이라
+                    # WARN, 반복되면 사람이 봐야 하므로 ERROR로 올린다.
+                    failures += 1
+                    level = logging.WARNING if failures == 1 else logging.ERROR
+                    log.log(
+                        level,
+                        "웹소켓 연결 끊김 (%d회 연속) — %.0f초 뒤 재연결: %s",
+                        failures,
+                        self._reconnect_delay,
+                        exc,
+                    )
                 await asyncio.sleep(self._reconnect_delay)
         except asyncio.CancelledError:
             pass

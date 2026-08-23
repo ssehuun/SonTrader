@@ -39,7 +39,7 @@ TTTC8434R/VTTC8434R)를 그대로 쓴다.
 
 from __future__ import annotations
 
-import sys
+import logging
 import time as time_module
 import uuid
 from collections.abc import Callable
@@ -53,6 +53,8 @@ from sontrader.client import KisClient, KisError
 from sontrader.core.types import Fill, Order, OrderStatus, Side
 from sontrader.data import orders as orders_repo
 from sontrader.data.orders import OrderRecord
+
+log = logging.getLogger(__name__)
 
 _SUBMIT_RETRIES = 3
 
@@ -129,7 +131,7 @@ class KisBroker:
             # 사유를 남긴다. 예전에는 그냥 REJECTED로만 기록해서 "잔고 부족"과
             # "유량 초과"를 구분할 수 없었다 — 상시 가동에서 관측 공백이 된다.
             orders_repo.update_status(self._engine, order_id, OrderStatus.REJECTED)
-            self._log(f"주문 거절 {order.symbol} {side} {order.qty}주: {exc}")
+            log.error("주문 거절 %s %s %s주: %s", order.symbol, side, order.qty, exc)
             return OrderResult(order=order, status=OrderStatus.REJECTED, reason=str(exc))
 
         broker_order_no = response.get("ODNO")
@@ -139,9 +141,6 @@ class KisBroker:
         return OrderResult(
             order=order, status=OrderStatus.SUBMITTED, broker_order_no=broker_order_no
         )
-
-    def _log(self, message: str) -> None:
-        print(message, file=sys.stderr, flush=True)
 
     def _resolve_one(self, record: OrderRecord) -> OrderResult:
         order = _order_from_record(record)
