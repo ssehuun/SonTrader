@@ -108,25 +108,53 @@ def load_database_url() -> str | None:
     )
 
 
+def _load_credentials(paper: bool) -> tuple[str, str, str, str]:
+    """환경에 맞는 자격증명 3종을 고른다.
+
+    앱키는 환경별로 발급된다 — 모의 앱키를 실전 도메인에 쓰거나 그 반대면
+    KIS가 `EGW02007: 해당 앱키는 모의투자용 앱키가 아닙니다`로 거절한다.
+    그래서 두 벌을 각각 `KIS_APP_PAPER_*` / `KIS_APP_*`에 두고 `KIS_PAPER`로
+    고른다. 한 벌만 쓰던 기존 `.env`도 그대로 동작하도록, 모의용 변수가
+    없으면 접미사 없는 이름으로 넘어간다.
+
+    조용한 실패를 막는 것이 핵심이다: 이름 하나 안 맞아서 실전 키가 모의
+    도메인에 붙으면 시세조회는 통과하고 계좌 API만 막혀, 기동 후 한참 뒤에
+    "왜 잔고가 안 보이지"로 드러난다.
+
+    계좌번호는 어느 변수에서 왔는지까지 돌려준다 — 형식이 틀렸을 때 두 이름
+    중 무엇을 고쳐야 하는지 오류 메시지가 짚어줘야 한다.
+    """
+    names = (
+        ("KIS_APP_PAPER_KEY", "KIS_APP_KEY"),
+        ("KIS_APP_PAPER_SECRET", "KIS_APP_SECRET"),
+        ("KIS_ACCOUNT_PAPER_NO", "KIS_ACCOUNT_NO"),
+    )
+    values: list[str] = []
+    used: list[str] = []
+    for paper_name, real_name in names:
+        name = paper_name if paper and _optional_env(paper_name) else real_name
+        value = _optional_env(name)
+        if not value:
+            hint = f"{paper_name} 또는 {real_name}" if paper else real_name
+            raise RuntimeError(
+                f"Missing required environment variable: {hint}. "
+                "Copy env.example to .env and fill in your KIS credentials."
+            )
+        values.append(value)
+        used.append(name)
+    return values[0], values[1], values[2], used[2]
+
+
 def load_settings() -> Settings:
     load_dotenv()
-    try:
-        app_key = os.environ["KIS_APP_KEY"]
-        app_secret = os.environ["KIS_APP_SECRET"]
-        account_no = os.environ["KIS_ACCOUNT_NO"]
-    except KeyError as exc:
-        raise RuntimeError(
-            f"Missing required environment variable {exc}. "
-            "Copy env.example to .env and fill in your KIS credentials."
-        ) from exc
+    paper = os.environ.get("KIS_PAPER", "true").strip().lower() not in ("false", "0", "no")
+    app_key, app_secret, account_no, account_var = _load_credentials(paper)
 
     cano, _, acnt_prdt_cd = account_no.partition("-")
     if len(cano) != 8 or len(acnt_prdt_cd) != 2:
         raise RuntimeError(
-            "KIS_ACCOUNT_NO must look like 12345678-01 (계좌번호 8자리-상품코드 2자리)."
+            f"{account_var} must look like 12345678-01 (계좌번호 8자리-상품코드 2자리)."
         )
-
-    paper = os.environ.get("KIS_PAPER", "true").strip().lower() not in ("false", "0", "no")
     # expanduser: .env의 "~/..."가 확장되지 않으면 리포지토리 안에 "~" 디렉토리가
     # 생겨 토큰이 저장소에 커밋될 뻔한 사고가 실제로 있었다.
     token_cache = Path(os.environ.get("SONTRADER_TOKEN_CACHE", DEFAULT_TOKEN_CACHE)).expanduser()

@@ -54,7 +54,9 @@ from sontrader.engine.loop import CycleConfig, Deps, run_cycle
 from sontrader.engine.reconcile import ReconcileReport
 from sontrader.logging_setup import configure as configure_logging
 
-log = logging.getLogger(__name__)
+# `python -m sontrader.apps.live`로 띄우면 __name__이 "__main__"이 되어
+# 로그에 모듈 경로가 안 남는다. 이름을 고정해 다른 모듈과 형식을 맞춘다.
+log = logging.getLogger("sontrader.apps.live")
 
 CYCLE_INTERVAL = 60.0  # 초 — 텔레그램 폴링·이벤트 확인 주기
 WS_URL_REAL = "ws://ops.koreainvestment.com:21000"
@@ -79,6 +81,12 @@ def main() -> None:
             return
 
         tick_stream = _start_tick_stream(engine, client, settings)
+        log.info(
+            "기동 완료 — %s, 워치리스트 %d종목, 분봉 스트림 %s",
+            "모의투자" if settings.paper else "실전",
+            len(_load_watchlist(engine, RealClock().now().date())),
+            "on" if tick_stream is not None else "off",
+        )
         if notifier is not None:
             notifier.send_message("SonTrader 기동 완료")
 
@@ -161,6 +169,7 @@ def main() -> None:
     finally:
         if tick_stream is not None:
             tick_stream.stop()
+        log.info("종료")
         if notifier is not None:
             notifier.send_message("SonTrader 종료")
         client.close()

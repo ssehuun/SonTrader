@@ -18,6 +18,8 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setenv("KIS_ACCOUNT_NO", "12345678-01")
     monkeypatch.setenv("SONTRADER_TOKEN_CACHE", str(tmp_path / "token.json"))
     monkeypatch.delenv("KIS_PAPER", raising=False)
+    for name in ("KIS_APP_PAPER_KEY", "KIS_APP_PAPER_SECRET", "KIS_ACCOUNT_PAPER_NO"):
+        monkeypatch.delenv(name, raising=False)
     return monkeypatch
 
 
@@ -118,3 +120,52 @@ def test_entry_trigger_rejects_unknown_values(monkeypatch):
     monkeypatch.setenv("SONTRADER_ENTRY_TRIGGER", "momentum")
     with pytest.raises(RuntimeError, match="SONTRADER_ENTRY_TRIGGER"):
         load_entry_trigger()
+
+
+# --- 환경별 자격증명 선택 ---------------------------------------------------------
+#
+# 앱키는 환경별로 발급된다. 실전 키를 모의 도메인에 쓰면 시세조회는 통과하고
+# 계좌 API만 EGW02007로 막혀서, 기동한 뒤 한참 지나 드러난다.
+
+
+def test_paper_credentials_win_in_paper_mode(env):
+    env.setenv("KIS_APP_PAPER_KEY", "paper-key")
+    env.setenv("KIS_APP_PAPER_SECRET", "paper-secret")
+    env.setenv("KIS_ACCOUNT_PAPER_NO", "87654321-02")
+
+    settings = load_settings()
+
+    assert settings.paper is True
+    assert settings.app_key == "paper-key"
+    assert settings.app_secret == "paper-secret"
+    assert settings.cano == "87654321"
+
+
+def test_paper_credentials_are_ignored_in_real_mode(env):
+    """실전 도메인에 모의 키가 붙으면 주문이 통째로 막힌다."""
+    env.setenv("KIS_PAPER", "false")
+    env.setenv("KIS_APP_PAPER_KEY", "paper-key")
+    env.setenv("KIS_APP_PAPER_SECRET", "paper-secret")
+    env.setenv("KIS_ACCOUNT_PAPER_NO", "87654321-02")
+
+    settings = load_settings()
+
+    assert settings.paper is False
+    assert settings.app_key == "key"
+    assert settings.cano == "12345678"
+
+
+def test_paper_mode_falls_back_to_unsuffixed_names(env):
+    """한 벌만 쓰던 기존 .env가 그대로 동작해야 한다."""
+    settings = load_settings()
+
+    assert settings.paper is True
+    assert settings.app_key == "key"
+
+
+def test_error_names_the_variable_that_is_actually_used(env):
+    """두 이름 중 무엇을 고쳐야 하는지 메시지가 짚어줘야 한다."""
+    env.setenv("KIS_ACCOUNT_PAPER_NO", "1234-5")
+
+    with pytest.raises(RuntimeError, match="KIS_ACCOUNT_PAPER_NO"):
+        load_settings()
