@@ -5,10 +5,13 @@
 """
 
 import logging
+import re
+from datetime import datetime
 
 import pytest
 
-from sontrader.logging_setup import REDACTED, collect_env_secrets, configure, mask
+from sontrader.logging_setup import REDACTED, collect_env_secrets, configure, mask, traced
+from sontrader.timeutil import now_kst
 
 SECRETS = ("PSxxxxxxxxAPPKEY", "12345678")
 
@@ -126,3 +129,127 @@ def test_log_level_comes_from_the_environment(monkeypatch):
 
     assert logging.getLogger().level == logging.WARNING
     logging.getLogger().handlers.clear()
+
+
+# --- @traced -------------------------------------------------------------------
+
+
+@pytest.fixture
+def at_level(monkeypatch, capsys):
+    """지정한 레벨로 configure()한 뒤 stdout을 돌려준다."""
+
+    def _run(level, emit):
+        for name in ("KIS_APP_KEY", "KIS_APP_SECRET", "KIS_ACCOUNT_NO", "DATABASE_URL"):
+            monkeypatch.delenv(name, raising=False)
+        configure(level)
+        emit()
+        return capsys.readouterr().out
+
+    yield _run
+    logging.getLogger().handlers.clear()
+
+
+def test_traced_logs_failures_even_at_info_level(at_level):
+    """실제로 겪은 사고의 회귀 테스트. 예전 구현은 DEBUG가 아니면 try에
+    들어가기도 전에 조기 반환해서, docstring이 약속한 실패 로그가 기본
+    레벨에서 영원히 찍히지 않았다 — 관측용 데코레이터가 실패를 감췄다."""
+
+    @traced
+    def submit(order):
+        raise RuntimeError("KIS 응답 없음")
+
+    def emit():
+        with pytest.raises(RuntimeError):
+            submit("005930")
+
+    out = at_level("INFO", emit)
+
+    assert "ERROR" in out
+    assert "submit 실패" in out
+    assert "KIS 응답 없음" in out
+
+
+def test_traced_reraises_the_original_exception(at_level):
+    """로그를 남기되 삼키지 않는다 — 삼키면 호출자가 실패를 모른다."""
+
+    @traced
+    def boom():
+        raise ValueError("원본")
+
+    def emit():
+        with pytest.raises(ValueError, match="원본"):
+            boom()
+
+    at_level("INFO", emit)
+
+
+def test_traced_is_silent_at_info_when_the_call_succeeds(at_level):
+    """평상시에는 조용해야 한다. 경계 함수마다 매 사이클 두 줄이 늘면
+    하트비트가 묻힌다."""
+
+    @traced
+    def cash():
+        return 100
+
+    out = at_level("INFO", lambda: cash())
+
+    assert out == ""
+
+
+def test_traced_logs_enter_and_exit_with_duration_at_debug(at_level):
+    @traced
+    def cash():
+        return 9_494_652
+
+    out = at_level("DEBUG", lambda: cash())
+
+    # qualname이므로 중첩 함수는 "...<locals>.cash"로 찍힌다.
+    assert "cash()" in out  # 진입
+    assert "ms →" in out  # 이탈 + 소요시간
+    assert "9494652" in out  # 반환값
+    assert out.count("\n") == 2  # 진입/이탈 두 줄
+
+
+def test_traced_hides_self_but_keeps_real_arguments(at_level):
+    """self는 매번 같아 정보가 없으니 빼고, 실제 인자는 남긴다. 판정을
+    데코레이션 시점 시그니처로 하는 이유 — 호출 시점 추측은 첫 인자의 타입이
+    우연히 같은 이름의 속성을 가지면 실제 인자를 조용히 삼킨다."""
+
+    class Broker:
+        def submit(self, symbol):  # 같은 이름의 속성을 가진 타입
+            return "ok"
+
+        submit = traced(submit)
+
+    out = at_level("DEBUG", lambda: Broker().submit("005930"))
+
+    assert "'005930'" in out, "실제 인자가 남아야 한다"
+    assert "Broker object" not in out, "self는 빠져야 한다"
+
+
+def test_traced_truncates_huge_arguments(at_level):
+    """봉 300개짜리 리스트가 그대로 펼쳐지면 한 줄이 수만 자가 된다."""
+
+    @traced
+    def collect(symbols):
+        return symbols
+
+    out = at_level("DEBUG", lambda: collect([f"{i:06d}" for i in range(500)]))
+
+    assert "…" in out
+    assert max(len(line) for line in out.splitlines()) < 400
+
+
+# --- 시각 ----------------------------------------------------------------------
+
+
+def test_timestamps_are_kst_with_milliseconds(at_level):
+    """머신 타임존은 UTC인데 DB는 naive KST다. 시각을 대조할 수 없으면
+    "그때 무슨 일이 있었나"를 추적할 수 없다. 밀리초는 한 사이클 안의 순서를
+    복원하는 데 필요하다."""
+    out = at_level("INFO", lambda: logging.getLogger("sontrader.test").info("x"))
+
+    stamp = out.split(" KST ")[0]
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}", stamp), stamp
+    logged = datetime.strptime(stamp.split(",")[0], "%Y-%m-%d %H:%M:%S")
+    assert abs((logged - now_kst()).total_seconds()) < 5

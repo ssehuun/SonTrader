@@ -42,6 +42,7 @@ from sontrader.core.types import Bar, Context, Event, Judgment, Position
 from sontrader.data import db
 from sontrader.data import orders as orders_repo
 from sontrader.engine.context import InMemoryBarView
+from sontrader.logging_setup import traced
 
 _SYMBOL_CHUNK = 500  # IN 절 바인드 변수 한도 대비 — apps/backtest.py와 동일한 규약
 _DEFAULT_EVENT_LOOKBACK = timedelta(hours=24)
@@ -50,6 +51,7 @@ _DEFAULT_BAR_HISTORY = 300  # core/exit_rules.py 기본 ATR 창(14)+최대보유
 JudgeFn = Callable[[Event], Judgment | None]
 
 
+@traced
 def build_context(
     engine: Engine,
     *,

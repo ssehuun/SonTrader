@@ -43,6 +43,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 
 from sqlalchemy.engine import Engine
@@ -54,6 +55,13 @@ from sontrader.core.gate import GateConfig, Rejection, RejectReason
 from sontrader.core.strategy import StrategyConfig
 from sontrader.core.types import Context, Order, Target, TargetItem
 from sontrader.engine import killswitch
+from sontrader.logging_setup import traced
+
+# 백테스트와 실전이 이 모듈을 공유한다. 백테스트는 수천 사이클을 재생하므로
+# **"아무 일도 없었다"를 INFO로 찍지 않는다** — 주문이 실제로 생긴 사이클만
+# 남기고 나머지는 DEBUG다. 사이클의 존재 자체는 `apps/live.py`의 하트비트와
+# `cycle_log`가 답한다.
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -79,6 +87,7 @@ class CycleResult:
     order_results: tuple[OrderResult, ...]
 
 
+@traced
 def run_cycle(ctx: Context, deps: Deps, config: CycleConfig | None = None) -> CycleResult:
     cfg = config or CycleConfig()
     if cfg.check_killswitch and deps.engine is None:
@@ -90,6 +99,18 @@ def run_cycle(ctx: Context, deps: Deps, config: CycleConfig | None = None) -> Cy
 
     final_target = Target(items)
     orders = diff.to_orders(final_target, ctx, cfg.diff)
+    if orders:
+        log.info(
+            "주문 %d건 결정: %s",
+            len(orders),
+            ", ".join(f"{o.symbol} {o.side.value} {o.qty}주 {o.urgency.value}" for o in orders),
+        )
+    else:
+        log.debug("주문 없음 (목표 %d종목, 보유 %d종목)", len(items), len(ctx.positions))
+    # 거부는 사이클마다 같은 종목이 반복된다(슬롯이 찬 동안 계속). 사유별
+    # 집계는 하트비트가, 종목별 내역은 `cycle_log.rejections`가 답한다.
+    for rejection in gated.rejections + blocked:
+        log.debug("거부 %s: %s", rejection.symbol, rejection.reason.value)
     order_results = deps.broker.submit(orders, now=ctx.now)
 
     return CycleResult(
@@ -106,6 +127,10 @@ def _apply_killswitch(
     """신규 진입만 떨어낸다. 보유 종목의 축소·청산은 항상 통과시킨다."""
     if not cfg.check_killswitch or not killswitch.is_engaged(deps.engine):
         return target.items, ()
+    # 여기서 WARNING을 찍지 않는다. 킬 스위치는 해제할 때까지 붙어 있어서
+    # 60초마다 같은 줄이 반복되고, 그러면 조치가 필요한 다른 WARNING이 묻힌다.
+    # 작동 여부는 `apps/live.py`의 하트비트가 매 사이클 한 줄에 실어 보내고,
+    # 막힌 종목은 아래 RejectReason.KILL_SWITCH로 남는다.
 
     held = ctx.held_symbols
     kept: list[TargetItem] = []

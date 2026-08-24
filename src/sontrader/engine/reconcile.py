@@ -37,6 +37,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Literal
 
@@ -47,6 +48,9 @@ from sontrader.adapters.broker_kis import KisBroker
 from sontrader.core.types import Position
 from sontrader.data import positions as positions_repo
 from sontrader.engine import fills
+from sontrader.logging_setup import traced
+
+log = logging.getLogger(__name__)
 
 MismatchReason = Literal["broker_only", "db_only"]
 
@@ -78,6 +82,13 @@ def _record_resolved_positions(engine: Engine, resolved: list[OrderResult]) -> N
     held = frozenset(p.symbol for p in positions_repo.load_all(engine))
     for change in fills.position_changes(resolved, held=held):
         if isinstance(change, fills.Opened):
+            log.info(
+                "포지션 신규 %s %d주 @%s (진입 %s)",
+                change.symbol,
+                change.qty,
+                f"{change.entry_price:,}",
+                change.entered_at,
+            )
             positions_repo.upsert(
                 engine,
                 symbol=change.symbol,
@@ -88,6 +99,7 @@ def _record_resolved_positions(engine: Engine, resolved: list[OrderResult]) -> N
                 event_id=change.event_id,
             )
         else:
+            log.info("포지션 청산 %s %d주 @%s", change.symbol, change.qty, f"{change.exit_price:,}")
             positions_repo.delete(engine, change.symbol)
 
 
@@ -103,8 +115,11 @@ class ReconcileReport:
         return len(self.mismatches) > 0
 
 
+@traced
 def reconcile(engine: Engine, broker: KisBroker) -> ReconcileReport:
     resolved = broker.resolve_unknown()
+    if resolved:
+        log.info("접수 불명/미체결 주문 %d건 확정", len(resolved))
     _record_resolved_positions(engine, resolved)
 
     broker_positions = {p.symbol: p for p in broker.positions()}
@@ -132,5 +147,21 @@ def reconcile(engine: Engine, broker: KisBroker) -> ReconcileReport:
     # positions_repo에서 pop되지 않고 남은 항목 = DB에 기록이 없는 브로커 보유분.
     for symbol, broker_pos in broker_positions.items():
         mismatches.append(PositionMismatch(symbol, "broker_only", broker_pos.qty, None))
+
+    # 불일치는 종목별 사유까지 남긴다. 호출자(`apps/live.py`)는 "중단한다"는
+    # 결정만 ERROR로 남기므로, 무엇이 왜 어긋났는지는 여기서만 알 수 있다.
+    for mismatch in mismatches:
+        if mismatch.reason == "broker_only":
+            log.warning(
+                "계좌에만 있는 종목 %s (%d주) — 청산조건을 몰라 스톱을 걸 수 없다",
+                mismatch.symbol,
+                mismatch.broker_qty,
+            )
+        else:
+            log.warning(
+                "DB에만 있는 종목 %s (%d주) — 계좌에 없다", mismatch.symbol, mismatch.db_qty
+            )
+    # 매 사이클 호출되므로 정상 경로는 DEBUG다. 살아있음은 하트비트가 답한다.
+    log.debug("대조 완료: 포지션 %d건, 불일치 %d건", len(positions), len(mismatches))
 
     return ReconcileReport(tuple(positions), tuple(mismatches), tuple(resolved))

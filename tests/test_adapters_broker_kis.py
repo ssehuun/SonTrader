@@ -451,3 +451,100 @@ def test_exhausted_transient_retries_end_in_rejection_with_reason(settings, db_e
     assert len(attempts) == 3
     stored = orders.find_by_idempotency_key(db_engine, make_order().idempotency_key)
     assert stored.status is OrderStatus.REJECTED
+
+
+# --- 로그 (실전 관측의 유일한 창구) ------------------------------------------------
+
+
+def test_submitted_order_is_logged_with_its_odno(settings, db_engine, caplog):
+    """**실제 자금이 움직이기 시작한 지점**이라 로그가 반드시 있어야 한다.
+    ODNO를 남겨야 나중에 KIS 앱에서 같은 주문을 찾아 대조할 수 있다.
+
+    회귀 테스트인 이유: 이 로그가 한 번 누락된 채로 전체 테스트가 통과했고,
+    실제로 코드를 돌려 눈으로 봤을 때야 빠진 것이 드러났다.
+    """
+    db.migrate(db_engine)
+
+    def responder(request):
+        return httpx.Response(200, json={"rt_cd": "0", "output": {"ODNO": "0000117057"}})
+
+    broker = make_broker(settings, db_engine, responder)
+    with caplog.at_level("INFO", logger="sontrader.adapters.broker_kis"):
+        broker.submit([make_order()], now=NOW)
+
+    [record] = [r for r in caplog.records if "주문 제출" in r.message]
+    assert record.levelname == "INFO"
+    assert "005930" in record.message
+    assert "0000117057" in record.message  # ODNO
+
+
+def test_duplicate_submission_is_logged(settings, db_engine, caplog):
+    """중복 차단이 조용하면 "주문이 안 나갔다"와 "이미 나갔다"를 구분할 수 없다."""
+    db.migrate(db_engine)
+    calls = []
+
+    def responder(request):
+        calls.append(request)
+        return httpx.Response(200, json={"rt_cd": "0", "output": {"ODNO": "0000117057"}})
+
+    broker = make_broker(settings, db_engine, responder)
+    order = make_order()
+    broker.submit([order], now=NOW)
+    with caplog.at_level("INFO", logger="sontrader.adapters.broker_kis"):
+        broker.submit([order], now=NOW)  # 같은 멱등 키
+
+    assert len(calls) == 1  # KIS를 다시 부르지 않았다
+    assert any("중복 주문 차단" in r.message for r in caplog.records)
+
+
+def test_rejected_order_is_logged_at_error_with_the_reason(settings, db_engine, caplog):
+    """사유가 없으면 "잔고 부족"과 "유량 초과"를 구분할 수 없다."""
+    db.migrate(db_engine)
+
+    def responder(request):
+        return httpx.Response(
+            200, json={"rt_cd": "1", "msg_cd": "40310000", "msg1": "주문가능금액이 부족합니다"}
+        )
+
+    broker = make_broker(settings, db_engine, responder)
+    with caplog.at_level("INFO", logger="sontrader.adapters.broker_kis"):
+        broker.submit([make_order()], now=NOW)
+
+    [record] = [r for r in caplog.records if "주문 거절" in r.message]
+    assert record.levelname == "ERROR"
+    assert "주문가능금액이 부족합니다" in record.message
+
+
+def test_unknown_acceptance_is_logged_at_warning(settings, db_engine, caplog):
+    """접수 불명은 다음 사이클에 해소되지만, 실제로 접수됐을 수 있어
+    조용히 넘기면 안 된다."""
+    db.migrate(db_engine)
+
+    def responder(request):
+        raise httpx.ReadTimeout("timeout")
+
+    broker = make_broker(settings, db_engine, responder)
+    with caplog.at_level("INFO", logger="sontrader.adapters.broker_kis"):
+        result = broker.submit([make_order()], now=NOW)
+
+    assert result[0].status is OrderStatus.UNKNOWN
+    [record] = [r for r in caplog.records if "접수 불명" in r.message]
+    assert record.levelname == "WARNING"
+
+
+def test_missing_odno_warning_fires_only_once_per_order(settings, db_engine, caplog):
+    """`list_unresolved()`는 나이 제한이 없고 이 주문은 상태가 영영 바뀌지
+    않는다. 조건 없이 찍으면 하루 약 390회 같은 경고가 반복되어 정작 조치가
+    필요한 WARNING을 묻어 버린다."""
+    db.migrate(db_engine)
+    order = make_order()
+    orders.insert(db_engine, order, order_id="oid-1", status=OrderStatus.UNKNOWN, created_at=NOW)
+
+    broker = make_broker(settings, db_engine, lambda request: httpx.Response(200, json={}))
+    with caplog.at_level("INFO", logger="sontrader.adapters.broker_kis"):
+        broker.resolve_unknown()
+        broker.resolve_unknown()
+        broker.resolve_unknown()
+
+    warnings = [r for r in caplog.records if "ODNO가 없어" in r.message]
+    assert len(warnings) == 1, f"3번 호출했지만 경고는 1회여야 한다 (실제 {len(warnings)}회)"

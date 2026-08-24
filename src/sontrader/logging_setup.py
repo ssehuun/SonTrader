@@ -36,12 +36,26 @@ CLI의 `print`는 로그가 아니라 **명령어의 출력**이다. 사용자�
 
 from __future__ import annotations
 
+import functools
+import inspect
 import logging
 import os
 import re
 import sys
+import time
+from collections.abc import Callable
+from datetime import datetime
+from typing import Any, TypeVar
+
+from sontrader.timeutil import KST
 
 REDACTED = "***"
+
+F = TypeVar("F", bound=Callable[..., Any])
+
+# @traced가 인자·반환값을 찍을 때의 길이 상한. 봉 300개나 종목 2,464개짜리
+# 리스트가 그대로 펼쳐지면 한 줄이 수만 자가 되어 로그를 못 읽는다.
+_TRACE_REPR_LIMIT = 80
 
 # 값을 그대로 치환할 환경변수. 계좌번호는 URL 쿼리(CANO=...)에도 박히므로
 # 8자리 앞부분만 따로 등록한다.
@@ -73,12 +87,27 @@ _URL_PASSWORD = re.compile(r"(://[^:/@\s]+:)([^@/\s]+)(@)")
 
 
 class SecretMaskingFormatter(logging.Formatter):
-    """포맷된 문자열(트레이스백 포함) 전체에서 비밀을 가린다."""
+    """포맷된 문자열(트레이스백 포함) 전체에서 비밀을 가리고, 시각은 KST로 찍는다."""
 
     def __init__(self, fmt: str, *, secrets: tuple[str, ...] = ()) -> None:
         super().__init__(fmt)
         # 긴 것부터 지워야 짧은 값이 긴 값의 일부를 먼저 갉아먹지 않는다.
         self._secrets = tuple(sorted(set(secrets), key=len, reverse=True))
+
+    def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
+        """KST 고정. 기본 구현은 머신 타임존을 따르는데, 이 서버는 UTC라
+        로그가 09:22로 찍히고 DB의 `cycle_log.ts`(naive KST)는 18:22이 된다.
+        시각을 대조할 수 없으면 "그때 무슨 일이 있었나"를 추적할 수 없다.
+
+        밀리초를 유지한다. 기본 구현이 붙여 주는 것을 이 재정의가 떨어뜨리면
+        초 단위 해상도가 되어, 한 사이클 안의 순서(주문 제출 연속, 재시도,
+        `traced`의 진입/이탈 짝)를 로그만으로 복원할 수 없다 — 소요시간을
+        남기는 목적과 정면으로 어긋난다.
+        """
+        stamped = datetime.fromtimestamp(record.created, KST)
+        if datefmt:
+            return stamped.strftime(datefmt)
+        return f"{stamped.strftime('%Y-%m-%d %H:%M:%S')},{int(record.msecs):03d}"
 
     def format(self, record: logging.LogRecord) -> str:
         return mask(super().format(record), self._secrets)
@@ -123,7 +152,7 @@ def configure(level: str | None = None) -> None:
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(
         SecretMaskingFormatter(
-            "%(asctime)s %(levelname)s %(name)s %(message)s",
+            "%(asctime)s KST %(levelname)s %(name)s %(message)s",
             secrets=collect_env_secrets(),
         )
     )
@@ -134,3 +163,75 @@ def configure(level: str | None = None) -> None:
     # 우리 로그가 그 안에 묻힌다.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("websockets").setLevel(logging.WARNING)
+
+
+def _brief(value: object) -> str:
+    """로그 한 줄에 넣을 수 있는 짧은 표현."""
+    try:
+        text = repr(value)
+    except Exception:  # noqa: BLE001 — 추적 로그가 본 기능을 깨뜨리면 안 된다
+        return f"<{type(value).__name__}>"
+    if len(text) > _TRACE_REPR_LIMIT:
+        return f"{text[:_TRACE_REPR_LIMIT]}…({len(text)}자)"
+    return text
+
+
+def traced(fn: F) -> F:
+    """진입·이탈·소요시간을 DEBUG로 남긴다. **경계 함수에만** 붙인다.
+
+    경계란 프로세스 밖(KIS API, DB, 텔레그램)과 닿는 지점과 사이클의 큰
+    단계다. `core/`에는 붙이지 않는다 — 순수 함수이고 종목마다 호출되므로
+    사이클당 수백 줄이 되어 정작 필요한 줄이 묻힌다. 그리고 `core/`가
+    부작용을 갖는 순간 "백테스트와 실전이 같은 코드를 실행한다"는 전제
+    (설계 §1.1 원칙 1)가 깨진다.
+
+    소요시간이 함께 남는 것이 핵심이다. KIS는 유량 한도가 있어(모의 초당 2건)
+    "어느 호출이 느렸나"를 알아야 사이클 예산을 짤 수 있다. 지금 붙어 있는
+    곳은 상시 가동 경로뿐이다 — `cli.py`는 `configure()`를 부르지 않으므로
+    (그 모듈의 `print`는 로그가 아니라 명령어 출력이다) 수집기 커맨드에
+    `SONTRADER_LOG_LEVEL=DEBUG`를 걸어도 효과가 없다.
+
+    **레벨과 무관하게 예외는 ERROR로 남기고 그대로 다시 올린다.** 진입·이탈
+    줄만 DEBUG로 가린다 — 예전에는 DEBUG가 아니면 `try`에 들어가기도 전에
+    조기 반환해서, docstring이 약속한 실패 로그가 기본 레벨에서 영원히
+    찍히지 않았다. 관측을 위해 붙인 데코레이터가 정작 실패를 감추고 있었다.
+    """
+    log = logging.getLogger(fn.__module__)
+
+    # self/cls는 매번 같아서 정보가 없으니 인자 표시에서 뺀다. 판정은 데코레이션
+    # 시점에 한 번만 한다 — 호출 시점에 `hasattr(type(args[0]), fn.__name__)`으로
+    # 추측하면, 첫 인자의 타입이 우연히 같은 이름의 속성을 가진 경우 실제 인자를
+    # 조용히 삼킨다.
+    try:
+        first_param = next(iter(inspect.signature(fn).parameters), None)
+    except (TypeError, ValueError):  # 시그니처를 못 읽는 콜러블
+        first_param = None
+    skip_first = first_param in ("self", "cls")
+
+    @functools.wraps(fn)
+    def wrapper(*args: object, **kwargs: object) -> object:
+        debug = log.isEnabledFor(logging.DEBUG)
+        if debug:
+            shown = args[1:] if skip_first else args
+            joined = ", ".join(
+                [_brief(a) for a in shown] + [f"{k}={_brief(v)}" for k, v in kwargs.items()]
+            )
+            log.debug("→ %s(%s)", fn.__qualname__, joined)
+        started = time.perf_counter()
+        try:
+            result = fn(*args, **kwargs)
+        except Exception as exc:
+            log.error(
+                "← %s 실패 %.0fms: %s: %s",
+                fn.__qualname__,
+                (time.perf_counter() - started) * 1000,
+                type(exc).__name__,
+                exc,
+            )
+            raise
+        if debug:
+            elapsed = (time.perf_counter() - started) * 1000
+            log.debug("← %s %.0fms → %s", fn.__qualname__, elapsed, _brief(result))
+        return result
+
+    return wrapper  # type: ignore[return-value]

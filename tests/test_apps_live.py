@@ -10,11 +10,14 @@ from datetime import date
 import pytest
 
 from sontrader.apps.live import (
+    IDLE_HEARTBEAT_EVERY,
     _build_entry_config,
     _build_judge,
     _build_notifier,
     _halt,
     _load_watchlist,
+    _log_heartbeat,
+    _log_idle,
     _poll_telegram,
 )
 from sontrader.core.strategy import EntryTrigger
@@ -195,3 +198,92 @@ def test_event_trigger_without_an_api_key_fails_loudly(monkeypatch, db_engine):
 
     with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY"):
         _build_entry_config(db_engine)
+
+
+# --- 관측 (하트비트) ---------------------------------------------------------------
+
+
+class _Bars:
+    def history(self, symbol, count):
+        return []
+
+    def latest(self, symbol):
+        return None
+
+
+class _Result:
+    def __init__(self, orders=(), rejections=()):
+        self.orders = orders
+        self.rejections = rejections
+
+
+def _ctx(positions=(), watchlist=("005930",), equity=9_494_652):
+    from datetime import datetime
+
+    from sontrader.core.types import Context
+
+    return Context(
+        now=datetime(2026, 8, 24, 14, 36),
+        bars=_Bars(),
+        watchlist=watchlist,
+        positions=positions,
+        equity=equity,
+        cash=equity,
+    )
+
+
+def test_heartbeat_is_emitted_every_cycle(caplog):
+    """이게 없으면 "장 시작" 이후 "장 마감"까지 로그가 비어, 돌고 있는지
+    죽었는지 사람이 구분할 수 없다 — 실제로 54분간 그랬다."""
+    with caplog.at_level("INFO", logger="sontrader.apps.live"):
+        _log_heartbeat(1, _ctx(), _Result(), engaged=False)
+
+    [record] = caplog.records
+    assert "사이클 1" in record.message
+    assert "워치 1" in record.message
+    assert "9,494,652원" in record.message
+    assert "주문 0" in record.message
+
+
+def test_heartbeat_summarizes_rejections_by_reason(caplog):
+    """종목별 32줄이 아니라 사유별 집계여야 한 줄에 들어간다.
+    종목 내역은 `cycle_log.rejections`가 답한다."""
+    from sontrader.core.gate import Rejection, RejectReason
+
+    rejections = tuple(Rejection(f"{i:06d}", RejectReason.SLOT_FULL) for i in range(30)) + (
+        Rejection("111111", RejectReason.COOLDOWN),
+    )
+
+    with caplog.at_level("INFO", logger="sontrader.apps.live"):
+        _log_heartbeat(7, _ctx(), _Result(rejections=rejections), engaged=False)
+
+    [record] = caplog.records
+    assert "slot_full 30" in record.message
+    assert "cooldown 1" in record.message
+    assert "000000" not in record.message  # 종목 코드를 나열하지 않는다
+
+
+def test_heartbeat_flags_the_killswitch(caplog):
+    with caplog.at_level("INFO", logger="sontrader.apps.live"):
+        _log_heartbeat(1, _ctx(), _Result(), engaged=True)
+
+    assert "킬스위치 작동" in caplog.records[0].message
+
+
+def test_idle_heartbeat_is_throttled(caplog):
+    """장외에도 살아있음을 남겨야 하지만, 장중처럼 매 틱 찍으면 밤사이
+    로그가 그날의 매매 기록을 덮어 버린다."""
+    with caplog.at_level("INFO", logger="sontrader.apps.live"):
+        idle = 0
+        for _ in range(IDLE_HEARTBEAT_EVERY * 2):
+            idle = _log_idle(idle, "장외")
+
+    assert len(caplog.records) == 2, "2주기 동안 2줄이어야 한다"
+    assert "장외 대기 중" in caplog.records[0].message
+
+
+def test_idle_heartbeat_names_the_reason(caplog):
+    with caplog.at_level("INFO", logger="sontrader.apps.live"):
+        _log_idle(0, "휴장일")
+
+    assert "휴장일 대기 중" in caplog.records[0].message

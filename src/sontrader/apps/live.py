@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import signal
 import threading
+from collections import Counter
 from datetime import date
 
 import httpx
@@ -59,6 +60,9 @@ from sontrader.logging_setup import configure as configure_logging
 log = logging.getLogger("sontrader.apps.live")
 
 CYCLE_INTERVAL = 60.0  # 초 — 텔레그램 폴링·이벤트 확인 주기
+# 장외에는 이 틱 수마다 한 번만 유휴 하트비트를 남긴다(60초 × 30 = 30분).
+# 장중처럼 매 틱 찍으면 밤사이 로그가 매매 기록을 덮어 버린다.
+IDLE_HEARTBEAT_EVERY = 30
 WS_URL_REAL = "ws://ops.koreainvestment.com:21000"
 WS_URL_PAPER = "ws://ops.koreainvestment.com:31000"
 
@@ -93,6 +97,8 @@ def main() -> None:
         offset: int | None = None
         notified_holiday: date | None = None
         trading_open = False  # 장중/장외 전이 로그를 한 번만 남기기 위한 상태
+        cycle = 1  # 하트비트 번호 — 로그에서 사이클을 세고 구멍을 찾는 기준
+        idle = 0  # 장외 대기 틱 수 — 유휴 하트비트 주기 판정용
         while not stop.is_set():
             if notifier is not None:
                 offset = _poll_telegram(notifier, offset)
@@ -104,6 +110,7 @@ def main() -> None:
                     if notifier is not None and notified_holiday != now.date():
                         notifier.send_message(f"{now:%Y-%m-%d} 휴장일 — 매매를 쉽니다.")
                         notified_holiday = now.date()
+                    idle = _log_idle(idle, "휴장일")
                     stop.wait(CYCLE_INTERVAL)
                     continue
 
@@ -118,11 +125,13 @@ def main() -> None:
                 if trading_open:  # 장중 → 장외 전이에만 남긴다
                     log.info("장 마감 — 매매 사이클 중단")
                     trading_open = False
+                idle = _log_idle(idle, "장외")
                 stop.wait(CYCLE_INTERVAL)
                 continue
             if not trading_open:
                 log.info("장 시작 — 매매 사이클 시작")
                 trading_open = True
+                idle = 0
 
             report = reconcile_mod.reconcile(engine, broker)
             if report.halt:
@@ -150,6 +159,7 @@ def main() -> None:
                 judge=judge or (lambda event: None),
             )
             result = run_cycle(ctx, Deps(broker=broker, engine=engine), cycle_config)
+            engaged = killswitch.is_engaged(engine)
             # 사이클마다 무조건 남긴다. "변화가 있을 때만" 조건을 걸면 정작
             # 필요한 "아무 일도 없었다"는 사실이 사라지고, 로그의 구멍이
             # 다운타임인지 무거래인지 구분할 수 없게 된다.
@@ -160,19 +170,77 @@ def main() -> None:
                 positions_n=len(ctx.positions),
                 cash=ctx.cash,
                 equity=ctx.equity,
-                killswitch_engaged=killswitch.is_engaged(engine),
+                killswitch_engaged=engaged,
                 orders_n=len(result.orders),
                 rejections=result.rejections,
             )
+            _log_heartbeat(cycle, ctx, result, engaged=engaged)
+            cycle += 1
 
             stop.wait(CYCLE_INTERVAL)
+    except Exception:
+        # 처리하지 못한 오류로 죽는 경로. 이 핸들러가 없으면 파이썬이
+        # 트레이스백을 **stderr**로만 내보내는데 로거는 stdout을 쓰므로,
+        # 로그 스트림에는 아래 finally의 "종료" 한 줄만 남는다 — 크래시와
+        # 정상 종료가 로그상 완전히 같아진다. 상시 가동에서 "조용히 죽으면
+        # 인지조차 못 한다"(01문서 §6.4)는 바로 이 상황이다.
+        #
+        # 로그만 남기고 다시 올린다. 삼키면 종료 코드가 0이 되어 supervisor가
+        # 재시작하지 않는다.
+        log.exception("비정상 종료 — 처리하지 못한 오류")
+        raise
     finally:
         if tick_stream is not None:
             tick_stream.stop()
-        log.info("종료")
+        log.info("종료 — 정리 완료")
         if notifier is not None:
             notifier.send_message("SonTrader 종료")
         client.close()
+
+
+def _log_heartbeat(cycle: int, ctx, result, *, engaged: bool) -> None:
+    """사이클마다 한 줄. **살아 있다는 증거가 로그에 있어야 한다.**
+
+    원래는 "사이클마다 INFO를 찍지 않는다"(설계 §6.6.2)였다. 이유는 60초 ×
+    420회면 노이즈가 된다는 것이었고, "살아 있었다"는 `cycle_log` 테이블이
+    답한다는 전제였다. 실제로 돌려 보니 그 전제가 틀렸다 — 09:00 "장 시작"
+    이후 15:30 "장 마감"까지 **54분간 아무것도 안 찍혀서**, 돌고 있는지 죽은
+    건지 사람이 구분할 수 없었다. DB를 열어 보지 않으면 알 수 없는 정보는
+    "왜 죽었나"에 답하는 이벤트 로그의 몫이 아니다.
+
+    한 줄 약 120바이트 × 420회 = 하루 약 50KB다. 노이즈 우려보다 관측 공백이
+    비싸다. 대신 **한 줄로 압축**하고, 거부 사유별 내역처럼 큰 것은 여전히
+    `cycle_log`에 맡긴다.
+    """
+    reasons = Counter(r.reason.value for r in result.rejections)
+    parts = [
+        f"사이클 {cycle}",
+        f"워치 {len(ctx.watchlist)}",
+        f"보유 {len(ctx.positions)}",
+        f"평가 {ctx.equity:,}원",
+        f"주문 {len(result.orders)}",
+    ]
+    if reasons:
+        parts.append("거부 " + "/".join(f"{k} {v}" for k, v in reasons.most_common()))
+    if engaged:
+        parts.append("킬스위치 작동")
+    log.info(" | ".join(parts))
+
+
+def _log_idle(idle: int, reason: str) -> int:
+    """장외·휴장일 대기 중에도 주기적으로 살아있음을 남기고, 다음 틱 수를 반환한다.
+
+    장중 하트비트만으로는 관측 공백이 하루 17시간 넘게 남는다 — "장 마감"
+    한 줄 뒤로 다음 "장 시작"까지 아무것도 안 찍히면, **밤사이 죽은 프로세스와
+    정상 대기가 로그상 완전히 같다.** 매매를 쉬는 동안에도 프로세스는 텔레그램
+    폴링과 킬 스위치를 처리하므로 살아 있어야 하고, 살아 있다는 증거가 필요하다.
+
+    장중(60초)보다 훨씬 드물게 남긴다 — 밤사이 1,000줄이 쌓이면 정작 그날의
+    매매 기록을 찾기 어려워진다.
+    """
+    if idle % IDLE_HEARTBEAT_EVERY == 0:
+        log.info("%s 대기 중 — 매매 사이클은 쉬고 텔레그램·킬 스위치만 처리합니다", reason)
+    return idle + 1
 
 
 def _build_notifier(engine: sa.engine.Engine) -> TelegramNotifier | None:

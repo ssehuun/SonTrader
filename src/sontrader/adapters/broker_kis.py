@@ -53,6 +53,7 @@ from sontrader.client import KisClient, KisError
 from sontrader.core.types import Fill, Order, OrderStatus, Side
 from sontrader.data import orders as orders_repo
 from sontrader.data.orders import OrderRecord
+from sontrader.logging_setup import traced
 
 log = logging.getLogger(__name__)
 
@@ -70,10 +71,17 @@ class KisBroker:
         self._client = client
         self._engine = engine
         self._sleep = sleep
+        # ODNO 없는 주문을 이미 경고한 order_id. `list_unresolved()`는 나이
+        # 제한이 없고 이 주문들은 상태가 영영 바뀌지 않으므로, 조건 없이 찍으면
+        # 하루 약 390회 같은 경고가 반복되어 정작 조치가 필요한 WARNING을
+        # 묻어 버린다. 프로세스 수명 동안만 기억하면 충분하다.
+        self._warned_missing_odno: set[str] = set()
 
+    @traced
     def submit(self, orders: list[Order], *, now: datetime) -> list[OrderResult]:
         return [self._submit_one(order, now) for order in orders]
 
+    @traced
     def positions(self) -> list[BrokerPosition]:
         balance = self._client.get_balance()
         result = []
@@ -88,16 +96,31 @@ class KisBroker:
             )
         return result
 
+    @traced
     def cash(self) -> int:
         balance = self._client.get_balance()
         return int(balance["summary"].get("dnca_tot_amt", 0))
 
+    @traced
     def resolve_unknown(self) -> list[OrderResult]:
         """SUBMITTED/UNKNOWN/PARTIAL로 남은 주문을 KIS에 조회해 확정한다."""
         results = []
         for record in orders_repo.list_unresolved(self._engine):
             if record.broker_order_no is None:
-                continue  # ODNO가 없으면 이 API로 특정할 방법이 없다
+                # 자동으로 영원히 해소되지 않는다 — 사람이 KIS 앱에서 확인해야
+                # 한다. 조용히 넘기면 미확정 주문이 무한히 쌓인다.
+                if record.order_id not in self._warned_missing_odno:
+                    self._warned_missing_odno.add(record.order_id)
+                    log.warning(
+                        "주문 %s (%s %s %d주, %s)에 ODNO가 없어 확인 불가 — "
+                        "KIS 앱에서 직접 확인 필요 (이 주문은 한 번만 알립니다)",
+                        record.order_id,
+                        record.symbol,
+                        record.side.value,
+                        record.qty,
+                        record.status.value,
+                    )
+                continue
             results.append(self._resolve_one(record))
         return results
 
@@ -108,6 +131,14 @@ class KisBroker:
         if existing is not None:
             # 이미 제출된 적 있는 주문 — 재전송이어도 다시 쏘지 않는다
             # (멱등 키 1차 방어선 + DB UNIQUE 제약 2차 방어선, 설계 2.6절).
+            log.info(
+                "중복 주문 차단 %s %s %d주 — 기존 %s (%s)",
+                order.symbol,
+                order.side.value,
+                order.qty,
+                existing.order_id,
+                existing.status.value,
+            )
             fills = orders_repo.load_fills(self._engine, existing.order_id)
             return OrderResult(
                 order=order,
@@ -124,8 +155,19 @@ class KisBroker:
         side = "buy" if order.side is Side.BUY else "sell"
         try:
             response = self._client.order(side, order.symbol, order.qty, price=order.limit_price)
-        except httpx.HTTPError:
+        except httpx.HTTPError as exc:
             # 접수 여부를 알 수 없다 — 이미 UNKNOWN으로 기록돼 있으니 그대로 둔다.
+            # ERROR가 아니라 WARNING인 이유: resolve_unknown()이 다음 사이클에
+            # 확정한다. 다만 실제로 접수됐을 수 있어 조용히 넘기면 안 된다.
+            log.warning(
+                "주문 접수 불명 %s %s %d주 (%s: %s) — order_id=%s, 다음 사이클에 조회",
+                order.symbol,
+                side,
+                order.qty,
+                type(exc).__name__,
+                exc,
+                order_id,
+            )
             return OrderResult(order=order, status=OrderStatus.UNKNOWN)
         except KisError as exc:
             # 사유를 남긴다. 예전에는 그냥 REJECTED로만 기록해서 "잔고 부족"과
@@ -137,6 +179,16 @@ class KisBroker:
         broker_order_no = response.get("ODNO")
         orders_repo.update_status(
             self._engine, order_id, OrderStatus.SUBMITTED, broker_order_no=broker_order_no
+        )
+        # 실제 자금이 움직이기 시작한 지점이다. ODNO를 남겨야 나중에 KIS
+        # 앱/HTS에서 같은 주문을 찾아 대조할 수 있다.
+        log.info(
+            "주문 제출 %s %s %d주 %s → ODNO=%s",
+            order.symbol,
+            side,
+            order.qty,
+            "시장가" if order.limit_price is None else f"@{order.limit_price:,}",
+            broker_order_no,
         )
         return OrderResult(
             order=order, status=OrderStatus.SUBMITTED, broker_order_no=broker_order_no
@@ -187,6 +239,19 @@ class KisBroker:
             fills = (fill,)
 
         orders_repo.update_status(self._engine, record.order_id, status)
+        if status != record.status:
+            # 상태가 바뀐 것만 남긴다. 안 바뀌면 매 사이클 같은 줄이 반복된다.
+            # 이미 저장한 값(`set_fill_snapshot`)을 그대로 쓴다. row를 다시
+            # 파싱하면 로그와 DB가 어긋날 여지가 생긴다.
+            detail = f" {fills[0].qty}주 @{fills[0].price:,}" if fills else ""
+            log.info(
+                "주문 확정 %s %s → %s%s (ODNO=%s)",
+                record.symbol,
+                record.status.value,
+                status.value,
+                detail,
+                record.broker_order_no,
+            )
         return OrderResult(
             order=order, status=status, fills=fills, broker_order_no=record.broker_order_no
         )
