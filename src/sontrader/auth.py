@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 import httpx
 
 from sontrader.config import Settings
+from sontrader.timeutil import now_kst
 
 _EXPIRY_MARGIN = timedelta(minutes=10)
 # KIS returns expiry as local (KST) wall-clock time, e.g. "2026-07-31 09:00:00".
@@ -108,7 +109,10 @@ class TokenManager:
             expires_at = datetime.strptime(data["expires_at"], _EXPIRY_FORMAT)
         except (KeyError, ValueError):
             return None
-        if datetime.now() >= expires_at - _EXPIRY_MARGIN:
+        # now_kst(): KIS가 준 만료 시각은 KST 벽시계다. 맨 datetime.now()로
+        # 비교하면 서버가 UTC일 때 9시간 어긋나, 만료된 토큰을 계속 쓰다가
+        # EGW00123("기간이 만료된 token")을 맞는다.
+        if now_kst() >= expires_at - _EXPIRY_MARGIN:
             return None
         return data.get("access_token") or None
 
@@ -178,7 +182,7 @@ class ApprovalKeyManager:
             issued_at = datetime.strptime(data["issued_at"], _EXPIRY_FORMAT)
         except (KeyError, ValueError):
             return None
-        if datetime.now() >= issued_at + self._VALIDITY - _EXPIRY_MARGIN:
+        if now_kst() >= issued_at + self._VALIDITY - _EXPIRY_MARGIN:
             return None
         return data.get("approval_key") or None
 
@@ -206,7 +210,9 @@ class ApprovalKeyManager:
             json.dumps(
                 {
                     "approval_key": key,
-                    "issued_at": datetime.now().strftime(_EXPIRY_FORMAT),
+                    # 읽는 쪽(_read_cache)이 KST로 비교하므로 쓰는 쪽도 KST여야
+                    # 한다. 한쪽만 고치면 어긋남이 그대로 남는다.
+                    "issued_at": now_kst().strftime(_EXPIRY_FORMAT),
                     "base_url": self._settings.base_url,
                     "app_key_fp": _app_key_fingerprint(self._settings.app_key),
                 }

@@ -9,6 +9,7 @@ from datetime import timedelta
 
 from sontrader.client import KisClient, KisError
 from sontrader.config import load_dart_api_key, load_database_url, load_settings
+from sontrader.timeutil import now_kst
 
 
 def _first_line(exc: Exception) -> str:
@@ -16,10 +17,8 @@ def _first_line(exc: Exception) -> str:
 
 
 def _now_kst():
-    # 저장 시각은 naive KST 통일 (스키마 규약).
-    from datetime import datetime, timedelta, timezone
-
-    return datetime.now(timezone(timedelta(hours=9))).replace(tzinfo=None)
+    # 저장 시각은 naive KST 통일 (스키마 규약) — 정의는 `timeutil` 한 곳.
+    return now_kst()
 
 
 def _parse_date_arg(date_str: str):

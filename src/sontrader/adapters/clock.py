@@ -15,10 +15,10 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from typing import Protocol
 
-_KST = timezone(timedelta(hours=9))
+from sontrader.timeutil import now_kst
 
 
 class Clock(Protocol):
@@ -27,10 +27,10 @@ class Clock(Protocol):
 
 @dataclass(frozen=True)
 class RealClock:
-    """벽시계 KST, naive datetime — DB 저장 규약과 동일(cli.py의 _now_kst와 같은 값)."""
+    """벽시계 KST, naive datetime — DB 저장 규약과 동일(`timeutil.now_kst`)."""
 
     def now(self) -> datetime:
-        return datetime.now(_KST).replace(tzinfo=None)
+        return now_kst()
 
 
 class ReplayClock:
