@@ -28,6 +28,35 @@ def _parse_date_arg(date_str: str):
     return datetime.strptime(date_str, "%Y%m%d").date()
 
 
+# API 호출 간격 기본값.
+#
+# 문서상 한도(실전 초당 20건 / 모의 초당 2건)를 그대로 환산한 값(0.06 / 0.5)은
+# 여유가 0이고, 실제로 KIS는 문서 한도의 절반쯤에서 이미 EGW00201을 돌려준다.
+# 400종목 증분 수집(실전)으로 실측한 값:
+#
+#   pace 0.06 → EGW00201 32회, 21회   (약 5~8%),  60초
+#   pace 0.12 → 6회                   (약 1.5%),  69초
+#   pace 0.20 → 0회, 1회              (약 0.2%),  94초
+#   pace 0.30 → 0회                              134초
+#
+# 임계값이 아니라 확률이다 — 같은 pace로 재측정하면 횟수가 달라진다. 그래서
+# pace로는 빈도만 낮출 수 있고 없앨 수는 없다. 실제 방어는 재시도이고(어느
+# 값에서도 실패 0), 0.20을 쓰는 이유는 걸릴 때마다 _RETRY_BACKOFF만큼(1초)
+# 버리기 때문이다 — 0.06에서 32회면 32초를 대기로 쓰고, 그만큼 로그가 시끄러워
+# 진짜 이상을 묻는다. 전체 수집(2,462종목)에서 늘어나는 시간은 몇 분 수준이고,
+# 실전 전체 수집은 API가 아니라 종목당 DB 쓰기가 병목이다(41분 = 초당 1건).
+#
+# 모의값은 **실측하지 않았다** — daily_collect는 실전에서 돈다. 실전에서 안전한
+# 지점이 문서 한도의 1/4이었으니 모의(초당 2건)도 그 비율로 내려 1.0으로 둔다.
+# 모의로 대량 수집을 할 일이 생기면 위와 같은 방식으로 실측할 것.
+DEFAULT_PACE_PAPER = 1.0
+DEFAULT_PACE_REAL = 0.20
+
+
+def _default_pace(settings) -> float:
+    return DEFAULT_PACE_PAPER if settings.paper else DEFAULT_PACE_REAL
+
+
 def _open_engine():
     """Load DATABASE_URL and build an engine; print + return None on failure.
 
@@ -217,7 +246,7 @@ def _run_backfill_prices(
         if dry_run:
             return 0
 
-        pace_seconds = pace if pace is not None else (0.5 if settings.paper else 0.06)
+        pace_seconds = pace if pace is not None else _default_pace(settings)
 
         def on_progress(index: int, total: int) -> None:
             if index % 50 == 0 or index == total:
@@ -352,7 +381,7 @@ def _run_collect_prices(limit: int | None, pace: float | None, lookback_days: in
         if limit is not None:
             symbols = symbols[:limit]
         # 유량 한도: 모의 초당 2건 / 실전 초당 20건 — 기본 간격을 여유 있게 잡는다.
-        pace_seconds = pace if pace is not None else (0.5 if settings.paper else 0.06)
+        pace_seconds = pace if pace is not None else _default_pace(settings)
 
         def on_progress(index: int, total: int) -> None:
             if index % 100 == 0 or index == total:
@@ -738,7 +767,7 @@ def main(argv: list[str] | None = None) -> int:
     prices = sub.add_parser("collect-prices", help="일봉 수집 (수정주가, 증분+자가치유)")
     prices.add_argument("--limit", type=int, default=None, help="상위 N종목만 (테스트용)")
     prices.add_argument(
-        "--pace", type=float, default=None, help="API 호출 간격 초 (기본: 모의 0.5)"
+        "--pace", type=float, default=None, help="API 호출 간격 초 (기본: 모의 1.0, 실전 0.2)"
     )
     prices.add_argument(
         "--lookback-days", type=int, default=420, help="최초 수집 시 소급 일수 (달력일)"
