@@ -21,6 +21,21 @@ def _now_kst():
     return now_kst()
 
 
+def _display_width(text: str) -> int:
+    """터미널에서 차지하는 칸 수. 한글·한자는 두 칸이다.
+
+    글자 수로 폭을 맞추면 종목명이 섞인 열이 어긋난다 — 분봉 수집은 수천 줄을
+    쏟아내므로 눈으로 훑을 수 있어야 한다.
+    """
+    import unicodedata
+
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in text)
+
+
+def _pad(text: str, width: int) -> str:
+    return text + " " * max(0, width - _display_width(text))
+
+
 def _parse_date_arg(date_str: str):
     """--date 값(YYYYMMDD) → date. 형식이 틀리면 ValueError."""
     from datetime import datetime
@@ -75,6 +90,7 @@ def _run_collect_minutes(
     from sqlalchemy.exc import SQLAlchemyError
 
     from sontrader.data.db import migrate
+    from sontrader.data.master import load_names
     from sontrader.data.minutes import MAX_DAYS, MinuteCollectionAborted, collect_minutes_all
 
     try:
@@ -111,6 +127,14 @@ def _run_collect_minutes(
         if limit is not None:
             symbols = symbols[:limit]
 
+        # 종목명을 한 번만 읽어 둔다 — 호출마다 조회하면 수백 번 왕복한다.
+        # 마스터에 없는 종목(상장폐지 등)은 코드만 보여준다.
+        names = load_names(engine, symbols)
+
+        def label(symbol: str) -> str:
+            name = names.get(symbol)
+            return _pad(f"{symbol} {name}" if name else symbol, 20)
+
         # 일봉보다 보수적으로 잡는다. 실측에서 분봉 조회가 EGW00201(초당 초과)에
         # 실제로 걸렸고, 종목당 약 980호출이라 한 번 걸릴 때마다 재시도 대기가 붙는다.
         pace_seconds = pace if pace is not None else DEFAULT_PACE_MINUTES
@@ -125,13 +149,13 @@ def _run_collect_minutes(
         )
 
         def on_progress(index: int, total: int) -> None:
-            print(f"  [{index}/{total}] 종목 완료", flush=True)
+            print(f"  [{index}/{total}] {label(symbols[index - 1])} 완료", flush=True)
 
         def on_page(p) -> None:
             # 호출마다 한 줄. 종목당 약 980호출이라 진행률 없이는 언제 끝날지
             # 짐작할 수 없다 — 오늘 실제로 그 상태로 몇 시간을 기다렸다.
             print(
-                f"    {p.symbol} #{p.page:<4} {p.rows:>3}건 → {p.reached:%Y-%m-%d %H:%M}"
+                f"    {label(p.symbol)} #{p.page:<4} {p.rows:>3}건 → {p.reached:%Y-%m-%d %H:%M}"
                 f"  {p.percent:5.1f}%  누적 {p.stored:,}행",
                 flush=True,
             )
@@ -160,7 +184,7 @@ def _run_collect_minutes(
         calls = sum(r.pages for r in results)
         print(f"수집 완료: {len(results)}종목, {rows:,}행, {calls:,}호출 (실패 {len(failures)})")
         for symbol, exc in failures[:5]:
-            print(f"  실패 {symbol}: {_first_line(exc)}", file=sys.stderr)
+            print(f"  실패 {label(symbol)}: {_first_line(exc)}", file=sys.stderr)
         return 1 if failures else 0
     except SQLAlchemyError as exc:
         print(f"error: DB access failed: {_first_line(exc)}", file=sys.stderr)
