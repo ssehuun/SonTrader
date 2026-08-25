@@ -60,6 +60,7 @@ uv run sontrader build-universe                 # 모멘텀 워치리스트 + �
 uv run sontrader collect-minutes --symbols 005930                # 1종목, 서버 보관 전체 (약 1년)
 uv run sontrader collect-minutes --symbols 005930 --days 3       # 짧게 시험
 uv run sontrader collect-minutes --from-watchlist --limit 5      # 워치리스트 앞쪽 N종목
+uv run sontrader collect-minutes --symbols 005930 --refetch      # 구멍 메우기 / 과거 확장
 ```
 
 `scripts/daily_collect.sh`가 일봉 → 워치리스트를 묶어 돌린다 (cron용).
@@ -120,6 +121,10 @@ uv run python -m sontrader.apps.live
   API의 빈 응답이 결정). 지정할 때는 **타임스탬프 기준**이라 09시에 `--days 1`을 주면
   하한이 전날 09시가 되어 전날 세션이 빠진다. 종목당 약 980호출(하루 4호출 ×
   245거래일)이라 1종목 약 10분, 37종목이면 10시간 규모다.
+- **`--refetch`가 필요한 때.** 분봉은 증분 수집이라 저장분에 도달하면 멈춘다. 그래서
+  구간 안에 구멍이 있거나 이전보다 더 과거가 필요하면 전체를 다시 받아야 한다 —
+  `저장분은 …까지만 있다` 경고가 그 신호다. **지우지 않고 덮어쓴다**: KIS는 1년 롤링이고
+  우리 DB는 계속 쌓이므로, 지우면 보관 경계를 넘어간 분봉을 되찾을 수 없다.
 - **백테스트 가능 구간 = 보유 거래일 − 253.** 모멘텀이 253 거래일을 워밍업으로 소비한다
   (2년치 ≈ 743 거래일 ≈ 1,110 달력일). 과거로 갈수록 생존 편향도 커진다 — 상장폐지 종목은
   `symbol_master`에 없어 그 시점 유니버스에서 이미 빠져 있다.

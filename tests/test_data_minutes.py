@@ -260,15 +260,16 @@ def test_bars_older_than_the_floor_are_not_stored(db_engine):
 # --- 증분 --------------------------------------------------------------------
 
 
-def test_incremental_skips_the_stored_range_and_keeps_going(db_engine):
-    """실제로 겪은 사고의 회귀 테스트.
+def test_incremental_stops_at_stored_data_without_jumping(db_engine):
+    """저장 구간에 들어오면 **멈춘다. 건너뛰지 않는다.**
 
-    수집은 과거로 가는데 증분 판정 기준은 '가장 최신 저장 봉'이다. 거기서
-    멈추면 **저장분보다 오래된 쪽에 구멍이 남고 다시는 채워지지 않는다.**
-    000660이 그랬다 — 앞선 실행이 잘려 08-24 15:09 위쪽만 있었고, 다음
-    실행은 1호출 만에 "이미 있다"며 끝났다.
+    예전에는 `stored_oldest`로 점프해 그 아래를 이어 받았는데, 그건 저장
+    구간이 연속이라고 가정한다. 구멍이 있으면 그대로 뛰어넘어 영구히 비워
+    둔다 — 005930의 08-25 09:00~10:25(86분)가 API에는 있는데 DB에는 없었고,
+    재실행해도 점프가 계속 건너뛰었다.
 
-    올바른 동작은 저장 구간을 **건너뛰고 그 아래를 이어 받는** 것이다.
+    구멍과 원본 결손을 구분할 방법이 없는 것이 핵심이다(07-28 10:14~10:43은
+    거래소에 아예 없는 구간이었다). 그래서 조용히 건너뛰지 않는다.
     """
     db.migrate(db_engine)
     collect_minutes(db_engine, StubSource({NOW: descending(NOW, 3)}), "005930", now=NOW, days=365)
@@ -278,7 +279,39 @@ def test_incremental_skips_the_stored_range_and_keeps_going(db_engine):
     second = StubSource(default=descending(later, 3))
     collect_minutes(db_engine, second, "005930", now=later, days=365)
 
-    assert stored_oldest in second.calls, "저장 구간 아래를 이어 받으려면 그 지점을 요청해야 한다"
+    assert stored_oldest not in second.calls, "저장 구간 아래로 점프해서는 안 된다"
+
+
+def test_floor_below_stored_range_warns_to_use_refetch(db_engine, caplog):
+    """멈추기만 하고 조용하면, 요청한 과거 구간이 안 받아진 것을 아무도 모른다."""
+    db.migrate(db_engine)
+    collect_minutes(db_engine, StubSource({NOW: descending(NOW, 3)}), "005930", now=NOW, days=1)
+
+    later = NOW + timedelta(minutes=2)
+    with caplog.at_level("WARNING", logger="sontrader.data.minutes"):
+        collect_minutes(
+            db_engine, StubSource(default=descending(later, 3)), "005930", now=later, days=365
+        )
+
+    assert any("--refetch" in r.message for r in caplog.records)
+
+
+def test_refetch_ignores_stored_data_and_fills_holes(db_engine):
+    """구멍을 메우는 유일한 방법. 저장분을 무시하고 구간 전체를 다시 받는다."""
+    db.migrate(db_engine)
+    first = StubSource({NOW: descending(NOW, 3)})
+    collect_minutes(db_engine, first, "005930", now=NOW, days=365)
+
+    # 저장 구간 안에 구멍을 만든다 (중간 봉 삭제)
+    hole = NOW - timedelta(minutes=1)
+    with db_engine.begin() as conn:
+        conn.execute(sa.delete(db.stock_candles_1m).where(db.stock_candles_1m.c.ts == hole))
+    assert hole not in {r.ts for r in rows_in(db_engine)}
+
+    second = StubSource({NOW: descending(NOW, 3)}, default=[])
+    collect_minutes(db_engine, second, "005930", now=NOW, days=365, refetch=True)
+
+    assert hole in {r.ts for r in rows_in(db_engine)}, "재수집이 구멍을 메워야 한다"
 
 
 # --- 여러 종목 ----------------------------------------------------------------

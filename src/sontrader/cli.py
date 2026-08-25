@@ -65,9 +65,10 @@ def _default_pace(settings) -> float:
 def _run_collect_minutes(
     symbols_arg: str | None,
     from_watchlist: bool,
-    days: int,
+    days: int | None,
     pace: float | None,
     limit: int | None,
+    refetch: bool = False,
 ) -> int:
     """분봉 수집. 일봉(`collect-prices`)과 별 커맨드다 — API·보관기간·정합성
     문제가 전부 달라서(`data/minutes.py` 참고) 옵션을 섞으면 오히려 헷갈린다."""
@@ -118,7 +119,7 @@ def _run_collect_minutes(
         span = days if days is not None else MAX_DAYS
         now = _now_kst()
         print(
-            f"분봉 수집 시작: {len(symbols)}종목, 과거 {span}일"
+            f"분봉 수집 시작: {len(symbols)}종목{' (재수집)' if refetch else ''}, 과거 {span}일"
             f"{'' if days is not None else ' (서버 보관 전체)'}, "
             f"간격 {pace_seconds}초 (기준 {now:%Y-%m-%d %H:%M})"
         )
@@ -146,6 +147,7 @@ def _run_collect_minutes(
                     pace_seconds=pace_seconds,
                     on_progress=on_progress,
                     on_page=on_page,
+                    refetch=refetch,
                 )
         except MinuteCollectionAborted as exc:
             print(f"error: 수집 중단 — {exc}", file=sys.stderr)
@@ -924,6 +926,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     minutes.add_argument("--pace", type=float, default=None, help="API 호출 간격 초 (기본 0.4)")
     minutes.add_argument("--limit", type=int, default=None, help="상위 N종목만 (테스트용)")
+    minutes.add_argument(
+        "--refetch",
+        action="store_true",
+        help="저장분을 무시하고 구간 전체를 다시 받는다 (구멍 메우기 / 과거 확장)",
+    )
 
     backfill = sub.add_parser(
         "backfill-prices",
@@ -1007,7 +1014,7 @@ def main(argv: list[str] | None = None) -> int:
         return _run_collect_master()
     if args.command == "collect-minutes":
         return _run_collect_minutes(
-            args.symbols, args.from_watchlist, args.days, args.pace, args.limit
+            args.symbols, args.from_watchlist, args.days, args.pace, args.limit, args.refetch
         )
     if args.command == "collect-prices":
         return _run_collect_prices(args.limit, args.pace, args.lookback_days)

@@ -158,18 +158,23 @@ def collect_minutes(
     pace_seconds: float = 0.0,
     sleep: Callable[[float], None] = time_module.sleep,
     on_page: Callable[[PageProgress], None] | None = None,
+    refetch: bool = False,
 ) -> MinuteCollectResult:
     """한 종목의 분봉을 과거로 수집한다. 재실행해도 결과가 같다 (upsert).
 
     `now`부터 과거로 `days`일까지. 이미 채운 구간(`source='rest'`)에 들어오면
-    그 구간을 **건너뛰고 아래를 이어 받는다** — 거기서 멈추면 저장분보다
-    오래된 쪽에 구멍이 남고 다시는 채워지지 않는다.
+    멈춘다 — 저장 구간 안에 구멍이 있어도 그것을 알 방법이 없으므로(원본
+    결손과 구별 불가) 건너뛰지 않는다. 구멍을 메우거나 더 과거를 받으려면
+    `refetch=True`로 구간 전체를 다시 받는다.
 
     장 운영시간은 알지 않는다 — `now`를 정하는 것은 호출자의 몫이다.
     """
     floor = _floor(now, days)
-    stored_newest = _last_stored(engine, symbol)
-    stored_oldest = _first_stored(engine, symbol)
+    # `refetch`면 저장분을 무시하고 구간 전체를 다시 받는다 — 구멍을 메우는
+    # 유일한 방법이다. 증분 종료는 "저장 구간이 연속"을 전제하는데 그걸
+    # 확인할 방법이 없어서(원본 결손과 구별 불가), 복구는 명시적 재수집으로 한다.
+    stored_newest = None if refetch else _last_stored(engine, symbol)
+    stored_oldest = None if refetch else _first_stored(engine, symbol)
 
     reference = now
     pages = 0
@@ -229,19 +234,29 @@ def collect_minutes(
         if page_oldest <= floor:
             break  # 목표 구간을 다 덮었다
         if stored_newest is not None and page_oldest <= stored_newest:
-            # 이미 채운 구간에 들어왔다. **멈추지 않고 그 구간 아래로 건너뛴다.**
+            # 이미 채운 구간에 들어왔으니 멈춘다. **건너뛰지 않는다.**
             #
-            # 수집은 과거로 가는데 판정 기준이 '가장 최신 저장 봉'이라, 여기서
-            # 멈추면 저장분보다 오래된 쪽에 구멍이 남고 다시는 채워지지 않는다.
-            # 실제로 그렇게 됐다 — 앞선 실행이 잘려 000660에 08-24 15:09 위쪽만
-            # 있었고, 다음 실행은 1호출 만에 "이미 있다"며 끝나 그 아래를
-            # 영원히 비워 뒀다.
-            stored_newest = None  # 건너뛰기는 한 번만 (무한 반복 방지)
-            if stored_oldest is not None and stored_oldest > floor:
-                log.debug("%s 저장 구간을 건너뛰고 %s 이전을 계속 받는다", symbol, stored_oldest)
-                reference = stored_oldest
-                continue
-            log.debug("%s 저장분이 하한까지 덮여 있다 — 증분 수집 종료", symbol)
+            # 예전에는 여기서 `stored_oldest`로 점프해 그 아래를 이어 받았다.
+            # 그건 **저장 구간이 연속이라고 가정**하는데, 그 안에 구멍이 있으면
+            # 그대로 뛰어넘어 영구히 비워 둔다. 실제로 그렇게 됐다 — 005930의
+            # 08-25 09:00~10:25(86분)가 API에는 있는데 DB에는 없었고, 재실행해도
+            # 점프가 그 구간을 계속 건너뛰었다.
+            #
+            # 구멍과 원본 결손을 구분할 방법이 없다는 것이 핵심이다. 같은 날
+            # 07-28 10:14~10:43(30분)은 거래소 원본에 아예 없는 구간이었다
+            # (기준 10:43 요청 시 최신 봉이 10:13). 길이나 위치로는 못 가른다.
+            #
+            # 그래서 조용히 건너뛰는 대신 **멈추고, 더 필요하면 사용자가
+            # `--refetch`로 다시 받게** 한다.
+            log.debug("%s 저장분(%s)에 도달 — 증분 수집 종료", symbol, stored_newest)
+            if stored_oldest is not None and floor < stored_oldest:
+                log.warning(
+                    "%s 저장분은 %s까지만 있다 — 그 이전(%s까지)을 받으려면 "
+                    "`--refetch`로 다시 실행해야 한다",
+                    symbol,
+                    stored_oldest,
+                    floor.date(),
+                )
             break
 
         reference = _next_reference(page_oldest, reference)
@@ -284,6 +299,7 @@ def collect_minutes_all(
     sleep: Callable[[float], None] = time_module.sleep,
     on_progress: Callable[[int, int], None] | None = None,
     on_page: Callable[[PageProgress], None] | None = None,
+    refetch: bool = False,
 ) -> tuple[list[MinuteCollectResult], list[tuple[str, Exception]]]:
     """여러 종목을 순차 수집한다. 한 종목의 실패는 다음 종목을 막지 않는다.
 
@@ -307,6 +323,7 @@ def collect_minutes_all(
                     pace_seconds=pace_seconds,
                     sleep=sleep,
                     on_page=on_page,
+                    refetch=refetch,
                 )
             )
             streak = 0
