@@ -61,8 +61,18 @@ from sontrader.logging_setup import traced
 
 log = logging.getLogger(__name__)
 
-# KIS가 보관하는 분봉 기간. 이 밖을 요청하면 빈 응답이 온다(실측: 550일 전 0건).
-RETENTION_DAYS = 365
+# 기본 수집 범위 = **서버가 가진 만큼 전부**. 기간을 지정하지 않는 것이 정상
+# 사용법이다 — 분봉은 애초에 1년만 보관되므로 "얼마나 소급할지"는 사용자가
+# 정할 게 아니라 서버가 정한다.
+#
+# 실측(2026-08-25, 005930): 365일 전은 데이터가 있고 380일 전부터 0건 —
+# 경계는 365~379일 사이다. 롤링 경계라 상수로 못 박으면 시간이 지나며
+# 어긋나므로, 넉넉히 넘겨 잡고 **실제 종료는 API의 빈 응답이 결정한다**
+# (그게 이미 종료 조건이다). 365로 잘라내면 경계 근처 최대 2주를 이유 없이
+# 버린다.
+#
+# 상한 역할도 겸한다 — 오타(`--days 36500`)로 호출 상한까지 도는 것을 막는다.
+MAX_DAYS = 400
 
 # 1회 응답 상한. 이보다 적게 오는 것은 정상이다(보관 경계, 결손 구간).
 PAGE_SIZE = 120
@@ -82,6 +92,35 @@ class MinuteCandleSource(Protocol):
     """KisClient가 만족하는 분봉 소스 (테스트에서는 스텁으로 대체)."""
 
     def get_intraday_candles(self, code: str, reference: datetime) -> list[dict[str, Any]]: ...
+
+
+@dataclass(frozen=True)
+class PageProgress:
+    """API 호출 한 번의 결과. 호출자가 진행도를 보여주는 데 쓴다.
+
+    로그가 아니라 콜백인 이유: `cli.py`는 `logging_setup.configure()`를 부르지
+    않는다(그 모듈의 `print`는 로그가 아니라 명령어의 출력이다). 그래서 이
+    모듈의 `log.info`는 CLI 실행에서 보이지 않는다 — 일봉 수집기의
+    `on_progress`와 같은 방식으로 호출자에게 넘긴다.
+    """
+
+    symbol: str
+    page: int  # 이 종목의 몇 번째 호출인가
+    rows: int  # 이번 응답 건수 (120이 상한)
+    reached: datetime  # 이번 페이지에서 도달한 가장 오래된 봉
+    started: datetime  # 수집 시작 시각 (진행률 분모)
+    floor: datetime  # 수집 하한
+    stored: int  # 이 종목에서 지금까지 저장한 행 수
+
+    @property
+    def percent(self) -> float:
+        """하한까지 얼마나 왔는가. 종목당 약 980호출이라 이게 없으면
+        언제 끝날지 짐작할 수 없다."""
+        span = (self.started - self.floor).total_seconds()
+        if span <= 0:
+            return 100.0
+        done = (self.started - self.reached).total_seconds()
+        return max(0.0, min(100.0, done / span * 100.0))
 
 
 @dataclass(frozen=True)
@@ -115,20 +154,22 @@ def collect_minutes(
     symbol: str,
     *,
     now: datetime,
-    days: int = RETENTION_DAYS,
+    days: int = MAX_DAYS,
     pace_seconds: float = 0.0,
     sleep: Callable[[float], None] = time_module.sleep,
+    on_page: Callable[[PageProgress], None] | None = None,
 ) -> MinuteCollectResult:
     """한 종목의 분봉을 과거로 수집한다. 재실행해도 결과가 같다 (upsert).
 
-    `now`부터 과거로 `days`일까지. 이미 저장된 구간에 도달하면 멈춘다
-    (증분 수집) — 저장된 가장 최근 봉보다 오래된 페이지를 받으면 그 종목은
-    이미 그 지점까지 채워져 있다는 뜻이다.
+    `now`부터 과거로 `days`일까지. 이미 채운 구간(`source='rest'`)에 들어오면
+    그 구간을 **건너뛰고 아래를 이어 받는다** — 거기서 멈추면 저장분보다
+    오래된 쪽에 구멍이 남고 다시는 채워지지 않는다.
 
     장 운영시간은 알지 않는다 — `now`를 정하는 것은 호출자의 몫이다.
     """
     floor = _floor(now, days)
     stored_newest = _last_stored(engine, symbol)
+    stored_oldest = _first_stored(engine, symbol)
 
     reference = now
     pages = 0
@@ -173,11 +214,34 @@ def collect_minutes(
             newest_saved = max(keep[-1]["ts"], newest_saved or keep[-1]["ts"])
 
         page_oldest = rows[0]["ts"]
+        if on_page is not None:
+            on_page(
+                PageProgress(
+                    symbol=symbol,
+                    page=pages,
+                    rows=len(rows),
+                    reached=page_oldest,
+                    started=now,
+                    floor=floor,
+                    stored=total_rows,
+                )
+            )
         if page_oldest <= floor:
             break  # 목표 구간을 다 덮었다
         if stored_newest is not None and page_oldest <= stored_newest:
-            # 이미 저장된 구간으로 들어갔다 — 증분 수집 종료.
-            log.debug("%s 저장분(%s)에 도달 — 증분 수집 종료", symbol, stored_newest)
+            # 이미 채운 구간에 들어왔다. **멈추지 않고 그 구간 아래로 건너뛴다.**
+            #
+            # 수집은 과거로 가는데 판정 기준이 '가장 최신 저장 봉'이라, 여기서
+            # 멈추면 저장분보다 오래된 쪽에 구멍이 남고 다시는 채워지지 않는다.
+            # 실제로 그렇게 됐다 — 앞선 실행이 잘려 000660에 08-24 15:09 위쪽만
+            # 있었고, 다음 실행은 1호출 만에 "이미 있다"며 끝나 그 아래를
+            # 영원히 비워 뒀다.
+            stored_newest = None  # 건너뛰기는 한 번만 (무한 반복 방지)
+            if stored_oldest is not None and stored_oldest > floor:
+                log.debug("%s 저장 구간을 건너뛰고 %s 이전을 계속 받는다", symbol, stored_oldest)
+                reference = stored_oldest
+                continue
+            log.debug("%s 저장분이 하한까지 덮여 있다 — 증분 수집 종료", symbol)
             break
 
         reference = _next_reference(page_oldest, reference)
@@ -215,10 +279,11 @@ def collect_minutes_all(
     symbols: Sequence[str],
     *,
     now: datetime,
-    days: int = RETENTION_DAYS,
+    days: int = MAX_DAYS,
     pace_seconds: float = 0.0,
     sleep: Callable[[float], None] = time_module.sleep,
     on_progress: Callable[[int, int], None] | None = None,
+    on_page: Callable[[PageProgress], None] | None = None,
 ) -> tuple[list[MinuteCollectResult], list[tuple[str, Exception]]]:
     """여러 종목을 순차 수집한다. 한 종목의 실패는 다음 종목을 막지 않는다.
 
@@ -241,6 +306,7 @@ def collect_minutes_all(
                     days=days,
                     pace_seconds=pace_seconds,
                     sleep=sleep,
+                    on_page=on_page,
                 )
             )
             streak = 0
@@ -264,9 +330,12 @@ def collect_minutes_all(
 
 
 def _floor(now: datetime, days: int) -> datetime:
-    """수집 하한. KIS 보관 기간을 넘겨 요청해도 빈 응답만 오므로 미리 자른다."""
-    limit = min(days, RETENTION_DAYS)
-    return now - timedelta(days=limit)
+    """수집 하한.
+
+    365로 자르지 않는다 — 실제 보관 경계가 365~379일 사이라 365로 자르면
+    최대 2주를 이유 없이 버린다. 보관 밖은 API의 빈 응답으로 끝난다.
+    """
+    return now - timedelta(days=min(days, MAX_DAYS))
 
 
 def _next_reference(page_oldest: datetime, current: datetime) -> datetime:
@@ -360,19 +429,36 @@ def _parse_ts(row: dict[str, Any]) -> datetime | None:
 
 
 def _last_stored(engine: Engine, symbol: str) -> datetime | None:
+    """이 수집기가 이미 채운 가장 최근 봉. **`source='rest'`만 센다.**
+
+    `source`를 구분하지 않으면 웹소켓 집계 봉(`ws`)이 증분 종료를 앞당겨
+    REST 수집을 잘라먹는다. 실제로 그렇게 잘렸다 — 000660은 ws 봉이 08-24
+    15:54까지 있어서, 2호출(08-24 15:08 도달) 만에 "이미 수집했다"고 판단하고
+    하한(08-22)에 한참 못 미친 30%에서 멈췄다. 데몬이 스트리밍한 종목은 전부
+    이렇게 잘리는데, 그게 정확히 백테스트에 필요한 종목들이다.
+    """
     columns = db.stock_candles_1m.c
     with engine.connect() as conn:
         return conn.execute(
-            sa.select(sa.func.max(columns.ts)).where(columns.symbol == symbol)
+            sa.select(sa.func.max(columns.ts)).where(
+                columns.symbol == symbol, columns.source == "rest"
+            )
         ).scalar_one_or_none()
 
 
-def first_stored(engine: Engine, symbol: str) -> datetime | None:
-    """저장된 가장 오래된 봉 — CLI가 수집 상태를 보고할 때 쓴다."""
+def _first_stored(engine: Engine, symbol: str) -> datetime | None:
+    """이 수집기가 채운 가장 오래된 봉. `_last_stored`와 같은 이유로
+    `source='rest'`만 센다.
+
+    증분 수집이 이미 채운 구간을 **건너뛸** 지점이다 — 과거로 내려가다 저장
+    구간에 들어오면 여기로 점프해 그 아래를 이어 받는다.
+    """
     columns = db.stock_candles_1m.c
     with engine.connect() as conn:
         return conn.execute(
-            sa.select(sa.func.min(columns.ts)).where(columns.symbol == symbol)
+            sa.select(sa.func.min(columns.ts)).where(
+                columns.symbol == symbol, columns.source == "rest"
+            )
         ).scalar_one_or_none()
 
 

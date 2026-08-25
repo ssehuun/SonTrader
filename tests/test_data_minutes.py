@@ -62,7 +62,12 @@ def rows_in(engine) -> list[tuple]:
     with engine.connect() as conn:
         return conn.execute(
             sa.select(
-                columns.symbol, columns.ts, columns.close, columns.volume, columns.trade_value
+                columns.symbol,
+                columns.ts,
+                columns.close,
+                columns.volume,
+                columns.trade_value,
+                columns.source,
             ).order_by(columns.ts)
         ).fetchall()
 
@@ -255,19 +260,25 @@ def test_bars_older_than_the_floor_are_not_stored(db_engine):
 # --- 증분 --------------------------------------------------------------------
 
 
-def test_incremental_stops_at_stored_data(db_engine):
-    """이미 저장된 구간으로 들어가면 멈춘다 — 1년치를 매번 다시 받지 않는다."""
+def test_incremental_skips_the_stored_range_and_keeps_going(db_engine):
+    """실제로 겪은 사고의 회귀 테스트.
+
+    수집은 과거로 가는데 증분 판정 기준은 '가장 최신 저장 봉'이다. 거기서
+    멈추면 **저장분보다 오래된 쪽에 구멍이 남고 다시는 채워지지 않는다.**
+    000660이 그랬다 — 앞선 실행이 잘려 08-24 15:09 위쪽만 있었고, 다음
+    실행은 1호출 만에 "이미 있다"며 끝났다.
+
+    올바른 동작은 저장 구간을 **건너뛰고 그 아래를 이어 받는** 것이다.
+    """
     db.migrate(db_engine)
-    old = NOW - timedelta(minutes=10)
-    first = StubSource({NOW: descending(NOW, 3)})
-    collect_minutes(db_engine, first, "005930", now=NOW, days=365)
+    collect_minutes(db_engine, StubSource({NOW: descending(NOW, 3)}), "005930", now=NOW, days=365)
+    stored_oldest = min(r.ts for r in rows_in(db_engine))
 
     later = NOW + timedelta(minutes=2)
-    second = StubSource({later: descending(later, 3)}, default=descending(old, 3))
+    second = StubSource(default=descending(later, 3))
     collect_minutes(db_engine, second, "005930", now=later, days=365)
 
-    # 저장분(NOW)에 도달하면 더 파고들지 않는다
-    assert len(second.calls) <= 2
+    assert stored_oldest in second.calls, "저장 구간 아래를 이어 받으려면 그 지점을 요청해야 한다"
 
 
 # --- 여러 종목 ----------------------------------------------------------------
@@ -354,3 +365,152 @@ def test_dropped_oldest_bar_is_recovered_by_the_next_page(db_engine):
     # 09:02는 page1에서 빠졌지만 page2에서 직전 봉(09:01)과 함께 와 차분됨
     assert stored[t0 + timedelta(minutes=2)] == 50
     assert stored[t0 + timedelta(minutes=3)] == 100
+
+
+# --- 진행도 콜백 ---------------------------------------------------------------
+
+
+def test_on_page_is_called_once_per_api_call(db_engine):
+    """종목당 약 980호출이라 호출 단위 진행도가 없으면 언제 끝날지 모른다.
+    로그가 아니라 콜백인 이유는 `cli.py`가 logging을 설정하지 않기 때문이다."""
+    db.migrate(db_engine)
+    first_oldest = NOW - timedelta(minutes=2)
+    source = StubSource(
+        {NOW: descending(NOW, 3), first_oldest: descending(first_oldest, 3)}, default=[]
+    )
+    seen = []
+
+    collect_minutes(db_engine, source, "005930", now=NOW, days=1, on_page=seen.append)
+
+    # 3번째 호출은 빈 응답이라 콜백이 없다 — 도달한 봉이 없으니 보고할 게 없다.
+    assert [p.page for p in seen] == [1, 2]
+    assert [p.symbol for p in seen] == ["005930"] * 2
+    assert seen[0].rows == 3
+    assert seen[0].reached == first_oldest
+    assert seen[1].stored >= seen[0].stored  # 누적 행 수는 줄지 않는다
+
+
+def test_page_progress_percent_tracks_distance_to_the_floor(db_engine):
+    """진행률은 '시작 시각 → 하한' 구간에서 얼마나 왔는가다."""
+    db.migrate(db_engine)
+    # 하한은 NOW - 10분. 첫 페이지가 NOW-5분까지 도달하면 절반.
+    page = [bar(NOW - timedelta(minutes=i), 10_000) for i in range(6)]
+    source = StubSource({NOW: page}, default=[])
+    seen = []
+
+    collect_minutes(
+        db_engine,
+        source,
+        "005930",
+        now=NOW,
+        days=0,  # 하한 = NOW
+        on_page=seen.append,
+    )
+
+    assert seen[0].percent == 100.0  # 하한이 NOW면 이미 다 온 것으로 본다
+
+
+def test_on_page_is_optional(db_engine):
+    """콜백을 안 주면 아무 일도 없어야 한다 — 프로그램적 호출자(실전)는 쓰지 않는다."""
+    db.migrate(db_engine)
+    source = StubSource({NOW: descending(NOW, 3)})
+
+    result = collect_minutes(db_engine, source, "005930", now=NOW, days=1)
+
+    assert result.rows == 2
+
+
+def test_websocket_bars_do_not_truncate_rest_collection(db_engine):
+    """실제로 겪은 사고의 회귀 테스트.
+
+    `_last_stored()`가 source를 구분하지 않으면 웹소켓 집계 봉(`ws`)에 도달한
+    순간 "이미 수집했다"고 판단해 REST 수집이 잘린다. 000660은 ws 봉이 08-24
+    15:54까지 있어서 2호출 만에 하한 훨씬 전(30%)에서 멈췄다. 데몬이
+    스트리밍한 종목이 정확히 백테스트에 필요한 종목이라 더 나쁘다.
+    """
+    db.migrate(db_engine)
+    # 웹소켓이 수집해 둔 최근 봉 하나 (source='ws')
+    with db_engine.begin() as conn:
+        conn.execute(
+            db.stock_candles_1m.insert().values(
+                symbol="005930",
+                ts=NOW - timedelta(minutes=1),
+                open=10_000,
+                high=10_000,
+                low=10_000,
+                close=10_000,
+                volume=1,
+                source="ws",
+            )
+        )
+
+    first_oldest = NOW - timedelta(minutes=2)
+    source = StubSource(
+        {NOW: descending(NOW, 3), first_oldest: descending(first_oldest, 3)}, default=[]
+    )
+
+    result = collect_minutes(db_engine, source, "005930", now=NOW, days=1)
+
+    # ws 봉이 있어도 2페이지까지 파고들어야 한다 (증분 종료가 걸리면 1페이지)
+    assert result.pages >= 2, "ws 봉이 REST 수집을 잘라서는 안 된다"
+    assert source.calls[:2] == [NOW, first_oldest]
+
+
+def test_incremental_does_not_refetch_the_stored_range(db_engine):
+    """건너뛰기가 재수집으로 바뀌면 안 된다 — 저장 구간을 매번 다시 받으면
+    실행마다 종목당 약 980호출이 든다. 구간 내부 지점은 요청하지 않는다."""
+    db.migrate(db_engine)
+    collect_minutes(db_engine, StubSource({NOW: descending(NOW, 5)}), "005930", now=NOW, days=365)
+    inside = [r.ts for r in rows_in(db_engine)][1:-1]
+
+    later = NOW + timedelta(minutes=2)
+    second = StubSource(default=descending(later, 3))
+    collect_minutes(db_engine, second, "005930", now=later, days=365)
+
+    assert not (set(inside) & set(second.calls)), f"구간 내부를 다시 요청했다: {second.calls}"
+
+
+# --- 출처 구분 -----------------------------------------------------------------
+
+
+def test_collected_rows_are_marked_as_rest(db_engine):
+    """웹소켓 집계분(`ws`)과 값이 갈리므로 출처를 남긴다 — 백테스트는
+    `rest`만 읽는다(`data/db.py`의 표 참고)."""
+    db.migrate(db_engine)
+    source = StubSource({NOW: descending(NOW, 3)})
+
+    collect_minutes(db_engine, source, "005930", now=NOW, days=1)
+
+    assert {r.source for r in rows_in(db_engine)} == {"rest"}
+
+
+def test_rest_rows_overwrite_ws_rows_at_the_same_minute(db_engine):
+    """갭 필로 들어온 REST 봉이 ws 봉을 덮어 정본으로 승격된다. 반대 방향
+    (ws가 rest를 덮음)은 마감 후 재수집이 다시 정리한다."""
+    db.migrate(db_engine)
+    from sontrader.core.types import Bar
+    from sontrader.data import live_bars
+
+    ts = NOW - timedelta(minutes=1)
+    live_bars.store(
+        db_engine,
+        Bar(symbol="005930", ts=ts, open=1, high=1, low=1, close=1, volume=1),
+    )
+    assert [r.source for r in rows_in(db_engine)] == ["ws"]
+
+    collect_minutes(db_engine, StubSource({NOW: descending(NOW, 3)}), "005930", now=NOW, days=1)
+
+    by_ts = {r.ts: r for r in rows_in(db_engine)}
+    assert by_ts[ts].source == "rest"
+    assert by_ts[ts].close == 10_000  # ws의 close=1 이 덮였다
+
+
+def test_days_beyond_retention_is_not_clamped_to_365(db_engine):
+    """실측 보관 경계가 365~379일 사이라, 365로 자르면 그 구간을 이유 없이
+    버린다. 보관 밖은 API의 빈 응답이 끝내므로 클램프가 필요 없다."""
+    from sontrader.data.minutes import MAX_DAYS, _floor
+
+    now = datetime(2026, 8, 25, 15, 30)
+
+    assert _floor(now, 379) == now - timedelta(days=379)  # 365로 잘리지 않는다
+    assert _floor(now, 36500) == now - timedelta(days=MAX_DAYS)  # 오타는 막는다

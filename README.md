@@ -57,9 +57,9 @@ uv run sontrader build-universe                 # 모멘텀 워치리스트 + �
 분봉 (백테스트용, **실전 자격증명 필수**):
 
 ```sh
-uv run sontrader collect-minutes --symbols 005930 --days 2       # 특정 종목
+uv run sontrader collect-minutes --symbols 005930                # 1종목, 서버 보관 전체 (약 1년)
+uv run sontrader collect-minutes --symbols 005930 --days 3       # 짧게 시험
 uv run sontrader collect-minutes --from-watchlist --limit 5      # 워치리스트 앞쪽 N종목
-uv run sontrader collect-minutes --from-watchlist --days 365     # 1년치 (보관 상한)
 ```
 
 `scripts/daily_collect.sh`가 일봉 → 워치리스트를 묶어 돌린다 (cron용).
@@ -115,9 +115,11 @@ uv run python -m sontrader.apps.live
 - **`collect-prices`는 앞으로만 간다.** `--lookback-days`를 키워도 과거는 안 늘어난다.
   기간을 늘리려면 `backfill-prices`(중단·재실행 안전, 기존 행 불변).
 - **분봉은 실전 전용, 1년 상한.** `주식일별분봉조회`가 모의투자 미지원이라
-  `KIS_PAPER=false`가 아니면 즉시 실패한다. `--days`는 **타임스탬프 기준**이라 09시에
-  `--days 1`을 주면 하한이 전날 09시가 되어 전날 세션이 빠진다 — 거래일 N개를 원하면
-  N+1을 준다. 종목당 약 980호출(하루 4호출 × 245거래일)이라 37종목이면 10시간 규모다.
+  `KIS_PAPER=false`가 아니면 즉시 실패한다. **`--days`는 생략이 정상** — 서버가 1년만
+  보관하므로 얼마나 소급할지는 사용자가 정할 게 아니다(실측 경계 365~379일, 종료는
+  API의 빈 응답이 결정). 지정할 때는 **타임스탬프 기준**이라 09시에 `--days 1`을 주면
+  하한이 전날 09시가 되어 전날 세션이 빠진다. 종목당 약 980호출(하루 4호출 ×
+  245거래일)이라 1종목 약 10분, 37종목이면 10시간 규모다.
 - **백테스트 가능 구간 = 보유 거래일 − 253.** 모멘텀이 253 거래일을 워밍업으로 소비한다
   (2년치 ≈ 743 거래일 ≈ 1,110 달력일). 과거로 갈수록 생존 편향도 커진다 — 상장폐지 종목은
   `symbol_master`에 없어 그 시점 유니버스에서 이미 빠져 있다.

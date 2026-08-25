@@ -74,7 +74,7 @@ def _run_collect_minutes(
     from sqlalchemy.exc import SQLAlchemyError
 
     from sontrader.data.db import migrate
-    from sontrader.data.minutes import MinuteCollectionAborted, collect_minutes_all
+    from sontrader.data.minutes import MAX_DAYS, MinuteCollectionAborted, collect_minutes_all
 
     try:
         settings = load_settings()
@@ -113,14 +113,27 @@ def _run_collect_minutes(
         # 일봉보다 보수적으로 잡는다. 실측에서 분봉 조회가 EGW00201(초당 초과)에
         # 실제로 걸렸고, 종목당 약 980호출이라 한 번 걸릴 때마다 재시도 대기가 붙는다.
         pace_seconds = pace if pace is not None else DEFAULT_PACE_MINUTES
+        # 기간 미지정이 정상 사용법 — 분봉은 1년만 보관되므로 서버가 가진
+        # 만큼 전부 받고, 실제 경계는 API의 빈 응답이 알려준다.
+        span = days if days is not None else MAX_DAYS
         now = _now_kst()
         print(
-            f"분봉 수집 시작: {len(symbols)}종목, 과거 {days}일, "
+            f"분봉 수집 시작: {len(symbols)}종목, 과거 {span}일"
+            f"{'' if days is not None else ' (서버 보관 전체)'}, "
             f"간격 {pace_seconds}초 (기준 {now:%Y-%m-%d %H:%M})"
         )
 
         def on_progress(index: int, total: int) -> None:
-            print(f"  {index}/{total}", flush=True)
+            print(f"  [{index}/{total}] 종목 완료", flush=True)
+
+        def on_page(p) -> None:
+            # 호출마다 한 줄. 종목당 약 980호출이라 진행률 없이는 언제 끝날지
+            # 짐작할 수 없다 — 오늘 실제로 그 상태로 몇 시간을 기다렸다.
+            print(
+                f"    {p.symbol} #{p.page:<4} {p.rows:>3}건 → {p.reached:%Y-%m-%d %H:%M}"
+                f"  {p.percent:5.1f}%  누적 {p.stored:,}행",
+                flush=True,
+            )
 
         try:
             with KisClient(settings) as client:
@@ -129,9 +142,10 @@ def _run_collect_minutes(
                     client,
                     symbols,
                     now=now,
-                    days=days,
+                    days=span,
                     pace_seconds=pace_seconds,
                     on_progress=on_progress,
+                    on_page=on_page,
                 )
         except MinuteCollectionAborted as exc:
             print(f"error: 수집 중단 — {exc}", file=sys.stderr)
@@ -902,7 +916,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="최신 워치리스트 스냅샷의 종목을 순위대로 수집",
     )
-    minutes.add_argument("--days", type=int, default=365, help="과거 소급 일수 (KIS 보관 상한 365)")
+    minutes.add_argument(
+        "--days",
+        type=int,
+        default=None,
+        help="과거 소급 일수 (기본: 서버 보관 전체 ≈1년). 짧게 시험할 때만 지정",
+    )
     minutes.add_argument("--pace", type=float, default=None, help="API 호출 간격 초 (기본 0.4)")
     minutes.add_argument("--limit", type=int, default=None, help="상위 N종목만 (테스트용)")
 
