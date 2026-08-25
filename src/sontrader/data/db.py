@@ -223,16 +223,37 @@ stock_candles_1d = Table(
 # 1분봉 — 웹소켓 실시간체결가(adapters/live_ws.py)가 집계해 채운다.
 # stock_candles_1d와 별개 테이블이다: PK가 date가 아니라 ts(분 단위)이고,
 # 재연결 시 같은 분이 다시 집계될 수 있어 upsert로 쓴다(data/live_bars.py).
+# 1분봉. 출처가 두 가지이고 값이 갈리므로 `source`로 구분한다.
+#
+# | | `rest` (주식일별분봉조회 213) | `ws` (웹소켓 틱 집계) |
+# |---|---|---|
+# | 만든 곳 | 거래소 확정 봉 | `adapters/live_ticks.py`가 직접 집계 |
+# | 종가 단일가(15:20~29) | **생략** | 체결 있으면 포함 |
+# | 시간외 거래 | **없음** | **있음** (실측: 15:58 봉까지) |
+# | 재연결 구멍 | 없음 | 일부만 집계된 봉이 남을 수 있음 |
+# | `trade_value` | 있음 (누적값 차분) | NULL (틱에 거래대금이 없다) |
+#
+# **백테스트는 `source='rest'`만 읽는다.** 시간외 봉을 학습하면 실전에서
+# 재현 불가능한 청산이 나온다 — 그 시간에는 시장가 즉시 청산이 안 된다.
+# 실전 청산은 필터 없이 최신 봉을 읽는다(오늘 것이 정답이고, 갭 필로 들어온
+# REST 봉이 ws 봉을 덮으며 정본으로 승격된다). 마감 후 REST 재수집이 그날을
+# 덮으므로 시간이 지나면 전부 `rest`로 수렴한다.
 stock_candles_1m = Table(
     "stock_candles_1m",
     metadata,
     Column("symbol", String(20), primary_key=True),
-    Column("ts", DateTime, primary_key=True),
+    Column("ts", DateTime, primary_key=True, comment="봉의 시작 시각 (KST naive)"),
     Column("open", Integer, nullable=False),
     Column("high", Integer, nullable=False),
     Column("low", Integer, nullable=False),
     Column("close", Integer, nullable=False),
     Column("volume", BigInteger, nullable=False),
+    Column(
+        "trade_value",
+        BigInteger,
+        comment="그 분의 거래대금 — REST 누적값(acml_tr_pbmn)의 차분. ws 집계는 NULL",
+    ),
+    Column("source", String(4), comment="rest | ws — 위 표 참고"),
 )
 
 # 국내휴장일조회(CTCA0903R) 캐시 — KIS가 "가급적 1일 1회 호출"을 명시

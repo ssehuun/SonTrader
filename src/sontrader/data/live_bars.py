@@ -36,6 +36,11 @@ def store(engine: Engine, bar: Bar) -> None:
                     "low": bar.low,
                     "close": bar.close,
                     "volume": bar.volume,
+                    # 우리가 틱을 직접 집계한 봉이다. 거래소 확정 봉(`rest`)과
+                    # 값이 갈리므로(시간외 포함, 재연결 구멍) 출처를 남긴다 —
+                    # 백테스트가 이 행을 학습하면 실전에서 재현 불가능한
+                    # 청산이 나온다(`data/db.py`의 표 참고).
+                    "source": "ws",
                 }
             ],
             key_cols=("symbol", "ts"),
