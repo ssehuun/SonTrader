@@ -54,6 +54,14 @@ uv run sontrader backfill-prices --earliest 20180101
 uv run sontrader build-universe                 # 모멘텀 워치리스트 + 일별 스냅샷
 ```
 
+분봉 (백테스트용, **실전 자격증명 필수**):
+
+```sh
+uv run sontrader collect-minutes --symbols 005930 --days 2       # 특정 종목
+uv run sontrader collect-minutes --from-watchlist --limit 5      # 워치리스트 앞쪽 N종목
+uv run sontrader collect-minutes --from-watchlist --days 365     # 1년치 (보관 상한)
+```
+
 `scripts/daily_collect.sh`가 일봉 → 워치리스트를 묶어 돌린다 (cron용).
 
 ### 백테스트
@@ -96,7 +104,7 @@ uv run python -m sontrader.apps.live
 | 진입 트리거 | `SONTRADER_ENTRY_TRIGGER` — `watchlist`(기본, LLM 호출 없음) \| `event`(공시마다 LLM API 호출) |
 | 텔레그램 명령 | `/kill` 매매 중단 · `/resume` 재개 · `/status` 상태 |
 | 텔레그램 없을 때 | 매매는 그대로 돈다. 알림·킬 스위치만 없다 |
-| 1분봉 | 웹소켓으로 수집해 저장만 — 판정은 일봉 기준 |
+| 1분봉 | 웹소켓으로 수집해 `source='ws'`로 저장만 — 판정은 일봉 기준. 백테스트는 `source='rest'`(거래소 확정 봉)만 읽는다 |
 | 휴장일 | 실전 계좌만 캘린더 확인. 모의투자는 해당 API 미지원 |
 | 로그 | stdout으로만. 레벨은 `SONTRADER_LOG_LEVEL`(기본 INFO). 앱키·계좌번호·토큰은 자동 마스킹 |
 
@@ -106,6 +114,10 @@ uv run python -m sontrader.apps.live
   않는다. 저장해버리면 청산이 임시 종가로 발동하고 스냅샷이 재현 불가능해진다.
 - **`collect-prices`는 앞으로만 간다.** `--lookback-days`를 키워도 과거는 안 늘어난다.
   기간을 늘리려면 `backfill-prices`(중단·재실행 안전, 기존 행 불변).
+- **분봉은 실전 전용, 1년 상한.** `주식일별분봉조회`가 모의투자 미지원이라
+  `KIS_PAPER=false`가 아니면 즉시 실패한다. `--days`는 **타임스탬프 기준**이라 09시에
+  `--days 1`을 주면 하한이 전날 09시가 되어 전날 세션이 빠진다 — 거래일 N개를 원하면
+  N+1을 준다. 종목당 약 980호출(하루 4호출 × 245거래일)이라 37종목이면 10시간 규모다.
 - **백테스트 가능 구간 = 보유 거래일 − 253.** 모멘텀이 253 거래일을 워밍업으로 소비한다
   (2년치 ≈ 743 거래일 ≈ 1,110 달력일). 과거로 갈수록 생존 편향도 커진다 — 상장폐지 종목은
   `symbol_master`에 없어 그 시점 유니버스에서 이미 빠져 있다.

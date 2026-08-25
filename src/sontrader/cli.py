@@ -52,9 +52,126 @@ def _parse_date_arg(date_str: str):
 DEFAULT_PACE_PAPER = 1.0
 DEFAULT_PACE_REAL = 0.20
 
+# 분봉은 실전 전용이고 종목당 약 980호출이다(하루 약 4호출 × 245거래일). 위
+# 실전값(0.20)의 두 배로 둔다 — 프로브에서 분봉 조회가 EGW00201에 실제로
+# 걸렸고, 한 종목이 오래 도는 작업이라 재시도 대기가 누적되면 전체가 밀린다.
+DEFAULT_PACE_MINUTES = 0.4
+
 
 def _default_pace(settings) -> float:
     return DEFAULT_PACE_PAPER if settings.paper else DEFAULT_PACE_REAL
+
+
+def _run_collect_minutes(
+    symbols_arg: str | None,
+    from_watchlist: bool,
+    days: int,
+    pace: float | None,
+    limit: int | None,
+) -> int:
+    """분봉 수집. 일봉(`collect-prices`)과 별 커맨드다 — API·보관기간·정합성
+    문제가 전부 달라서(`data/minutes.py` 참고) 옵션을 섞으면 오히려 헷갈린다."""
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from sontrader.data.db import migrate
+    from sontrader.data.minutes import MinuteCollectionAborted, collect_minutes_all
+
+    try:
+        settings = load_settings()
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    # 명세상 모의투자 미지원(주식일별분봉조회 [국내주식-213]: "모의 TR_ID
+    # 모의투자 미지원"). 조용히 넘기면 KIS가 애매한 오류로 답한다.
+    if settings.paper:
+        print(
+            "error: 분봉 조회(FHKST03010230)는 모의투자를 지원하지 않습니다. "
+            "KIS_PAPER=false 로 실전 자격증명을 쓰세요.",
+            file=sys.stderr,
+        )
+        return 2
+
+    engine = _open_engine()
+    if engine is None:
+        return 2
+    try:
+        for action in migrate(engine):
+            print(action)
+
+        symbols = _minute_symbols(engine, symbols_arg, from_watchlist)
+        if not symbols:
+            print(
+                "error: 수집 대상이 없습니다. --symbols 로 지정하거나 "
+                "--from-watchlist 로 최신 워치리스트를 쓰세요.",
+                file=sys.stderr,
+            )
+            return 2
+        if limit is not None:
+            symbols = symbols[:limit]
+
+        # 일봉보다 보수적으로 잡는다. 실측에서 분봉 조회가 EGW00201(초당 초과)에
+        # 실제로 걸렸고, 종목당 약 980호출이라 한 번 걸릴 때마다 재시도 대기가 붙는다.
+        pace_seconds = pace if pace is not None else DEFAULT_PACE_MINUTES
+        now = _now_kst()
+        print(
+            f"분봉 수집 시작: {len(symbols)}종목, 과거 {days}일, "
+            f"간격 {pace_seconds}초 (기준 {now:%Y-%m-%d %H:%M})"
+        )
+
+        def on_progress(index: int, total: int) -> None:
+            print(f"  {index}/{total}", flush=True)
+
+        try:
+            with KisClient(settings) as client:
+                results, failures = collect_minutes_all(
+                    engine,
+                    client,
+                    symbols,
+                    now=now,
+                    days=days,
+                    pace_seconds=pace_seconds,
+                    on_progress=on_progress,
+                )
+        except MinuteCollectionAborted as exc:
+            print(f"error: 수집 중단 — {exc}", file=sys.stderr)
+            print(f"  중단 시점까지 {len(exc.results)}종목 저장됨", file=sys.stderr)
+            for symbol, failure in exc.failures[-3:]:
+                print(f"  실패 {symbol}: {_first_line(failure)}", file=sys.stderr)
+            return 1
+
+        rows = sum(r.rows for r in results)
+        calls = sum(r.pages for r in results)
+        print(f"수집 완료: {len(results)}종목, {rows:,}행, {calls:,}호출 (실패 {len(failures)})")
+        for symbol, exc in failures[:5]:
+            print(f"  실패 {symbol}: {_first_line(exc)}", file=sys.stderr)
+        return 1 if failures else 0
+    except SQLAlchemyError as exc:
+        print(f"error: DB access failed: {_first_line(exc)}", file=sys.stderr)
+        return 2
+    finally:
+        engine.dispose()
+
+
+def _minute_symbols(engine, symbols_arg: str | None, from_watchlist: bool) -> list[str]:
+    """수집 대상 종목. --symbols 가 우선이고, 없으면 최신 워치리스트."""
+    if symbols_arg:
+        return [s.strip().zfill(6) for s in symbols_arg.split(",") if s.strip()]
+    if not from_watchlist:
+        return []
+    import sqlalchemy as sa
+
+    from sontrader.data.db import watchlist_snapshots
+
+    columns = watchlist_snapshots.c
+    with engine.connect() as conn:
+        latest = conn.execute(sa.select(sa.func.max(columns.date))).scalar_one_or_none()
+        if latest is None:
+            return []
+        rows = conn.execute(
+            sa.select(columns.symbol).where(columns.date == latest).order_by(columns.rank)
+        )
+        return [row.symbol for row in rows]
 
 
 def _open_engine():
@@ -773,6 +890,22 @@ def main(argv: list[str] | None = None) -> int:
         "--lookback-days", type=int, default=420, help="최초 수집 시 소급 일수 (달력일)"
     )
 
+    minutes = sub.add_parser(
+        "collect-minutes",
+        help="분봉 수집 (거래소 공식 1분봉, 백테스트용 — 실전 자격증명 필수)",
+    )
+    minutes.add_argument(
+        "--symbols", default=None, help="쉼표로 구분한 종목코드 (예: 005930,000660)"
+    )
+    minutes.add_argument(
+        "--from-watchlist",
+        action="store_true",
+        help="최신 워치리스트 스냅샷의 종목을 순위대로 수집",
+    )
+    minutes.add_argument("--days", type=int, default=365, help="과거 소급 일수 (KIS 보관 상한 365)")
+    minutes.add_argument("--pace", type=float, default=None, help="API 호출 간격 초 (기본 0.4)")
+    minutes.add_argument("--limit", type=int, default=None, help="상위 N종목만 (테스트용)")
+
     backfill = sub.add_parser(
         "backfill-prices",
         help="일봉을 과거 방향으로 채운다 (collect-prices는 앞으로만 간다)",
@@ -853,6 +986,10 @@ def main(argv: list[str] | None = None) -> int:
         return _run_collect_dart(args.date, args.interval)
     if args.command == "collect-master":
         return _run_collect_master()
+    if args.command == "collect-minutes":
+        return _run_collect_minutes(
+            args.symbols, args.from_watchlist, args.days, args.pace, args.limit
+        )
     if args.command == "collect-prices":
         return _run_collect_prices(args.limit, args.pace, args.lookback_days)
     if args.command == "backfill-prices":
