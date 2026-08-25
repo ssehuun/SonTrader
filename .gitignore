@@ -22,3 +22,10 @@ uv.lock.orig
 
 # scripts/daily_collect.sh's cron log output — machine-local, not source
 /logs/
+
+# KIS API 명세 문서 (docs/api/*.xlsx) — 추적하지 않는다.
+# 바이너리라 diff가 안 되고, KIS 포털에서 받는 배포 문서라 이 저장소가 원본이
+# 아니다. 코드 주석이 파일명으로 근거를 가리키므로(client.py의 _TR_IDS 등),
+# 필요하면 apiportal.koreainvestment.com에서 같은 이름으로 내려받아 여기 둔다.
+*.xlsx
+*.xls
