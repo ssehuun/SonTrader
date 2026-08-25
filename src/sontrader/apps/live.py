@@ -71,6 +71,7 @@ def main() -> None:
     configure_logging()
     settings = load_settings()
     engine = db.get_engine(load_database_url())
+    _sync_schema(engine)
     client = KisClient(settings)
     broker = KisBroker(client, engine)
     notifier = _build_notifier(engine)
@@ -196,6 +197,41 @@ def main() -> None:
         if notifier is not None:
             notifier.send_message("SonTrader 종료")
         client.close()
+
+
+def _sync_schema(engine: sa.engine.Engine) -> None:
+    """기동 시 DB 스키마를 코드에 맞춘다. 무엇을 적용했는지 반드시 남긴다.
+
+    스키마가 뒤처진 채로 기동하면 **장중에** psycopg2 UndefinedColumn으로
+    터진다. 두 번 겪었다:
+
+    - `orders.exit_rule_json` — 첫 `reconcile()`의 미체결 조회가 트레이스백
+      으로 죽었다. 스택 어디에도 "마이그레이션 미실행"이 안 적혀 있어 코드
+      버그처럼 보였다.
+    - `stock_candles_1m.source` — 웹소켓 저장이 실패했고, 재연결 루프가 예외를
+      삼켜 **5초마다 분봉을 버리면서 데몬은 계속 살아 있었다.** 더 나쁘다.
+
+    거부하지 않고 적용하는 이유: `migrate()`는 additive-only(컬럼·테이블 추가만,
+    삭제·재작성 불가)라 위험이 낮은 반면, 기동을 거부하면 데몬이 죽어 있다.
+    "장중 루프가 죽으면 손절이 발동하지 않는다"(01문서 §6.4)가 더 큰 손실이다.
+    CLI 수집기들도 이미 같은 방식으로 스스로 `migrate()`를 돌린다.
+
+    적용 **전에** 무엇을 할지 먼저 남긴다 — 마이그레이션이 실패해도 무엇을
+    시도했는지가 로그에 남아야 원인을 찾을 수 있다.
+    """
+    try:
+        pending = db.pending_migrations(engine)
+        if not pending:
+            log.debug("DB 스키마 최신 — 마이그레이션 없음")
+            return
+        log.warning("DB 스키마가 코드보다 뒤처져 있다 — 적용한다: %s", ", ".join(pending))
+        for action in db.migrate(engine):
+            log.warning("  %s", action)
+    except sa.exc.SQLAlchemyError:
+        # 여기서 실패하면 뒤따르는 모든 DB 작업이 깨진다. 매매를 시작하는
+        # 것보다 기동을 멈추는 게 낫다 — 주문은 아직 하나도 안 냈다.
+        log.exception("DB 스키마 동기화 실패 — 기동을 중단한다")
+        raise SystemExit(2) from None
 
 
 def _log_heartbeat(cycle: int, ctx, result, *, engaged: bool) -> None:

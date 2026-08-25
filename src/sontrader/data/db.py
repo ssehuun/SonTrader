@@ -25,6 +25,8 @@ no database server is required.
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import sqlalchemy as sa
 from sqlalchemy import (
     BigInteger,
@@ -343,6 +345,58 @@ cycle_log = Table(
 )
 
 
+class _Drift(NamedTuple):
+    """DB가 이 모듈의 metadata보다 뒤처진 한 항목.
+
+    `migrate()`(고친다)와 `pending_migrations()`(읽기만 한다)가 **같은 판정**을
+    쓰게 하려고 둔다. 두 곳에서 따로 비교하면 "점검은 통과했는데 마이그레이션
+    할 게 남아 있다"는 조합이 생겨 점검이 무의미해진다.
+    """
+
+    table: Table
+    column: Column | None = None
+    index: sa.Index | None = None
+
+    def describe(self) -> str:
+        if self.column is not None:
+            return f"{self.table.name}.{self.column.name} 컬럼 없음"
+        if self.index is not None:
+            return f"{self.table.name} 인덱스 {self.index.name} 없음"
+        return f"{self.table.name} 테이블 없음"
+
+
+def _drift(engine: Engine) -> list[_Drift]:
+    """metadata에는 있고 DB에는 없는 것들. 읽기 전용."""
+    inspector = sa.inspect(engine)
+    existing_tables = set(inspector.get_table_names())
+    pending: list[_Drift] = []
+
+    for table in metadata.sorted_tables:
+        if table.name not in existing_tables:
+            # 테이블이 없으면 컬럼·인덱스는 create_all이 함께 만든다.
+            pending.append(_Drift(table))
+            continue
+        existing_cols = {c["name"] for c in inspector.get_columns(table.name)}
+        pending += [
+            _Drift(table, column=col) for col in table.columns if col.name not in existing_cols
+        ]
+        # 인덱스도 동기화한다 — 컬럼만 추가하면 신규 DB(인덱스 포함 생성)와
+        # 기존 DB(컬럼만 추가됨)의 스키마가 갈라진다.
+        existing_idx = {ix["name"] for ix in inspector.get_indexes(table.name)}
+        pending += [_Drift(table, index=ix) for ix in table.indexes if ix.name not in existing_idx]
+
+    return pending
+
+
+def pending_migrations(engine: Engine) -> list[str]:
+    """`migrate()`가 할 일을 사람이 읽을 수 있게 반환한다. **DB를 바꾸지 않는다.**
+
+    비어 있으면 스키마가 코드와 맞다는 뜻이다. 상시 가동 프로세스가 기동 시
+    "무엇이 적용될 것인가"를 로그에 남기는 데 쓴다 — `apps/live.py` 참고.
+    """
+    return [item.describe() for item in _drift(engine)]
+
+
 def migrate(engine: Engine) -> list[str]:
     """Create missing tables/columns; return the actions performed.
 
@@ -355,31 +409,22 @@ def migrate(engine: Engine) -> list[str]:
     "added column" actions instead of a silent skip. Non-additive changes
     (type changes, drops, PK changes) require manual DDL.
     """
-    inspector = sa.inspect(engine)
-    before = set(inspector.get_table_names())
+    pending = _drift(engine)
     actions: list[str] = []
 
-    missing = [t for t in metadata.sorted_tables if t.name not in before]
+    missing = [item.table for item in pending if item.column is None and item.index is None]
     if missing:
         metadata.create_all(engine, tables=missing, checkfirst=False)
         actions += [f"created table {t.name}" for t in missing]
 
     with engine.begin() as conn:
-        for table in metadata.sorted_tables:
-            if table.name not in before:
-                continue
-            existing_cols = {c["name"] for c in inspector.get_columns(table.name)}
-            for col in table.columns:
-                if col.name not in existing_cols:
-                    ddl_type = col.type.compile(engine.dialect)
-                    actions.append(_add_column(conn, table.name, col.name, ddl_type))
-            # 인덱스도 동기화한다 — 컬럼만 추가하면 신규 DB(인덱스 포함 생성)와
-            # 기존 DB(컬럼만 추가됨)의 스키마가 갈라진다.
-            existing_idx = {ix["name"] for ix in inspector.get_indexes(table.name)}
-            for index in table.indexes:
-                if index.name not in existing_idx:
-                    index.create(conn)
-                    actions.append(f"created index {index.name}")
+        for item in pending:
+            if item.column is not None:
+                ddl_type = item.column.type.compile(engine.dialect)
+                actions.append(_add_column(conn, item.table.name, item.column.name, ddl_type))
+            elif item.index is not None:
+                item.index.create(conn)
+                actions.append(f"created index {item.index.name}")
 
     return actions
 

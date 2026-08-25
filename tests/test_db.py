@@ -180,3 +180,48 @@ def test_judgment_for_unknown_event_is_rejected(db_engine):
 def test_positions_has_no_high_water_column():
     # 설계 6.5절: high_water는 파생 데이터라 저장하지 않는다.
     assert "high_water" not in {c.name for c in db.positions.columns}
+
+
+# --- 스키마 드리프트 점검 --------------------------------------------------------
+
+
+def test_pending_migrations_is_empty_after_migrate(db_engine):
+    assert db.pending_migrations(db_engine)  # 빈 DB에는 할 일이 있다
+    db.migrate(db_engine)
+
+    assert db.pending_migrations(db_engine) == []
+
+
+def test_pending_migrations_does_not_touch_the_database(db_engine):
+    """점검이 스키마를 고쳐 버리면 '적용 전에 무엇을 할지 남긴다'가 불가능해진다."""
+    before = sorted(sa.inspect(db_engine).get_table_names())
+
+    db.pending_migrations(db_engine)
+
+    assert sorted(sa.inspect(db_engine).get_table_names()) == before
+
+
+def test_pending_migrations_reports_a_missing_column(db_engine):
+    """실제로 두 번 겪은 사고의 회귀 테스트. 테이블은 있고 나중에 추가된 컬럼만
+    없는 DB — 이 상태로 기동하면 장중에 psycopg2 UndefinedColumn으로 터진다
+    (`orders.exit_rule_json`, `stock_candles_1m.source`)."""
+    db.migrate(db_engine)
+    with db_engine.begin() as conn:
+        conn.execute(sa.text("ALTER TABLE stock_candles_1m DROP COLUMN source"))
+
+    assert db.pending_migrations(db_engine) == ["stock_candles_1m.source 컬럼 없음"]
+
+
+def test_migrate_and_pending_migrations_agree(db_engine):
+    """둘이 다른 판정을 쓰면 '점검은 통과했는데 마이그레이션할 게 남았다'는
+    조합이 생겨 점검이 무의미해진다. 그래서 `_drift()` 하나를 공유한다."""
+    db.migrate(db_engine)
+    with db_engine.begin() as conn:
+        conn.execute(sa.text("ALTER TABLE stock_candles_1m DROP COLUMN source"))
+        conn.execute(sa.text("ALTER TABLE stock_candles_1m DROP COLUMN trade_value"))
+
+    pending = db.pending_migrations(db_engine)
+    applied = db.migrate(db_engine)
+
+    assert len(pending) == len(applied) == 2
+    assert db.pending_migrations(db_engine) == []
