@@ -79,7 +79,9 @@ def _record_resolved_positions(engine: Engine, resolved: list[OrderResult]) -> N
     """
     if not resolved:
         return
-    held = frozenset(p.symbol for p in positions_repo.load_all(engine))
+    # 수량까지 넘긴다 — 잔량을 모르면 트림(부분 매도)을 청산으로 오인해
+    # DB 포지션 행을 지워버린다(`engine/fills.py` 규칙 2).
+    held = {p.symbol: p.qty for p in positions_repo.load_all(engine)}
     for change in fills.position_changes(resolved, held=held):
         if isinstance(change, fills.Opened):
             log.info(

@@ -314,3 +314,114 @@ def test_event_id_is_carried_onto_orders():
 def test_invalid_config_is_rejected(kwargs):
     with pytest.raises(ValueError):
         DiffConfig(**kwargs)
+
+
+# --- 매매수량단위 (T7) ------------------------------------------------------
+#
+# 배수가 아닌 수량은 KIS가 거부한다. 백테스트만 체결시키면 실전에서 존재할 수
+# 없는 주문이 성과에 잡힌다 — 그래서 수량을 정하는 유일한 지점에서 막는다.
+
+
+def test_buy_qty_is_floored_to_the_trading_unit():
+    # 자산 1,000만 × 20% = 200만 / 10,000원 = 200주. 단위 30 → 180주로 내림.
+    ctx = make_ctx(closes={"100": 10_000}, trading_units={"100": 30})
+
+    order = to_orders(Target((entry("100", 0.2),)), ctx)[0]
+
+    assert order.qty == 180
+
+
+def test_buy_is_skipped_when_flooring_leaves_nothing():
+    # 목표 수량 20주인데 단위가 100주 → 살 수 있는 배수가 없다. 올림하면
+    # 목표 비중을 5배 초과하므로 주문을 만들지 않는다.
+    ctx = make_ctx(closes={"100": 100_000}, trading_units={"100": 100})
+
+    assert to_orders(Target((entry("100", 0.2),)), ctx) == []
+
+
+def test_partial_sell_qty_is_floored_to_the_trading_unit():
+    # 보유 200주, 목표 100주 → 매도 100주. 단위 30 → 90주로 내림한다.
+    # 올림하면 보유를 넘겨 잔고 부족이 되므로 방향은 항상 내림이다.
+    ctx = make_ctx(
+        closes={"100": 10_000},
+        positions=(make_position("100", 200),),
+        trading_units={"100": 30},
+    )
+
+    order = to_orders(Target((entry("100", 0.1),)), ctx)[0]
+
+    assert order.side is Side.SELL
+    assert order.qty == 90
+
+
+def test_full_exit_ignores_the_trading_unit():
+    # 단주가 남아도 노출은 전부 없앤다 — band·최소금액을 청산에 적용하지
+    # 않는 것과 같은 논리다.
+    ctx = make_ctx(
+        closes={"100": 10_000},
+        positions=(make_position("100", 137),),
+        trading_units={"100": 100},
+    )
+
+    order = to_orders(Target(()), ctx)[0]
+
+    assert order.qty == 137
+
+
+def test_flooring_happens_before_the_min_order_value_gate():
+    # 내림 전 금액은 하한을 넘지만 내림 후에는 못 넘는 경우. 판정을 나중에
+    # 하지 않으면 걸러내려던 부스러기 주문이 그대로 나간다.
+    # 목표 30주(300만원)를 단위 29로 내림 → 29주. 하한을 30주 금액 위로 둔다.
+    ctx = make_ctx(
+        closes={"100": 100_000},
+        trading_units={"100": 29},
+        equity=15_000_000,
+    )
+    config = DiffConfig(min_order_value=2_950_000, no_trade_band=0.0)
+
+    assert to_orders(Target((entry("100", 0.2),)), ctx, config) == []
+
+
+def test_unknown_or_broken_trading_unit_falls_back_to_one():
+    # 마스터에 없는 종목(0/음수 포함)에서 주문이 사라지거나 나눗셈이 터지면
+    # 안 된다 — 압도적으로 흔한 값 1로 진행한다.
+    ctx = make_ctx(closes={"100": 10_000, "200": 10_000}, trading_units={"200": 0})
+
+    orders = to_orders(Target((entry("100", 0.2), entry("200", 0.2))), ctx)
+
+    assert sorted(o.qty for o in orders) == [200, 200]
+
+
+# --- 기준가(ref_price) — 사후 슬리피지 측정의 근거 ---------------------------
+#
+# 주문 시점에 남기지 않으면 나중에 복원할 방법이 없다. 실전 체결이 아무리
+# 쌓여도 기준가가 없으면 `slippage_bps` 자리표시자를 영영 검증할 수 없다.
+
+
+def test_buy_order_carries_the_price_it_was_sized_from():
+    ctx = make_ctx(closes={"100": 10_000})
+
+    order = to_orders(Target((entry("100", 0.2),)), ctx)[0]
+
+    assert order.ref_price == 10_000
+
+
+def test_full_exit_carries_the_reference_price_when_a_bar_exists():
+    # 청산은 IMMEDIATE 시장가라 슬리피지가 가장 크게 나는 쪽이다 — 여기서
+    # 기준가가 빠지면 정작 측정하고 싶은 표본이 사라진다.
+    ctx = make_ctx(closes={"100": 9_000}, positions=(make_position("100", 100),))
+
+    order = to_orders(Target(()), ctx)[0]
+
+    assert order.side is Side.SELL
+    assert order.ref_price == 9_000
+
+
+def test_exit_without_a_bar_still_goes_out_with_no_reference_price():
+    # 시세 조회 실패가 청산을 막는 경로를 남기지 않는다. 측정은 부수적이다.
+    ctx = make_ctx(closes={}, positions=(make_position("100", 100),))
+
+    order = to_orders(Target(()), ctx)[0]
+
+    assert order.qty == 100
+    assert order.ref_price is None

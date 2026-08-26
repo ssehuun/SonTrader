@@ -19,9 +19,24 @@
 ## 현금·정산
 
 - **매수**는 즉시 현금을 차감한다. 살 수 있는 현금(`cash()`, 정산 완료분만)을
-  넘는 매수는 미수를 만들지 않도록 살 수 있는 수량만큼만 체결한다(그마저
-  0이면 거부). 설계 2.6절의 "결제 제약: D+2. 매도 대금 즉시 재사용 시 미수
-  발생 소지"를 실제로 막는 지점이 여기다.
+  넘는 매수는 **주문 전체를 거부한다.** 설계 2.6절의 "결제 제약: D+2. 매도
+  대금 즉시 재사용 시 미수 발생 소지"를 실제로 막는 지점이 여기다.
+
+  **왜 깎지 않고 거부하나** — 2026-08-26까지는 살 수 있는 만큼만 깎아서
+  체결했다. 두 가지 이유로 틀렸다:
+
+  1. **실전 KIS가 그렇게 동작하지 않는다.** 주문가능금액이 모자라면 수량을
+     줄여 받아주는 것이 아니라 **주문 전체를 거부**한다. 깎아서 체결시키면
+     실전에서 존재할 수 없는 포지션이 백테스트 성과에 잡힌다. 실측으로
+     매수 주문 1,466건 중 **435건(29.7%)이 이 경로로 체결**되고 있었다 —
+     이미 거부되던 471건까지 합치면 **61.8%가 실전이라면 안 나갔을 주문**이다.
+  2. **설계가 이미 그렇게 정해 뒀다.** `core/diff.py` 상단: *"현금 부족은
+     주문을 줄이는 게 아니라 **미루는** 문제"*. 미루는 것은 저절로 된다 —
+     다음 사이클에 diff가 같은 차이를 다시 계산해 주문을 재생성하고,
+     그때는 D+2 정산이 풀려 현금이 있을 수 있다.
+
+  **여전히 낙관적이다.** KIS는 시장가 매수의 필요 증거금을 상한가 기준으로
+  잡는 등 여기보다 **더 엄격**할 수 있다. 그 공식을 추측해 넣지는 않았다.
 - **매도**는 보유 수량을 즉시 줄이지만(다음 사이클 전략이 최신 보유 상태를
   봐야 하므로), 대금은 바로 쓸 수 있는 현금이 되지 않는다 — D+settlement_days
   뒤에 정산 대기열에서 풀려나온다. `submit()`을 호출할 때마다 그 시각까지
@@ -106,6 +121,9 @@ class SimBroker:
             symbol: [bar.ts for bar in rows] for symbol, rows in self._bars.items()
         }
         self._config = config or SimBrokerConfig()
+        # 매매수량단위는 여기서 보지 않는다 — 수량을 정하는 책임은 전적으로
+        # `core/diff.py`에 있고(실전과 백테스트가 같은 코드로 정해야 한다),
+        # 이 클래스는 더 이상 수량을 깎지 않는다.
         self._cash = initial_cash
         self._positions: dict[str, BrokerPosition] = {}
         self._pending: list[tuple[date, int]] = []  # (정산일, 입금액)
@@ -183,22 +201,22 @@ class SimBroker:
 
     def _fill_buy(self, order: Order, bar: Bar) -> OrderResult:
         price = bar.open * (1.0 + self._config.slippage_bps / 10_000)
-        qty = order.qty
-        total, commission = _order_cost(price, qty, self._config.commission_rate)
+        total, commission = _order_cost(price, order.qty, self._config.commission_rate)
 
         if total > self._cash:
-            # 미수를 만들지 않는다 — 살 수 있는 만큼만 산다.
-            qty = int(self._cash / (price * (1.0 + self._config.commission_rate)))
-            if qty <= 0:
-                return OrderResult(order=order, status=OrderStatus.REJECTED)
-            total, commission = _order_cost(price, qty, self._config.commission_rate)
+            # 현금이 모자라면 **주문 전체를 거부**한다 — 실전 KIS가 그렇게
+            # 하고, 설계도 "줄이지 말고 미루라"고 정해 뒀다(위 docstring).
+            # 다음 사이클에 diff가 같은 주문을 다시 만들며, 그때는 D+2 정산이
+            # 풀려 현금이 있을 수 있다.
+            return OrderResult(order=order, status=OrderStatus.REJECTED)
 
         self._cash -= total
         self._total_costs += commission
-        self._add_position(order.symbol, qty, price)
-        status = OrderStatus.FILLED if qty == order.qty else OrderStatus.PARTIAL
-        fill = _fill(order, price, qty, bar.ts)
-        return OrderResult(order=order, status=status, fills=(fill,))
+        self._add_position(order.symbol, order.qty, price)
+        # 현금 부족은 이제 거부이고 유동성 부족은 모델링하지 않으므로, 매수
+        # 체결은 전량 아니면 없음이다. PARTIAL이 나올 경로가 남아 있지 않다.
+        fill = _fill(order, price, order.qty, bar.ts)
+        return OrderResult(order=order, status=OrderStatus.FILLED, fills=(fill,))
 
     def _fill_sell(self, order: Order, bar: Bar) -> OrderResult:
         held = self._positions.get(order.symbol)

@@ -40,6 +40,7 @@ def make_order(
     qty: int = 100,
     event_id: str | None = None,
     idempotency_key: str | None = None,
+    ref_price: int | None = None,
 ) -> Order:
     return Order(
         idempotency_key=idempotency_key or f"{symbol}:{side.value}:{NOW.isoformat()}",
@@ -50,6 +51,7 @@ def make_order(
         urgency=Urgency.NEXT_OPEN,
         ts=NOW,
         event_id=event_id,
+        ref_price=ref_price,
     )
 
 
@@ -208,3 +210,28 @@ def test_list_unresolved_excludes_terminal_statuses(db_engine):
         orders.insert(db_engine, order, order_id=f"ord-{i}", status=status, created_at=NOW)
 
     assert orders.list_unresolved(db_engine) == []
+
+
+def test_ref_price_survives_a_round_trip(db_engine):
+    """기준가가 DB를 왕복해야 사후 슬리피지 측정이 성립한다 (apps/slippage.py)."""
+    db.migrate(db_engine)
+    order = make_order(ref_price=71_000)
+    orders.insert(db_engine, order, order_id="o1", status=OrderStatus.SUBMITTED, created_at=NOW)
+
+    record = orders.get(db_engine, "o1")
+
+    assert record is not None
+    assert record.ref_price == 71_000
+
+
+def test_ref_price_is_optional(db_engine):
+    """봉 없이 나간 청산 주문에는 기준가가 없다 — 그래도 기록은 돼야 한다."""
+    db.migrate(db_engine)
+    orders.insert(
+        db_engine, make_order(), order_id="o1", status=OrderStatus.SUBMITTED, created_at=NOW
+    )
+
+    record = orders.get(db_engine, "o1")
+
+    assert record is not None
+    assert record.ref_price is None

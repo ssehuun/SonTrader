@@ -44,6 +44,9 @@ class OrderRecord:
     broker_order_no: str | None
     created_at: datetime
     exit_rule: ExitRule | None = None
+    # 의사결정 시점의 기준가. 체결가와의 차이가 실측 슬리피지가 된다
+    # (`apps/slippage.py`). 옛 행에는 없어 None일 수 있다.
+    ref_price: int | None = None
 
 
 def find_by_idempotency_key(engine: Engine, idempotency_key: str) -> OrderRecord | None:
@@ -88,6 +91,7 @@ def insert(
                 broker_order_no=broker_order_no,
                 created_at=created_at,
                 exit_rule_json=order.exit_rule.to_dict() if order.exit_rule else None,
+                ref_price=order.ref_price,
             )
         )
 
@@ -167,4 +171,5 @@ def _to_record(row) -> OrderRecord:
         broker_order_no=row.broker_order_no,
         created_at=row.created_at,
         exit_rule=ExitRule.from_dict(row.exit_rule_json) if row.exit_rule_json else None,
+        ref_price=row.ref_price,
     )

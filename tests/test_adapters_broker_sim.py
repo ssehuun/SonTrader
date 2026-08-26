@@ -202,15 +202,35 @@ def test_total_costs_excludes_slippage():
 # --- 미수 방지 (현금 클램핑) -----------------------------------------------------
 
 
-def test_buy_beyond_available_cash_is_clamped_to_an_affordable_quantity():
+def test_buy_beyond_available_cash_is_rejected_outright_not_shrunk():
+    """실전 KIS는 주문가능금액이 모자라면 **주문 전체를 거부**한다.
+
+    수량을 깎아 체결시키면 실전에 존재할 수 없는 포지션이 성과에 잡힌다.
+    설계도 같은 말을 한다 — "현금 부족은 주문을 줄이는 게 아니라 미루는
+    문제"(`core/diff.py`). 미루는 것은 다음 사이클 diff가 알아서 한다.
+
+    실측(2026-08-26): 이 경로로 체결되던 매수가 1,466건 중 435건(29.7%)이었다.
+    """
     broker = SimBroker({SYMBOL: SERIES}, initial_cash=500_000, config=ZERO_COST)
 
+    # BAR1 시가 10,500원 × 100주 = 1,050,000원 > 현금 500,000원.
     [result] = broker.submit([make_order(SYMBOL, Side.BUY, 100, BAR0.ts)], now=BAR0.ts)
 
-    # BAR1 시가 10,500원 → 500,000 / 10,500 = 47.6 → 47주까지만.
-    assert result.status is OrderStatus.PARTIAL
-    assert result.fills[0].qty == 47
-    assert broker.cash() == 500_000 - 47 * 10_500
+    assert result.status is OrderStatus.REJECTED
+    assert result.fills == ()
+    assert broker.cash() == 500_000  # 현금은 손대지 않는다
+    assert broker.positions() == []
+
+
+def test_an_affordable_buy_still_fills_in_full():
+    """거부는 **못 살 때만**이다. 살 수 있으면 그대로 전량 체결한다."""
+    broker = SimBroker({SYMBOL: SERIES}, initial_cash=500_000, config=ZERO_COST)
+
+    # BAR1 시가 10,500원 × 40주 = 420,000원 ≤ 500,000원.
+    [result] = broker.submit([make_order(SYMBOL, Side.BUY, 40, BAR0.ts)], now=BAR0.ts)
+
+    assert result.status is OrderStatus.FILLED
+    assert result.fills[0].qty == 40
 
 
 def test_buy_with_zero_affordable_quantity_is_rejected():

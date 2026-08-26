@@ -60,6 +60,7 @@ def build_context(
     cash: int,
     watchlist: tuple[str, ...],
     judge: JudgeFn,
+    watchlist_ranks: Mapping[str, int] | None = None,
     event_lookback: timedelta = _DEFAULT_EVENT_LOOKBACK,
     bar_history: int = _DEFAULT_BAR_HISTORY,
 ) -> Context:
@@ -91,7 +92,31 @@ def build_context(
         used_event_ids=used_event_ids,
         last_exit_at=last_exit_at,
         pending_order_symbols=_load_pending_order_symbols(engine),
+        trading_units=_load_trading_units(engine, symbols),
+        watchlist_ranks=dict(watchlist_ranks or {}),
     )
+
+
+def _load_trading_units(engine: Engine, symbols: Sequence[str]) -> Mapping[str, int]:
+    """종목 → 매매수량단위. 배수가 아닌 수량은 KIS가 거부한다 (`core/diff.py`).
+
+    마스터에 없는 종목은 아예 넣지 않는다 — `Context.trading_unit()`이 1로
+    받는다. 조회 실패로 매매가 멈추는 것보다 낫다.
+    """
+    if not symbols:
+        return {}
+    columns = db.symbol_master.c
+    result: dict[str, int] = {}
+    with engine.connect() as conn:
+        for chunk_start in range(0, len(symbols), _SYMBOL_CHUNK):
+            chunk = symbols[chunk_start : chunk_start + _SYMBOL_CHUNK]
+            rows = conn.execute(
+                sa.select(columns.symbol, columns.trading_unit).where(columns.symbol.in_(chunk))
+            )
+            for symbol, unit in rows:
+                if unit is not None and unit >= 1:
+                    result[symbol] = unit
+    return result
 
 
 def _load_pending_order_symbols(engine: Engine) -> frozenset[str]:

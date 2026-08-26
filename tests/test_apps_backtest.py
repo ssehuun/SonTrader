@@ -321,3 +321,74 @@ def test_run_backtest_ignores_events_for_symbols_outside_the_universe(db_engine)
     )
 
     assert result.fills == ()
+
+
+# --- 매매수량단위 (T7) ------------------------------------------------------
+
+
+def test_replay_floors_entry_quantity_to_the_trading_unit():
+    """진입 수량이 배수로 내려간다. 배수가 아니면 실전에서 KIS가 거부한다."""
+    bars = {
+        SYMBOL: [
+            make_bar(SYMBOL, DAY0, open=9_800, close=10_000),
+            make_bar(SYMBOL, DAY1, open=10_500, close=10_600),
+        ]
+    }
+    watchlists = {day: [SYMBOL] for day in (DAY0, DAY1)}
+    events = {DAY0: [make_event("E1", SYMBOL, DAY0)]}
+
+    result = replay(
+        watchlists=watchlists,
+        bars=bars,
+        events=events,
+        initial_cash=10_000_000,
+        judge=always_enter(),
+        broker_config=ZERO_COST,
+        trading_units={SYMBOL: 30},
+    )
+
+    # 단위가 1이면 200주(= test_full_loop...와 동일). 30 단위 → 180주.
+    assert result.fills[0].qty == 180
+
+
+def test_run_backtest_reads_trading_units_from_symbol_master(db_engine):
+    db.migrate(db_engine)
+    seed_watchlist(db_engine, DAY0, [SYMBOL])
+    seed_watchlist(db_engine, DAY1, [SYMBOL])
+    seed_candles(db_engine, SYMBOL, [(DAY0, 9_800, 10_000), (DAY1, 10_500, 10_600)])
+    seed_event(db_engine, "E1", SYMBOL, DAY0)
+    with db_engine.begin() as conn:
+        conn.execute(
+            db.symbol_master.insert().values(
+                symbol=SYMBOL,
+                name="테스트",
+                market="KOSPI",
+                trading_unit=30,
+                updated_at=datetime.combine(DAY0, time.min),
+            )
+        )
+
+    result = run_backtest(
+        db_engine,
+        start=DAY0,
+        end=DAY1,
+        initial_cash=10_000_000,
+        judge=always_enter(),
+        broker_config=ZERO_COST,
+    )
+
+    assert result.fills[0].qty == 180
+
+
+def test_an_orphaned_broker_position_raises_instead_of_being_skipped():
+    """브로커에 있는데 진입 정보가 없는 종목은 **조용히 넘어가면 안 된다.**
+
+    이 상태가 2026-08-26에 발견된 부기 버그의 최종 증상이다 — 전략에게
+    보이지 않는 채로 실제 보유가 남아 청산 규칙이 영영 안 걸리고, 게이트의
+    슬롯 계산에서도 빠져 동시보유 상한이 무너졌다.
+    """
+    from sontrader.adapters.broker import BrokerPosition
+    from sontrader.apps.backtest import _reconstruct_positions
+
+    with pytest.raises(ValueError, match="orphaned position"):
+        _reconstruct_positions({SYMBOL: BrokerPosition(SYMBOL, 10, 10_000.0)}, held={})

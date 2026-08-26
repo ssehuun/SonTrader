@@ -109,6 +109,14 @@ orders = Table(
     Column("event_id", String(32), ForeignKey("events.event_id"), comment="청산 주문은 NULL"),
     Column("broker_order_no", String(20), comment="KIS 주문번호(ODNO) — 미체결 조회·취소용"),
     Column(
+        "ref_price",
+        Integer,
+        comment="의사결정 시점의 기준가 (주문을 만든 사이클의 마지막 완성 봉 종가). "
+        "체결가와의 차이가 곧 실측 슬리피지 — 이게 없으면 실전 체결이 쌓여도 "
+        "`SimBrokerConfig.slippage_bps`를 영영 검증할 수 없다 (apps/slippage.py). "
+        "봉이 없어 기준가를 모른 채 나간 청산 주문은 NULL",
+    ),
+    Column(
         "exit_rule_json",
         _JSON,
         comment="체결되면 붙일 청산 조건 (매수만). 체결 확인이 다음 사이클로 밀리면 "

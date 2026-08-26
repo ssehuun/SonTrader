@@ -375,3 +375,74 @@ def test_pending_sell_stops_a_duplicate_liquidation(db_engine):
     assert [
         o.symbol for o in to_orders(Target(()), replace(ctx, pending_order_symbols=frozenset()))
     ] == ["005930"]
+
+
+# --- 매매수량단위 (T7) ------------------------------------------------------
+#
+# 실전 Context에도 백테스트와 **같은 값**이 실려야 한다. 한쪽만 알면
+# 두 경로가 서로 다른 수량을 내고 북극성이 깨진다.
+
+
+def seed_master(db_engine, *, symbol: str, trading_unit: int | None) -> None:
+    with db_engine.begin() as conn:
+        conn.execute(
+            db.symbol_master.insert().values(
+                symbol=symbol,
+                name=f"종목{symbol}",
+                market="KOSPI",
+                trading_unit=trading_unit,
+                updated_at=NOW,
+            )
+        )
+
+
+def test_build_context_loads_trading_units_from_symbol_master(db_engine):
+    db.migrate(db_engine)
+    seed_bar(db_engine, symbol="005930", day=date(2026, 3, 9))
+    seed_master(db_engine, symbol="005930", trading_unit=10)
+
+    ctx = build_context(
+        db_engine,
+        now=NOW,
+        positions=(),
+        cash=1_000_000,
+        watchlist=("005930",),
+        judge=lambda event: None,
+    )
+
+    assert ctx.trading_unit("005930") == 10
+
+
+def test_build_context_falls_back_to_one_when_master_row_is_missing(db_engine):
+    """마스터에 없는 종목(신규 상장 직후 등) 때문에 매매가 멈추면 안 된다."""
+    db.migrate(db_engine)
+    seed_bar(db_engine, symbol="005930", day=date(2026, 3, 9))
+
+    ctx = build_context(
+        db_engine,
+        now=NOW,
+        positions=(),
+        cash=1_000_000,
+        watchlist=("005930",),
+        judge=lambda event: None,
+    )
+
+    assert ctx.trading_unit("005930") == 1
+
+
+def test_build_context_ignores_a_null_trading_unit(db_engine):
+    """마스터 파싱이 빈 칸을 NULL로 남긴 경우도 1로 본다."""
+    db.migrate(db_engine)
+    seed_bar(db_engine, symbol="005930", day=date(2026, 3, 9))
+    seed_master(db_engine, symbol="005930", trading_unit=None)
+
+    ctx = build_context(
+        db_engine,
+        now=NOW,
+        positions=(),
+        cash=1_000_000,
+        watchlist=("005930",),
+        judge=lambda event: None,
+    )
+
+    assert ctx.trading_unit("005930") == 1

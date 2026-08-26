@@ -36,8 +36,16 @@ DB에 저장된 일봉(`stock_candles_1d`)과 워치리스트 스냅샷
 **3. `equity`는 현금 + D+2 정산 대기액 + 보유분 시가평가액이다.** 정산
 대기액을 목표 비중 산출(`ctx.equity`)에 포함시키는 이유: "5종목 균등
 20%"는 총자산 기준 배분 의도이지 유동성 제약이 아니다. 유동성 제약(정산
-전 현금 사용 불가)은 이미 `SimBroker`의 매수 클램핑이 별도로 강제한다
-(구조 원칙 — core/전략은 의도를, 어댑터는 실제 제약을 담당).
+전 현금 사용 불가)은 `SimBroker`가 별도로 강제한다 — 현금이 모자라는
+매수는 **주문 전체를 거부**한다(실전 KIS와 같다). 구조 원칙 그대로
+core/전략은 의도를, 어댑터는 실제 제약을 담당한다.
+
+그 결과 **매수 주문의 상당수가 거부된다.** 실측(2026-08-26) 1,466건 중
+906건(61.8%)이다. 거부는 실패가 아니라 "미룸"이다 — 다음 사이클에 diff가
+같은 차이를 다시 계산해 주문을 재생성하고, 그때는 정산이 풀려 있을 수
+있다(`core/diff.py` 상단: "현금 부족은 주문을 줄이는 게 아니라 미루는 문제").
+다만 이 비율이 이렇게 높다는 것은 **목표 비중이 가용 현금과 구조적으로
+어긋나 있다**는 뜻이고, 그 자체가 `docs/system/02-매매-정교화.md` T21의 근거다.
 
 **4. LLM 판단 계층(6단계)이 없으므로 `judge` 콜백을 주입받는다.**
 `Callable[[Event], Judgment | None]` — 지정하지 않으면 아무 이벤트도
@@ -133,7 +141,7 @@ def run_backtest(
     broker_config: SimBrokerConfig | None = None,
     cycle_config: CycleConfig | None = None,
 ) -> BacktestResult:
-    watchlists = _load_watchlists(engine, start, end)
+    watchlists, watchlist_ranks = _load_watchlists(engine, start, end)
     if not watchlists:
         raise BacktestError(
             f"no watchlist snapshots between {start} and {end} — "
@@ -144,6 +152,7 @@ def run_backtest(
     )
     bars = _load_bars(engine, symbols, start, end)
     events = _load_events(engine, symbols, start, end)
+    trading_units = _load_trading_units(engine, symbols)
     return replay(
         watchlists=watchlists,
         bars=bars,
@@ -152,6 +161,8 @@ def run_backtest(
         judge=judge,
         broker_config=broker_config,
         cycle_config=cycle_config,
+        trading_units=trading_units,
+        watchlist_ranks=watchlist_ranks,
     )
 
 
@@ -164,6 +175,8 @@ def replay(
     judge: JudgeFn | None = None,
     broker_config: SimBrokerConfig | None = None,
     cycle_config: CycleConfig | None = None,
+    trading_units: Mapping[str, int] | None = None,
+    watchlist_ranks: Mapping[date, Mapping[str, int]] | None = None,
 ) -> BacktestResult:
     dates = sorted(watchlists)
     if not dates:
@@ -178,6 +191,8 @@ def replay(
         cycle_config = replace(cycle_config, check_killswitch=False)
 
     judge = judge or (lambda _event: None)
+    units = dict(trading_units or {})
+    ranks_by_day = watchlist_ranks or {}
     bar_view = InMemoryBarView(bars)
     broker = SimBroker(bars, initial_cash=initial_cash, config=broker_config)
     deps = Deps(broker=broker)
@@ -219,10 +234,23 @@ def replay(
             equity=equity,
             used_event_ids=frozenset(used_event_ids),
             last_exit_at=dict(last_exit_at),
+            trading_units=units,
+            watchlist_ranks=ranks_by_day.get(day, {}),
         )
 
         result = run_cycle(ctx, deps, cycle_config)
-        _apply_fills(result, held, used_event_ids, last_exit_at, fills, closed_trades)
+        # `broker_positions`는 이 사이클 체결을 반영하기 **전**의 잔고다
+        # (루프 맨 위에서 찍었다). `engine/fills.py`가 "포지션이 비었는가"를
+        # 판정하려면 이 시점의 수량이 필요하다.
+        _apply_fills(
+            result,
+            held,
+            used_event_ids,
+            last_exit_at,
+            fills,
+            closed_trades,
+            held_qty={symbol: bp.qty for symbol, bp in broker_positions.items()},
+        )
 
         rejections.extend((day, r) for r in result.rejections)
         equity_curve.append((day, equity))
@@ -242,6 +270,23 @@ def replay(
 def _reconstruct_positions(
     broker_positions: Mapping[str, object], held: Mapping[str, _HeldMeta]
 ) -> tuple[Position, ...]:
+    """브로커 잔고 + 우리 쪽 메타데이터 → 전략이 볼 `Position` 목록.
+
+    **고아 포지션을 조용히 넘기지 않는다.** 브로커에는 수량이 있는데 `held`에
+    진입 정보가 없으면, 그 종목은 전략에게 보이지 않으면서 실제로는 보유
+    중이다 — 청산 규칙이 영영 안 걸리고, 게이트의 슬롯 계산에서도 빠져
+    상한이 무너진다. 2026-08-26에 발견된 부기 버그가 정확히 이 상태를
+    만들었고, 그 결과 전체 사이클의 94.9%에서 동시보유 상한 5가 깨져 있었다.
+    성과 수치가 통째로 무효가 될 만큼 비싼 버그였으므로, 되돌아오면
+    **즉시 터지게** 한다.
+    """
+    orphans = sorted(set(broker_positions) - set(held))
+    if orphans:
+        raise ValueError(
+            f"broker holds {orphans} but no entry metadata is tracked — "
+            "orphaned position (see engine/fills.py rule 2)"
+        )
+
     positions = []
     for symbol, meta in held.items():
         bp = broker_positions.get(symbol)
@@ -260,12 +305,25 @@ def _reconstruct_positions(
     return tuple(positions)
 
 
-def _apply_fills(result, held, used_event_ids, last_exit_at, fills_out, closed_trades_out) -> None:
+def _apply_fills(
+    result,
+    held,
+    used_event_ids,
+    last_exit_at,
+    fills_out,
+    closed_trades_out,
+    *,
+    held_qty: Mapping[str, int],
+) -> None:
     """체결을 메모리 부기에 반영한다.
 
     포지션 변경 판정 자체는 `engine/fills.py`가 한다 — 실전(`apps/live.py`)이
     같은 규칙을 DB에 반영하므로, 규칙을 여기 복제하면 두 경로가 갈라진다.
     여기서는 백테스트에만 필요한 것(체결 로그, 종료된 거래 기록)을 더한다.
+
+    `held_qty`는 이번 체결 **전**의 보유 수량이다. 트림(부분 매도)을 청산으로
+    오인하지 않으려면 잔량이 필요하다 — 오인하면 여기서 `held.pop()`이 돌아
+    브로커에 남은 수량이 전략에게 보이지 않는 고아가 된다.
     """
     for order_result in result.order_results:
         if order_result.status in (OrderStatus.FILLED, OrderStatus.PARTIAL):
@@ -273,7 +331,7 @@ def _apply_fills(result, held, used_event_ids, last_exit_at, fills_out, closed_t
             if order_result.order.side is Side.BUY and order_result.order.event_id is not None:
                 used_event_ids.add(order_result.order.event_id)
 
-    for change in fills.position_changes(result.order_results, held=frozenset(held)):
+    for change in fills.position_changes(result.order_results, held=held_qty):
         if isinstance(change, fills.Opened):
             held[change.symbol] = _HeldMeta(
                 change.entered_at, change.entry_price, change.exit_rule, change.event_id
@@ -301,18 +359,28 @@ def _apply_fills(result, held, used_event_ids, last_exit_at, fills_out, closed_t
 # --- DB 로딩 ---------------------------------------------------------------
 
 
-def _load_watchlists(engine: Engine, start: date, end: date) -> dict[date, list[str]]:
+def _load_watchlists(
+    engine: Engine, start: date, end: date
+) -> tuple[dict[date, list[str]], dict[date, dict[str, int]]]:
+    """(날짜 → 순위순 종목, 날짜 → 종목별 **저장된** rank).
+
+    rank를 따로 돌려주는 이유: 위치+1은 저장된 순위가 아니다. 히스테리시스
+    (30/42)로 순위에 구멍이 뚫려 있어 실측 1,864일 중 1,793일이 1..N 연속이
+    아니다 (`core.types.Context.watchlist_ranks` 참고).
+    """
     columns = db.watchlist_snapshots.c
     result: dict[date, list[str]] = {}
+    ranks: dict[date, dict[str, int]] = {}
     with engine.connect() as conn:
         rows = conn.execute(
-            sa.select(columns.date, columns.symbol)
+            sa.select(columns.date, columns.symbol, columns.rank)
             .where(columns.date >= start, columns.date <= end)
             .order_by(columns.date, columns.rank)
         )
-        for day, symbol in rows:
+        for day, symbol, rank in rows:
             result.setdefault(day, []).append(symbol)
-    return result
+            ranks.setdefault(day, {})[symbol] = rank
+    return result, ranks
 
 
 def _load_bars(
@@ -352,6 +420,30 @@ def _load_bars(
                         volume=v or 0,
                     )
                 )
+    return result
+
+
+def _load_trading_units(engine: Engine, symbols: Sequence[str]) -> dict[str, int]:
+    """종목 → 매매수량단위.
+
+    **오늘의 마스터 스냅샷이다.** `symbol_master`는 일별 이력이 없어(T12)
+    2019년 백테스트에도 2026년 값을 쓴다 — 과거에 단위가 달랐다면 그 구간은
+    틀린다. 생존 편향과 같은 뿌리의 한계라 T12가 풀려야 정확해진다.
+    지금은 전 종목이 1이라 실질 차이가 없다(2026-08-26 실측).
+    """
+    result: dict[str, int] = {}
+    if not symbols:
+        return result
+    columns = db.symbol_master.c
+    with engine.connect() as conn:
+        for chunk_start in range(0, len(symbols), _SYMBOL_CHUNK):
+            chunk = symbols[chunk_start : chunk_start + _SYMBOL_CHUNK]
+            rows = conn.execute(
+                sa.select(columns.symbol, columns.trading_unit).where(columns.symbol.in_(chunk))
+            )
+            for symbol, unit in rows:
+                if unit is not None and unit >= 1:
+                    result[symbol] = unit
     return result
 
 

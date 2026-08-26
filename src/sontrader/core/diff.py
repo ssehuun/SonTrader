@@ -28,6 +28,20 @@ NEXT_OPEN 진입의 실제 체결가는 다음 시가이므로 수량은 근사�
 나간다** — 수량이 포지션에 이미 있기 때문이다. 시세 조회 실패가 청산을 막는
 경로를 남기지 않는다.
 
+## 매매수량단위 (`ctx.trading_unit`)
+
+KIS는 주문 수량이 `symbol_master.trading_unit`의 배수가 아니면 거부한다.
+수량이 정해지는 곳이 여기 하나뿐이므로 여기서 맞춘다 — 어댑터에서 고치면
+백테스트와 실전이 서로 다른 수량을 쓰게 되어 북극성이 깨진다.
+
+**항상 내림한다.** 매수는 올림하면 가용 현금을 넘길 수 있고, 부분 매도는
+올림하면 보유 수량을 넘겨 잔고 부족이 된다. 내림해서 0이 되면 주문을
+만들지 않는다(다음 사이클에 자산이 늘면 다시 시도한다).
+
+**전량 청산에는 적용하지 않는다.** 배수가 아니라는 이유로 노출을 남기면
+안 되고, 단주(端株)는 실제로 매도가 가능하다 — band·최소금액을 청산에
+적용하지 않는 것과 같은 논리다.
+
 ## 멱등 키
 
 `{symbol}:{side}:{cycle_ts}` — 한 사이클 안에서 결정적이다. 네트워크 재시도나
@@ -70,6 +84,18 @@ class DiffConfig:
             raise ValueError(f"min_order_value must be >= 0: {self.min_order_value}")
 
 
+def floor_to_trading_unit(qty: int, unit: int) -> int:
+    """`unit`의 배수로 내림한다. 매매수량단위 정책의 단일 출처.
+
+    `adapters/broker_sim.py`도 이 함수를 쓴다 — 시뮬레이터가 현금 부족으로
+    수량을 깎을 때 배수를 깨면, 백테스트만 체결되고 실전은 거부되는 주문이
+    다시 생긴다.
+    """
+    if unit <= 1:
+        return qty
+    return qty - (qty % unit)
+
+
 def to_orders(target: Target, ctx: Context, config: DiffConfig | None = None) -> list[Order]:
     """목표와 현재 포지션의 차이를 주문 목록으로 변환한다.
 
@@ -90,6 +116,9 @@ def to_orders(target: Target, ctx: Context, config: DiffConfig | None = None) ->
         if item is not None and item.weight > 0.0:
             continue
         urgency = item.urgency if item is not None else Urgency.IMMEDIATE
+        # 청산은 봉이 없어도 나간다(위 참고). 기준가는 **있으면 싣고 없으면 만다** —
+        # 사후 슬리피지 측정용일 뿐이라, 이것 때문에 청산이 막히면 안 된다.
+        exit_bar = ctx.bars.latest(pos.symbol)
         exits.append(
             _order(
                 symbol=pos.symbol,
@@ -98,6 +127,7 @@ def to_orders(target: Target, ctx: Context, config: DiffConfig | None = None) ->
                 urgency=urgency,
                 now=ctx.now,
                 event_id=pos.event_id,
+                ref_price=exit_bar.close if exit_bar is not None else None,
             )
         )
 
@@ -128,7 +158,14 @@ def to_orders(target: Target, ctx: Context, config: DiffConfig | None = None) ->
         if delta == 0:
             continue
 
-        value = abs(delta) * price
+        # 매매수량단위에 맞춰 내림한다. band·최소금액 판정보다 **먼저** 해야
+        # 한다 — 통과시킨 뒤에 줄이면 실제로 나가는 주문이 두 하한을 밑돌 수
+        # 있고, 그러면 두 게이트가 걸러내려던 부스러기 주문이 그대로 나간다.
+        qty = floor_to_trading_unit(abs(delta), ctx.trading_unit(item.symbol))
+        if qty == 0:
+            continue
+
+        value = qty * price
         if value < cfg.min_order_value:
             continue
         if value / ctx.equity < cfg.no_trade_band:
@@ -139,13 +176,16 @@ def to_orders(target: Target, ctx: Context, config: DiffConfig | None = None) ->
             _order(
                 symbol=item.symbol,
                 side=side,
-                qty=abs(delta),
+                qty=qty,
                 urgency=item.urgency,
                 now=ctx.now,
                 event_id=item.event_id,
                 # 매수만 청산 조건을 싣는다. 체결 시차 때문에 주문이 직접
                 # 들고 가야 한다 — `core.types.Order` 참고.
                 exit_rule=item.exit_rule if side is Side.BUY else None,
+                # 수량을 환산한 바로 그 가격을 남긴다 — 사후 슬리피지 측정의
+                # 기준가 (`apps/slippage.py`).
+                ref_price=price,
             )
         )
 
@@ -161,6 +201,7 @@ def _order(
     now: datetime,
     event_id: str | None,
     exit_rule: ExitRule | None = None,
+    ref_price: int | None = None,
 ) -> Order:
     # 진입도 청산도 시장가다. 차이는 타이밍(urgency)뿐이며, 그 해석은 집행기가
     # 한다 — IMMEDIATE는 장중 즉시, NEXT_OPEN은 다음 개장 시가 (설계 1.3절).
@@ -174,4 +215,5 @@ def _order(
         ts=now,
         event_id=event_id,
         exit_rule=exit_rule,
+        ref_price=ref_price,
     )
