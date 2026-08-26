@@ -773,7 +773,12 @@ def _build_cached_judge(engine, model: str):
     return judge, misses
 
 
-def _build_cycle_config(entry_trigger: str, cooldown_days: int | None):
+def _build_cycle_config(
+    entry_trigger: str,
+    cooldown_days: int | None,
+    stop_basis: str = "close",
+    entry_min_rank: int = 1,
+):
     """진입 트리거와 쿨다운만 바꾼 사이클 설정.
 
     워치리스트 모드는 event_id가 없어 게이트의 동일이벤트 차단이 걸리지
@@ -782,10 +787,19 @@ def _build_cycle_config(entry_trigger: str, cooldown_days: int | None):
     """
     from sontrader.core.gate import GateConfig
     from sontrader.core.strategy import EntryTrigger, StrategyConfig
+    from sontrader.core.types import ExitRule, StopBasis
     from sontrader.engine.loop import CycleConfig
 
     trigger = EntryTrigger.WATCHLIST_RANK if entry_trigger == "watchlist" else EntryTrigger.EVENT
-    config = CycleConfig(strategy=StrategyConfig(entry_trigger=trigger))
+    # 워치리스트 모드 진입에 붙일 청산 조건. EVENT 모드는 LLM이 규칙을 실어
+    # 보내므로 여기서 정하지 않는다.
+    config = CycleConfig(
+        strategy=StrategyConfig(
+            entry_trigger=trigger,
+            exit_rule=ExitRule(stop_basis=StopBasis(stop_basis)),
+            entry_min_rank=entry_min_rank,
+        )
+    )
     if cooldown_days is not None:
         config = replace(config, gate=GateConfig(cooldown_days=cooldown_days))
     return config
@@ -799,9 +813,13 @@ def _run_backtest(
     llm_model: str,
     entry_trigger: str,
     cooldown_days: int | None,
+    slippage_bps: float | None = None,
+    stop_basis: str = "close",
+    entry_min_rank: int = 1,
 ) -> int:
     from sqlalchemy.exc import SQLAlchemyError
 
+    from sontrader.adapters.broker_sim import SimBrokerConfig
     from sontrader.apps.backtest import BacktestError, run_backtest
     from sontrader.apps.report import build_report
     from sontrader.data.db import migrate
@@ -835,19 +853,31 @@ def _run_backtest(
         misses = None
         if use_llm:
             judge, misses = _build_cached_judge(engine, llm_model)
-        cycle_config = _build_cycle_config(entry_trigger, cooldown_days)
+        cycle_config = _build_cycle_config(entry_trigger, cooldown_days, stop_basis, entry_min_rank)
+        if entry_min_rank > 1:
+            print(f"진입 순위 하한: rank >= {entry_min_rank} (기본 1 = 제한 없음)")
+        if stop_basis != "close":
+            print(f"스톱 판정 기준: 봉 {stop_basis} (기본 close)")
         if entry_trigger == "watchlist":
             print("진입 트리거: 워치리스트 순위 (이벤트·LLM 미사용)")
         elif judge is None:
             print("주의: --llm 미지정 — 이번 실행은 신규 진입 없이 청산 로직만 검증합니다.")
         else:
             print(f"진입 판단: 저장된 LLM 판단만 사용 (model={llm_model}, API 호출 없음)")
+        broker_config = None
+        if slippage_bps is not None:
+            # 자리표시자(10bp)에 결론이 얼마나 기대고 있는지 재기 위한 손잡이다.
+            # 실측치가 나오기 전까지 기본값은 바꾸지 않는다 — 근거 없는 숫자를
+            # 기본값에 넣으면 그게 곧 은닉된 전략 결정이 된다.
+            broker_config = SimBrokerConfig(slippage_bps=slippage_bps)
+            print(f"슬리피지 {slippage_bps:g}bp (기본 {SimBrokerConfig().slippage_bps:g}bp 대체)")
         result = run_backtest(
             engine,
             start=start,
             end=end,
             initial_cash=initial_cash,
             judge=judge,
+            broker_config=broker_config,
             cycle_config=cycle_config,
         )
         final_equity = result.equity_curve[-1][1] if result.equity_curve else initial_cash
@@ -877,6 +907,58 @@ def _run_backtest(
         return 1
     finally:
         engine.dispose()
+
+
+def _run_slippage(since_str: str | None) -> int:
+    """실측 슬리피지를 출력한다. 표본이 없으면 **없다고 말한다.**
+
+    0.0을 찍으면 "슬리피지가 없다"로 읽혀 자리표시자보다 나쁜 거짓말이 된다.
+    """
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from sontrader.apps.slippage import SlippageReport, load_live_samples
+
+    since = None
+    if since_str is not None:
+        try:
+            since = _parse_date_arg(since_str)
+        except ValueError:
+            print("error: --since must be YYYYMMDD", file=sys.stderr)
+            return 2
+
+    engine = _open_engine()
+    if engine is None:
+        return 2
+    try:
+        report = SlippageReport.of(load_live_samples(engine, since=since))
+    except SQLAlchemyError as exc:
+        print(f"error: DB access failed: {_first_line(exc)}", file=sys.stderr)
+        return 1
+    finally:
+        engine.dispose()
+
+    if report.overall.sample_size == 0:
+        print("표본 0건 — 실측 슬리피지를 계산할 수 없습니다.")
+        print(
+            "  기준가(orders.ref_price)와 체결(fills)이 둘 다 있는 주문이 필요합니다. "
+            "실전/모의 매매를 돌려 체결이 쌓이면 그때 다시 실행하세요."
+        )
+        return 0
+
+    print("실측 슬리피지 — 의사결정 기준가 대비 체결가 (+ = 불리)")
+    print("주의: 순수 슬리피지가 아니라 집행 손실입니다 — 의사결정~체결 사이의")
+    print("      가격 변동(밤샘 갭 등)이 섞여 있습니다 (apps/slippage.py 참고).")
+    for label, stats in (("전체", report.overall), ("매수", report.buys), ("매도", report.sells)):
+        if stats.sample_size == 0:
+            print(f"  {label}: 표본 없음")
+            continue
+        print(
+            f"  {label}: n={stats.sample_size} "
+            f"중앙값 {stats.median_bps:+.1f}bp  평균 {stats.mean_bps:+.1f}bp  "
+            f"수량가중 {stats.qty_weighted_mean_bps:+.1f}bp  "
+            f"p90 {stats.p90_bps:+.1f}bp  최악 {stats.worst_bps:+.1f}bp"
+        )
+    return 0
 
 
 def _pct(value: float | None) -> str:
@@ -1019,6 +1101,34 @@ def main(argv: list[str] | None = None) -> int:
         default="claude-opus-5",
         help="어느 모델의 판단을 읽을지 (llm_judgments 캐시 키의 일부)",
     )
+    backtest.add_argument(
+        "--slippage-bps",
+        type=float,
+        default=None,
+        help="체결 슬리피지 bp. 생략하면 기본 자리표시자(10bp). "
+        "실측치가 없어 결론이 이 값에 얼마나 민감한지 재는 용도 (docs/system/02)",
+    )
+    backtest.add_argument(
+        "--stop-basis",
+        choices=["close", "low"],
+        default="close",
+        help="스톱 이탈을 봉의 어느 가격으로 판정할지. close=종가(기본), "
+        "low=저가(장중에 스톱을 건드리면 이탈). 설계 4절의 '종가 기준'은 분봉을 "
+        "전제한 문장이라 일봉에서는 의미가 다르다 (core/types.py StopBasis)",
+    )
+    backtest.add_argument(
+        "--entry-min-rank",
+        type=int,
+        default=1,
+        help="진입 후보의 최소 워치리스트 순위(저장된 rank 기준, 이상). "
+        "1=현행(제한 없음). 상위 순위를 피하는 가설의 손잡이 (원장 H005). "
+        "대역이 아니라 하한이다",
+    )
+
+    slippage = sub.add_parser(
+        "slippage", help="실측 슬리피지 — orders.ref_price 대비 실제 체결가 분포"
+    )
+    slippage.add_argument("--since", default=None, help="이 날짜 이후 체결만 YYYYMMDD")
 
     for side, korean in (("buy", "매수"), ("sell", "매도")):
         order = sub.add_parser(side, help=f"{korean} 주문")
@@ -1063,7 +1173,12 @@ def main(argv: list[str] | None = None) -> int:
             args.llm_model,
             args.entry_trigger,
             args.cooldown_days,
+            args.slippage_bps,
+            args.stop_basis,
+            args.entry_min_rank,
         )
+    if args.command == "slippage":
+        return _run_slippage(args.since)
 
     try:
         settings = load_settings()

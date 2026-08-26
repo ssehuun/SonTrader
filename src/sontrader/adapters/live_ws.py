@@ -23,11 +23,22 @@
 인지조차 못 한다"와 같은 이유 — 이 스트림이 조용히 멈추면 트레일링
 스톱 판정에 쓰일 최신 분봉이 끊긴다.
 
+## 구독 ACK 검사
+
+구독 확인 JSON의 `rt_cd`를 검사해 **거부를 로그로 드러낸다**
+(`_handle_control_message`). 예전에는 JSON 제어 메시지를 통째로 버렸는데,
+그러면 KIS 실시간 등록 건수 한도를 넘겼을 때 초과분이 조용히 안 붙고
+그 종목만 분봉이 비어도 아무도 모른다 (`docs/system/03-운영.md` T18).
+
+**한도 값 자체는 코드에 박지 않는다.** 정확한 값을 확인하지 못했고, 추측한
+상수로 미리 자르면 멀쩡한 종목까지 구독하지 않게 된다. 대신 거부를 드러내서
+한도가 실측으로 보이게 했다. `subscribed_symbols` / `rejected_symbols`로
+호출자가 대조할 수 있다.
+
 ## 아직 하지 않는 것
 
-구독 확인(ACK) JSON 메시지의 성공 여부(`rt_cd`)를 검사하지 않는다 —
-지금은 무시하고 넘어간다. 구독 실패를 알림으로 연결하는 일은 이
-스트림을 `apps/live.py`에 실제로 연결하는 다음 슬라이스로 미룬다.
+거부를 **알림(텔레그램)으로 연결하지 않는다.** 이 스트림을 `apps/live.py`에
+실제로 연결하는 슬라이스에서 다룬다 — 지금은 로그까지다.
 """
 
 from __future__ import annotations
@@ -47,6 +58,8 @@ log = logging.getLogger(__name__)
 
 TR_ID = "H0STCNT0"
 _TR_TYPE_SUBSCRIBE = "1"
+_PINGPONG_TR_ID = "PINGPONG"  # 서버 keepalive — 상태 코드가 없는 정상 메시지
+_RT_CD_OK = "0"
 
 
 def _subscribe_payload(approval_key: str, symbol: str, *, custtype: str) -> str:
@@ -88,6 +101,11 @@ class LiveTickStream:
         self._custtype = custtype
         self._reconnect_delay = reconnect_delay
         self._aggregator = MinuteBarAggregator()
+
+        # 구독 등록 결과. 요청 수와 성공 수가 다르면 일부만 붙은 것이다 —
+        # 그 종목은 틱이 안 와 분봉이 안 쌓이는데, ACK를 버리면 아무도 모른다.
+        self._subscribed: set[str] = set()
+        self._rejected: set[str] = set()
 
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -146,10 +164,77 @@ class LiveTickStream:
             async for raw in ws:
                 self._handle_message(raw)
 
+    @property
+    def subscribed_symbols(self) -> frozenset[str]:
+        """등록 성공을 확인한 종목. 요청한 `symbols`와 비교하면 누락이 보인다."""
+        return frozenset(self._subscribed)
+
+    @property
+    def rejected_symbols(self) -> frozenset[str]:
+        """등록이 거부된 종목 — 한도 초과가 여기로 드러난다."""
+        return frozenset(self._rejected)
+
     def _handle_message(self, raw: str) -> None:
         if raw.startswith("{"):
-            return  # 구독 확인 등 JSON 제어 메시지 — 지금은 버린다
+            self._handle_control_message(raw)
+            return
         for tick in parse_tick_message(raw):
             bar = self._aggregator.add(tick)
             if bar is not None:
                 self._on_bar(bar)
+
+    def _handle_control_message(self, raw: str) -> None:
+        """구독 ACK 등 JSON 제어 메시지.
+
+        **예전에는 통째로 버렸다.** 그러면 등록 거부가 조용히 사라진다 —
+        KIS 실시간 등록 건수 한도를 넘기면 초과분이 거부되는데, 거부 통보가
+        바로 이 형식으로 온다. 버리면 그 종목들은 틱이 안 와 분봉이 안 쌓이는데
+        로그에는 아무것도 남지 않는다 (`docs/system/03-운영.md` T18).
+
+        **한도 값을 코드에 박지 않는다.** 정확한 값을 확인하지 못했고, 추측한
+        상수로 미리 자르면 맞을 때보다 틀릴 때의 피해가 크다(멀쩡한 종목을
+        구독 안 함). 대신 **거부를 있는 그대로 드러내서** 한도가 실측으로
+        보이게 한다.
+
+        해석 실패·예상 밖 모양에도 예외를 던지지 않는다 — 제어 메시지 하나
+        때문에 수신 루프가 끊기면 스트림 전체가 재연결로 들어간다.
+        """
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            log.warning("웹소켓 제어 메시지를 해석하지 못했다: %.200s", raw)
+            return
+        if not isinstance(payload, dict):
+            return
+
+        header = payload.get("header")
+        header = header if isinstance(header, dict) else {}
+        if header.get("tr_id") == _PINGPONG_TR_ID:
+            return  # 정상 keepalive — 매번 로그를 남기면 잡음만 된다
+
+        body = payload.get("body")
+        if not isinstance(body, dict) or "rt_cd" not in body:
+            return  # 상태 코드가 없는 제어 메시지는 판정할 것이 없다
+
+        symbol = header.get("tr_key") or "?"
+        if body.get("rt_cd") == _RT_CD_OK:
+            self._subscribed.add(symbol)
+            self._rejected.discard(symbol)
+            log.debug(
+                "실시간 등록 성공 %s (%d/%d)", symbol, len(self._subscribed), len(self._symbols)
+            )
+            return
+
+        # 거부. 조용히 넘어가면 그 종목만 분봉이 비고 아무도 모른다.
+        self._rejected.add(symbol)
+        log.error(
+            "실시간 등록 거부 %s — rt_cd=%s msg_cd=%s %s "
+            "(요청 %d종목 중 성공 %d, 거부 %d; 등록 건수 한도 초과일 수 있다)",
+            symbol,
+            body.get("rt_cd"),
+            body.get("msg_cd"),
+            body.get("msg1", ""),
+            len(self._symbols),
+            len(self._subscribed),
+            len(self._rejected),
+        )

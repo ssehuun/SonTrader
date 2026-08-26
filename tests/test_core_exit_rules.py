@@ -16,7 +16,7 @@ from sontrader.core.exit_rules import (
     stop_level,
     trailing_stop,
 )
-from sontrader.core.types import Bar, ExitRule, Position
+from sontrader.core.types import Bar, ExitRule, Position, StopBasis
 
 SYMBOL = "005930"
 ENTRY_TS = datetime(2026, 1, 5, 9, 30)
@@ -252,3 +252,81 @@ def test_exit_rule_round_trip_preserves_breakeven_trigger():
     """포지션 저장/복원에서 살아남아야 한다 — 전역 값이 바뀌어도 과거 스톱이 재현된다."""
     rule = ExitRule(breakeven_trigger=0.12, stop_loss_pct=-0.08)
     assert ExitRule.from_dict(rule.to_dict()) == rule
+
+
+# --- 스톱 판정 기준 (StopBasis) ---------------------------------------------
+#
+# 설계 4절의 "종가 기준"은 **분봉** 종가를 전제한 문장이다. 일봉으로 판정하면
+# 같은 문구가 전혀 다른 규칙이 된다 — 장중에 스톱을 크게 깨고 종가에 회복한
+# 날을 통째로 놓친다. 두 기준이 실제로 갈리는 지점을 고정한다.
+
+
+def test_close_basis_ignores_an_intrabar_stop_breach():
+    """장중 저가가 스톱을 깼지만 종가가 회복하면 CLOSE 기준은 발동하지 않는다.
+
+    이것이 현행 기본값의 정확한 한계다 — 손실 769건 중 525건(68.3%)이
+    −5% 스톱보다 나쁘게 청산되던 원인이다(실측 2026-08-26).
+    """
+    rule = ExitRule(stop_basis=StopBasis.CLOSE)
+    position = make_position(rule)
+    # 고정 손절 레벨은 10,000 × 0.95 = 9,500.
+    bars = [make_bar(0, 10_000), make_bar(1, 9_800, low=9_000)]
+
+    assert evaluate(position, bars, now=ENTRY_TS + timedelta(days=1)) is None
+
+
+def test_low_basis_fires_on_the_same_intrabar_breach():
+    rule = ExitRule(stop_basis=StopBasis.LOW)
+    position = make_position(rule)
+    bars = [make_bar(0, 10_000), make_bar(1, 9_800, low=9_000)]
+
+    signal = evaluate(position, bars, now=ENTRY_TS + timedelta(days=1))
+
+    assert signal is not None
+    assert signal.reason is ExitReason.STOP
+    assert signal.trigger_price == 9_000  # 판정 근거는 저가다
+
+
+def test_both_bases_agree_when_the_close_itself_breaches():
+    bars = [make_bar(0, 10_000), make_bar(1, 9_400)]
+
+    for basis in (StopBasis.CLOSE, StopBasis.LOW):
+        signal = evaluate(make_position(ExitRule(stop_basis=basis)), bars, now=ENTRY_TS)
+        assert signal is not None, basis
+        assert signal.reason is ExitReason.STOP
+
+
+def test_low_basis_does_not_raise_high_water_on_the_upside():
+    """아래를 저가로 보더라도 위를 고가로 올리지는 않는다 (확정사항 1).
+
+    high_water가 위쪽 꼬리로 올라가면 스톱이 그만큼 타이트해져, 저가 판정으로
+    피하려던 노이즈가 반대 방향으로 그대로 들어온다.
+    """
+    rule = ExitRule(stop_basis=StopBasis.LOW, atr_period=1)
+    position = make_position(rule)
+    # 종가는 계속 진입가 근처인데 고가만 크게 튄 봉을 넣는다. high_water가
+    # 고가를 따라갔다면 본전 이동(+5%)이 발동해 스톱이 10,000으로 올라간다.
+    bars = [make_bar(0, 10_000), make_bar(1, 10_050, high=12_000), make_bar(2, 9_900)]
+
+    assert evaluate(position, bars, now=ENTRY_TS) is None
+
+
+def test_stop_basis_survives_a_round_trip_through_storage():
+    rule = ExitRule(stop_basis=StopBasis.LOW)
+
+    assert ExitRule.from_dict(rule.to_dict()).stop_basis is StopBasis.LOW
+
+
+def test_an_unknown_stop_basis_is_rejected():
+    """조용히 기본값으로 대체하면 그 포지션만 다른 규칙으로 판정된다 (fail-closed)."""
+    payload = ExitRule().to_dict() | {"stop_basis": "nonsense"}
+
+    with pytest.raises(ValueError, match="unknown stop basis"):
+        ExitRule.from_dict(payload)
+
+
+def test_old_stored_rules_without_a_stop_basis_default_to_close():
+    """이 필드가 생기기 전에 저장된 포지션은 기존 동작을 유지해야 한다."""
+    payload = {k: v for k, v in ExitRule().to_dict().items() if k != "stop_basis"}
+
+    assert ExitRule.from_dict(payload).stop_basis is StopBasis.CLOSE

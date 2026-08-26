@@ -92,12 +92,21 @@ class StrategyConfig:
     # 있고(CycleConfig.strategy → build_target), (b) "진입에 어떤 청산 조건을
     # 붙일지"가 전략의 결정이기 때문이다. 파라미터 스윕의 주입 지점이 된다.
     exit_rule: ExitRule = field(default_factory=ExitRule)
+    # 진입 후보로 삼을 **최소** 워치리스트 순위 (저장된 rank 기준, 이상).
+    # 1이면 현행과 정확히 동등하다 — 기본값을 1로 두는 이유이자 회귀 확인점.
+    #
+    # 하한이지 대역이 아니다. `r_min <= rank <= r_min+4`로 폭을 고정하는 것은
+    # 다른 가설(대역 격리)이고 파라미터가 2개가 된다. 값의 출처는 원장
+    # H005이며, 탐색값은 백테스트가 정한다(설계 8절) — 코드에 박지 않는다.
+    entry_min_rank: int = 1
 
     def __post_init__(self) -> None:
         if not 0.0 < self.entry_weight <= 1.0:
             raise ValueError(f"entry_weight must be in (0, 1]: {self.entry_weight}")
         if self.exit_history_bars < 1:
             raise ValueError(f"exit_history_bars must be >= 1: {self.exit_history_bars}")
+        if self.entry_min_rank < 1:
+            raise ValueError(f"entry_min_rank must be >= 1: {self.entry_min_rank}")
 
 
 def build_target(ctx: Context, config: StrategyConfig | None = None) -> Target:
@@ -162,6 +171,16 @@ def _watchlist_entries(
     저장한다). 게이트가 입력 순서를 슬롯 우선순위로 존중하므로 여기서
     다시 정렬하지 않는다.
 
+    ## 순위 하한 (`entry_min_rank`, 원장 H005)
+
+    `rank < entry_min_rank`인 종목을 후보에서 뺀다. **게이트가 아니라 여기서**
+    거르는 이유: 게이트는 이 함수가 준 후보 목록 안에서만 고르므로, 상위를
+    게이트에서 떨어뜨리면 하위로 **채워지지 않고 그냥 진입이 줄어든다.**
+    "상위를 피해 그 아래에서 산다"가 되려면 후보 생성 단계에서 빠져야 한다.
+
+    순위는 `ctx.watchlist_ranks`의 **저장된 값**이다. 위치+1이 아니다 —
+    히스테리시스로 순위에 구멍이 뚫려 있다(`core.types.Context` 참고).
+
     `event_id`는 None이다 — 촉발한 이벤트가 없다. 게이트의 동일이벤트
     검사는 None을 건너뛰므로(`gate.py`), 청산 후 재진입은 쿨다운
     (`GateConfig.cooldown_days`)이 유일한 제동이다. 이벤트 모드에서
@@ -172,7 +191,26 @@ def _watchlist_entries(
     종목별로 정해주던 최대보유일·스톱을 쓸 수 없기 때문이다. 이게 오히려
     비교에는 유리하다: 두 arm의 차이가 진입 트리거 하나로 좁혀진다.
     """
-    return [(symbol, None, cfg.exit_rule) for symbol in ctx.watchlist if symbol not in exclude]
+    if cfg.entry_min_rank <= 1:
+        return [(symbol, None, cfg.exit_rule) for symbol in ctx.watchlist if symbol not in exclude]
+
+    # 순위 하한이 걸린 경우에만 rank를 요구한다. 순위를 모르는 채로 통과시키면
+    # 하한이 조용히 무시되고, 위치+1로 대체하면 저장된 순위가 아닌 값으로
+    # 판정하게 된다 — 둘 다 "적용된 줄 알았는데 아니었다"를 만든다(fail-closed).
+    candidates: list[tuple[str, str | None, ExitRule]] = []
+    for symbol in ctx.watchlist:
+        if symbol in exclude:
+            continue
+        rank = ctx.watchlist_rank(symbol)
+        if rank is None:
+            raise ValueError(
+                f"entry_min_rank={cfg.entry_min_rank} requires stored watchlist ranks, "
+                f"but none is known for {symbol!r} (Context.watchlist_ranks)"
+            )
+        if rank < cfg.entry_min_rank:
+            continue
+        candidates.append((symbol, None, cfg.exit_rule))
+    return candidates
 
 
 def _event_entries(ctx: Context, exclude: set[str]) -> list[tuple[str, str, ExitRule]]:

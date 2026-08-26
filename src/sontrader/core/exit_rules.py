@@ -16,8 +16,15 @@
 설계 4절은 "최고가"라고 쓰면서 동시에 "트레일링 판정은 분봉 종가 기준, 틱
 저가로 판정하지 않는다(장중 스파이크 노이즈 회피)"고 못박는다. 위쪽 꼬리로
 high_water를 올리면 스톱이 그만큼 타이트해져 같은 노이즈가 반대 방향으로
-들어온다. 그래서 규칙을 하나로 정리한다 — **판정에는 종가만 쓰고, 고·저가는
-변동성 측정(ATR)에만 쓴다.**
+들어온다. **이 규칙은 `stop_basis`와 무관하게 유지된다** — 아래를 저가로
+판정하더라도 위를 고가로 올리지는 않는다.
+
+**1-b. 이탈 판정 가격은 주입된다 (`ExitRule.stop_basis`).**
+설계의 "종가 기준"은 **분봉** 종가를 전제한 문장인데 우리는 일봉으로
+판정한다. 분봉 종가는 사실상 연속 감시지만 일봉 종가는 하루 한 번이라,
+같은 문구가 전혀 다른 규칙이 된다 — 장중에 스톱을 −15% 깨고 종가에 −4%로
+회복한 날을 통째로 놓친다. 어느 쪽이 맞는지는 백테스트로 정할 값이므로
+(설계 8절) 기본값만 두고 선택지를 연다. `StopBasis` 독스트링 참고.
 
 **2. 하향 금지는 `max`만으로 보장되지 않는다. 래칫이 필요하다.**
 02 문서 §3.4는 "스톱이 하향되지 않는 성질이 max로 자연히 보장된다"고 하지만,
@@ -44,7 +51,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 
-from sontrader.core.types import Bar, ExitRule, Position, TechnicalExit
+from sontrader.core.types import Bar, ExitRule, Position, StopBasis, TechnicalExit
 
 # 본전 이동 문턱은 `ExitRule.breakeven_trigger`로 옮겼다 — 다른 스톱
 # 파라미터(stop_loss_pct·atr_k·atr_period)가 전부 거기 있는데 이것만 모듈
@@ -62,7 +69,7 @@ class ExitSignal:
     symbol: str
     reason: ExitReason
     stop_level: float
-    trigger_price: int | None  # 판정 근거가 된 봉 종가 (봉이 없으면 None)
+    trigger_price: int | None  # 판정 근거가 된 가격 (종가 또는 저가; 봉이 없으면 None)
 
 
 def stop_level(
@@ -142,8 +149,10 @@ def evaluate(
             raise ValueError(f"bar symbol {bar.symbol!r} != position symbol {position.symbol!r}")
 
     level, last = _ratchet(position, bars)
-    if last is not None and last.close <= level:
-        return ExitSignal(position.symbol, ExitReason.STOP, level, last.close)
+    if last is not None and _stop_price(last, rule.stop_basis) <= level:
+        return ExitSignal(
+            position.symbol, ExitReason.STOP, level, _stop_price(last, rule.stop_basis)
+        )
 
     # 거래일이 아니라 **달력일**이다 — core는 휴장일 캘린더를 알지 않는다
     # (구조 원칙 1). LLM이 출력하는 "최대보유일"도 달력일 감각에 가깝다.
@@ -156,6 +165,20 @@ def evaluate(
             last.close if last is not None else None,
         )
     return None
+
+
+def _stop_price(bar: Bar, basis: StopBasis) -> int:
+    """스톱 이탈 판정에 쓸 가격.
+
+    `LOW`는 **장중에 스톱을 건드렸으면 이탈**로 본다. 일봉 종가만 보면
+    장중에 스톱을 크게 깨고 종가에 일부 회복한 날을 통째로 놓치는데,
+    실전에서는 그 사이에 이미 스톱이 발동했을 것이다.
+
+    `high_water`는 이 선택과 무관하게 **항상 종가**다 (모듈 상단 확정사항 1).
+    위쪽 꼬리로 high_water를 올리면 스톱이 그만큼 타이트해져, 아래쪽에서
+    피하려던 노이즈가 반대 방향으로 그대로 들어온다.
+    """
+    return bar.low if basis is StopBasis.LOW else bar.close
 
 
 def _ratchet(position: Position, bars: Sequence[Bar]) -> tuple[float, Bar | None]:

@@ -144,7 +144,7 @@ uv run ruff format .                                 # 포맷
 | 문서 | 내용 |
 |---|---|
 | `CLAUDE.md` | 아키텍처, 모듈별 책임, 테스트 컨벤션 |
-| `docs/02-코드-구조.md` | 단계별 구현 현황과 설계 결정 이유 |
-| `docs/01-요구사항-설계-확정.md` | 요구사항 원문, 미확정 파라미터(§8) |
-| `docs/scenario/` | 매크로 국면 판단 설계 + 가설 원장(append-only) |
-| `todo/` | 미룬 작업. `01-실전-차단.md`가 실전을 막는 것들 |
+| `docs/design/02-코드-구조.md` | 단계별 구현 현황과 설계 결정 이유 |
+| `docs/design/01-요구사항-설계-확정.md` | 요구사항 원문, 미확정 파라미터(§8) |
+| `docs/research/` | 전략 리서치. `docs/research/01-가설-원장.md`가 검정 기록(append-only) |
+| `docs/system/` | 시스템 강건성 백로그. `docs/system/01-실전-차단.md`가 실전을 막는 것들 |

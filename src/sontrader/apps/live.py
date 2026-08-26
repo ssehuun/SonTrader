@@ -157,6 +157,7 @@ def main() -> None:
                 positions=report.positions,
                 cash=broker.cash(),
                 watchlist=watchlist,
+                watchlist_ranks=_load_watchlist_ranks(engine, now.date()),
                 judge=judge or (lambda event: None),
             )
             result = run_cycle(ctx, Deps(broker=broker, engine=engine), cycle_config)
@@ -360,6 +361,23 @@ def _load_watchlist(engine: sa.engine.Engine, day: date) -> tuple[str, ...]:
             sa.select(columns.symbol).where(columns.date == latest).order_by(columns.rank)
         )
         return tuple(row.symbol for row in rows)
+
+
+def _load_watchlist_ranks(engine: sa.engine.Engine, day: date) -> dict[str, int]:
+    """종목 → **저장된** rank. `_load_watchlist`와 같은 스냅샷을 본다.
+
+    위치+1로 대체할 수 없다 — 히스테리시스로 순위에 구멍이 뚫려 있다
+    (`core.types.Context.watchlist_ranks`).
+    """
+    columns = db.watchlist_snapshots.c
+    with engine.connect() as conn:
+        latest = conn.execute(
+            sa.select(sa.func.max(columns.date)).where(columns.date <= day)
+        ).scalar_one()
+        if latest is None:
+            return {}
+        rows = conn.execute(sa.select(columns.symbol, columns.rank).where(columns.date == latest))
+        return {row.symbol: row.rank for row in rows}
 
 
 def _poll_telegram(notifier: TelegramNotifier, offset: int | None) -> int | None:

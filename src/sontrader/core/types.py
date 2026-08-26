@@ -63,6 +63,33 @@ class OrderStatus(str, Enum):
     REJECTED = "rejected"
 
 
+class StopBasis(str, Enum):
+    """스톱 이탈을 **봉의 어느 가격으로** 판정할지 (설계 4절의 미해결 지점).
+
+    설계는 *"트레일링 판정은 **분봉** 종가 기준, 틱 저가로 판정하지 않는다
+    (장중 스파이크 노이즈 회피)"* 라고 정했다. 그런데 우리는 분봉이 아니라
+    **일봉**으로 판정한다 — 그러면 "종가 기준"의 의미가 완전히 달라진다.
+    분봉 종가는 사실상 연속 감시지만, 일봉 종가는 **하루에 한 번**이다.
+
+    둘 다 근사이고 **틀리는 방향이 서로 반대다**:
+
+    | | 놓치는 것 | 결과 |
+    |---|---|---|
+    | `CLOSE` | 장중에 스톱을 깨고 종가에 회복한 날 | 스톱이 발동하지 않아 손실이 커진 뒤 나간다 |
+    | `LOW` | 스파이크로 한 번 스친 것도 이탈로 본다 | 설계가 피하려던 노이즈 청산 |
+
+    실측(2026-08-26, quant researcher): 손실 769건 중 525건(68.3%)이 −5%
+    스톱보다 나쁘게 청산됐고 평균 −9.13%다. 갭은 실현손실의 5.6%뿐이라
+    원인은 갭이 아니라 **판정 주기**다.
+
+    어느 쪽을 쓸지는 백테스트로 정한다(설계 8절). 그래서 값이 아니라
+    **선택지**를 코드에 둔다.
+    """
+
+    CLOSE = "close"  # 봉 종가로 판정 (현행 기본값 — 설계 문구를 일봉에 직역한 것)
+    LOW = "low"  # 봉 저가로 판정 — 장중에 스톱을 건드리면 이탈
+
+
 class TechnicalExit(str, Enum):
     """사전 정의된 기술적 청산 규칙 (설계 3.2절 — LLM은 이 중에서 택1).
 
@@ -129,6 +156,10 @@ class ExitRule:
     # 전부 여기 있어 혼자만 주입 불가였다 — 백테스트로 확정할 값이므로
     # 포지션에 함께 저장해야 과거 스톱이 재현된다.
     breakeven_trigger: float = 0.05
+    # 스톱 이탈을 봉의 어느 가격으로 볼지 (`StopBasis` 참고). 다른 스톱
+    # 파라미터와 같은 이유로 포지션에 함께 저장한다 — 전역 기본값이 나중에
+    # 바뀌어도 과거 포지션의 판정이 그대로 재현돼야 한다.
+    stop_basis: StopBasis = StopBasis.CLOSE
 
     def __post_init__(self) -> None:
         if self.max_hold_days <= 0:
@@ -151,6 +182,7 @@ class ExitRule:
             "atr_period": self.atr_period,
             "atr_k": self.atr_k,
             "breakeven_trigger": self.breakeven_trigger,
+            "stop_basis": self.stop_basis.value,
         }
 
     @classmethod
@@ -166,6 +198,13 @@ class ExitRule:
         except ValueError as exc:
             raise ValueError(f"unknown technical exit rule: {raw!r}") from exc
         defaults = cls()
+        # 모르는 판정 기준도 거부한다(fail-closed) — 조용히 기본값으로
+        # 대체하면 그 포지션만 다른 규칙으로 판정되고 아무도 모른다.
+        raw_basis = payload.get("stop_basis", defaults.stop_basis.value)
+        try:
+            stop_basis = StopBasis(raw_basis)
+        except ValueError as exc:
+            raise ValueError(f"unknown stop basis: {raw_basis!r}") from exc
         return cls(
             technical=technical,
             max_hold_days=int(payload.get("max_hold_days", defaults.max_hold_days)),
@@ -173,6 +212,7 @@ class ExitRule:
             atr_period=int(payload.get("atr_period", defaults.atr_period)),
             atr_k=float(payload.get("atr_k", defaults.atr_k)),
             breakeven_trigger=float(payload.get("breakeven_trigger", defaults.breakeven_trigger)),
+            stop_basis=stop_basis,
         )
 
 
@@ -273,6 +313,14 @@ class Order:
     event_id: str | None = None
     order_id: str | None = None
     exit_rule: ExitRule | None = None
+    # 이 주문을 만들 때 본 가격 — 마지막 완성 봉의 종가(`core/diff.py`).
+    # 집행에는 쓰이지 않는다(시장가다). 오직 **사후 측정**을 위해 실어 나른다:
+    # 체결가 − 이 값 = 의사결정 시점부터 체결까지 실제로 잃은 가격이고, 그
+    # 분포가 `SimBrokerConfig.slippage_bps`(현재 10bp 자리표시자)의 실측
+    # 근거가 된다. 주문 시점에 남기지 않으면 나중에 복원할 방법이 없다 —
+    # 그날의 종가는 알아도 "그 사이클이 본 마지막 봉"은 알 수 없다.
+    # 봉이 없어도 청산은 나가므로(위 docstring) None일 수 있다.
+    ref_price: int | None = None
 
     def __post_init__(self) -> None:
         if self.qty <= 0:
@@ -364,12 +412,42 @@ class Context:
     # 백테스트는 체결이 즉시라 항상 비어 있다(`broker_sim`이 submit 안에서
     # 체결한다). 그래서 이 필드는 실전에서만 값이 찬다.
     pending_order_symbols: frozenset[str] = frozenset()
+    # 종목 → 매매수량단위(`symbol_master.trading_unit`). 주문 수량이 이 값의
+    # 배수가 아니면 **KIS가 주문을 거부**한다. 백테스트가 이걸 모르면 실전에서
+    # 존재할 수 없는 주문을 체결시키므로, 수량을 정하는 유일한 지점인
+    # `core/diff.py`가 여기서 읽는다.
+    #
+    # 비어 있거나 없는 종목은 1로 본다 — 마스터에 없는 종목(신규 상장 직후,
+    # 과거 상장폐지) 때문에 주문이 통째로 사라지는 편보다, 압도적으로 흔한
+    # 값으로 진행하는 편이 낫다. 2026-08-26 실측 4,386종목 전부 1이다.
+    trading_units: Mapping[str, int] = field(default_factory=dict)
+    # 종목 → 그날 스냅샷에 **저장된** 워치리스트 순위 (`watchlist_snapshots.rank`).
+    #
+    # `watchlist` 튜플의 위치로 순위를 유추하면 안 된다. 저장된 rank는
+    # 모멘텀 전체 풀에서의 순위이고 히스테리시스(30/42)로 일부만 남으므로
+    # **구멍이 뚫려 있다** — 실측 1,864일 중 1,793일이 1..N 연속이 아니다
+    # (예: 37종목인데 최대 rank 42). 위치+1을 쓰면 그건 저장된 순위가 아니라
+    # 재계산한 순위이고, 01문서 §5.2의 "재계산 금지"를 어긴다.
+    watchlist_ranks: Mapping[str, int] = field(default_factory=dict)
 
     def position(self, symbol: str) -> Position | None:
         for pos in self.positions:
             if pos.symbol == symbol:
                 return pos
         return None
+
+    def watchlist_rank(self, symbol: str) -> int | None:
+        """저장된 워치리스트 순위. 모르면 None (위 `watchlist_ranks` 주석 참고)."""
+        return self.watchlist_ranks.get(symbol)
+
+    def trading_unit(self, symbol: str) -> int:
+        """매매수량단위. 모르면 1 (위 `trading_units` 주석 참고).
+
+        0·음수가 들어오면 1로 본다 — 마스터 파싱 실패(빈 칸 → 0)가 나눗셈을
+        터뜨리거나 수량을 0으로 만들어 매매를 통째로 멈추는 경로를 막는다.
+        """
+        unit = self.trading_units.get(symbol, 1)
+        return unit if unit >= 1 else 1
 
     @property
     def held_symbols(self) -> frozenset[str]:

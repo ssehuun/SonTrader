@@ -101,6 +101,7 @@ def make_ctx(
     judgments: dict[str, Judgment] | None = None,
     equity: int = 10_000_000,
     now: datetime = NOW,
+    watchlist_ranks: dict[str, int] | None = None,
 ) -> Context:
     return Context(
         now=now,
@@ -110,6 +111,7 @@ def make_ctx(
         new_events=new_events,
         judgments=judgments or {},
         equity=equity,
+        watchlist_ranks=watchlist_ranks or {},
     )
 
 
