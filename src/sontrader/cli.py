@@ -777,7 +777,6 @@ def _build_cycle_config(
     entry_trigger: str,
     cooldown_days: int | None,
     stop_basis: str = "close",
-    entry_min_rank: int = 1,
 ):
     """진입 트리거와 쿨다운만 바꾼 사이클 설정.
 
@@ -797,7 +796,6 @@ def _build_cycle_config(
         strategy=StrategyConfig(
             entry_trigger=trigger,
             exit_rule=ExitRule(stop_basis=StopBasis(stop_basis)),
-            entry_min_rank=entry_min_rank,
         )
     )
     if cooldown_days is not None:
@@ -815,7 +813,6 @@ def _run_backtest(
     cooldown_days: int | None,
     slippage_bps: float | None = None,
     stop_basis: str = "close",
-    entry_min_rank: int = 1,
 ) -> int:
     from sqlalchemy.exc import SQLAlchemyError
 
@@ -853,9 +850,7 @@ def _run_backtest(
         misses = None
         if use_llm:
             judge, misses = _build_cached_judge(engine, llm_model)
-        cycle_config = _build_cycle_config(entry_trigger, cooldown_days, stop_basis, entry_min_rank)
-        if entry_min_rank > 1:
-            print(f"진입 순위 하한: rank >= {entry_min_rank} (기본 1 = 제한 없음)")
+        cycle_config = _build_cycle_config(entry_trigger, cooldown_days, stop_basis)
         if stop_basis != "close":
             print(f"스톱 판정 기준: 봉 {stop_basis} (기본 close)")
         if entry_trigger == "watchlist":
@@ -1117,14 +1112,6 @@ def main(argv: list[str] | None = None) -> int:
         "low=저가(장중에 스톱을 건드리면 이탈). 설계 4절의 '종가 기준'은 분봉을 "
         "전제한 문장이라 일봉에서는 의미가 다르다 (core/types.py StopBasis)",
     )
-    backtest.add_argument(
-        "--entry-min-rank",
-        type=int,
-        default=1,
-        help="진입 후보의 최소 워치리스트 순위(저장된 rank 기준, 이상). "
-        "1=현행(제한 없음). 상위 순위를 피하는 가설의 손잡이 (원장 H005). "
-        "대역이 아니라 하한이다",
-    )
 
     slippage = sub.add_parser(
         "slippage", help="실측 슬리피지 — orders.ref_price 대비 실제 체결가 분포"
@@ -1176,7 +1163,6 @@ def main(argv: list[str] | None = None) -> int:
             args.cooldown_days,
             args.slippage_bps,
             args.stop_basis,
-            args.entry_min_rank,
         )
     if args.command == "slippage":
         return _run_slippage(args.since)
