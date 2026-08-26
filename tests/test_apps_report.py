@@ -140,6 +140,56 @@ def test_win_rate_and_profit_factor_from_mixed_trades():
     assert report.trade_count == 3
 
 
+def test_payoff_ratio_is_the_average_ratio_not_the_total_ratio():
+    """PF와 손익비는 다르다. 같은 거래에서 값이 갈리는 것을 고정한다.
+
+    이 둘을 바꿔 읽어서 진단을 틀린 적이 있다(2026-08-26) — PF를 손익비로
+    읽고 "승자가 잘렸다"고 판단했으나 실제로는 승률이 문제였다.
+    """
+    entered = datetime(2026, 1, 1)
+    trades = [
+        make_trade("100", entered, entered + timedelta(days=1), 10_000, 11_000, qty=100),
+        make_trade("200", entered, entered + timedelta(days=1), 10_000, 9_000, qty=100),
+        make_trade("300", entered, entered + timedelta(days=1), 10_000, 12_000, qty=100),
+    ]
+    report = build_report(make_result(closed_trades=trades), initial_cash=10_000_000)
+
+    # PF = 총이익/총손실 = 300,000 / 100,000 = 3.0
+    # 손익비 = 평균이익/평균손실 = 150,000 / 100,000 = 1.5
+    assert report.profit_factor == pytest.approx(3.0)
+    assert report.payoff_ratio == pytest.approx(1.5)
+
+
+def test_payoff_ratio_can_exceed_one_while_the_strategy_loses():
+    """손익비 > 1을 "괜찮다"로 읽으면 안 된다.
+
+    손익분기 손익비는 (1−승률)/승률이다. 승률 25%면 3.0을 넘겨야 본전인데
+    아래는 2.0이라 PF가 1 미만이다 — 실제 전략이 이 모양이었다.
+    """
+    entered = datetime(2026, 1, 1)
+    trades = [
+        make_trade("100", entered, entered + timedelta(days=1), 10_000, 12_000, qty=100),
+    ] + [
+        make_trade(str(i), entered, entered + timedelta(days=1), 10_000, 9_000, qty=100)
+        for i in range(200, 203)
+    ]
+    report = build_report(make_result(closed_trades=trades), initial_cash=10_000_000)
+
+    assert report.win_rate == pytest.approx(0.25)
+    assert report.payoff_ratio == pytest.approx(2.0)  # 1을 넘는데
+    assert report.profit_factor == pytest.approx(200_000 / 300_000)  # 여전히 진다
+    assert report.profit_factor < 1
+
+
+def test_payoff_ratio_is_none_when_either_side_is_empty():
+    entered = datetime(2026, 1, 1)
+    trades = [make_trade("100", entered, entered + timedelta(days=1), 10_000, 11_000)]
+    report = build_report(make_result(closed_trades=trades), initial_cash=10_000_000)
+
+    assert report.payoff_ratio is None
+    assert build_report(make_result(), initial_cash=10_000_000).payoff_ratio is None
+
+
 def test_profit_factor_is_none_without_any_losing_trade():
     entered = datetime(2026, 1, 1)
     trades = [make_trade("100", entered, entered + timedelta(days=1), 10_000, 11_000)]

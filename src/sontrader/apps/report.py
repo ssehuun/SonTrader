@@ -55,6 +55,7 @@ class PerformanceReport:
     mdd: float
     win_rate: float | None
     profit_factor: float | None
+    payoff_ratio: float | None
     avg_holding_days: float | None
     trade_count: int
     cost_ratio: float
@@ -74,6 +75,7 @@ def build_report(result: BacktestResult, *, initial_cash: int) -> PerformanceRep
         mdd=_mdd(equity_values, initial_cash),
         win_rate=_win_rate(trades),
         profit_factor=_profit_factor(trades),
+        payoff_ratio=_payoff_ratio(trades),
         avg_holding_days=_avg_holding_days(trades),
         trade_count=len(trades),
         cost_ratio=result.total_costs / initial_cash,
@@ -129,6 +131,32 @@ def _win_rate(trades: Sequence[ClosedTrade]) -> float | None:
         return None
     wins = sum(1 for t in trades if _pnl(t) > 0)
     return wins / len(trades)
+
+
+def _payoff_ratio(trades: Sequence[ClosedTrade]) -> float | None:
+    """손익비 = 평균이익 / 평균손실. **Profit Factor와 다르다.**
+
+    `PF = 손익비 × 승률/(1−승률)` — PF는 승률을 이미 품고 있고 손익비는
+    승률과 독립이다. 그래서 둘을 함께 봐야 "왜 지는가"가 갈린다:
+
+    - 손익비는 높은데 PF가 낮다 → **덜 맞힌다.** 진입 신호 문제
+    - 손익비가 낮은데 승률이 높다 → **승자를 일찍 자른다.** 청산 문제
+
+    둘을 바꿔 읽어서 실제로 진단을 틀린 적이 있다(2026-08-26). PF 0.40을
+    손익비로 읽고 "승자가 잘렸다"고 판단했는데, 실제 손익비는 2.28로
+    승자가 패자보다 2배 넘게 컸다. 문제는 승률이었다.
+
+    손익분기 손익비는 `(1−승률)/승률`이다 — 승률 22.6%면 3.42를 넘겨야
+    본전이다. 이 값만 보고 "1을 넘으니 괜찮다"고 읽으면 안 된다.
+
+    PF와 같은 **원 단위**로 잰다. 수익률(%) 기준으로 재면 포지션 크기가
+    빠져 두 지표를 나란히 놓을 수 없다.
+    """
+    gains = [_pnl(t) for t in trades if _pnl(t) > 0]
+    losses = [-_pnl(t) for t in trades if _pnl(t) < 0]
+    if not gains or not losses:
+        return None  # 한쪽이 비면 비율이 정의되지 않는다 — 무한대를 흉내내지 않는다
+    return (sum(gains) / len(gains)) / (sum(losses) / len(losses))
 
 
 def _profit_factor(trades: Sequence[ClosedTrade]) -> float | None:

@@ -974,7 +974,8 @@ def _print_report(report) -> None:
 
     print(f"CAGR {_pct(report.cagr)}  샤프 {_num(report.sharpe)}  MDD {report.mdd:.2%}")
     print(
-        f"승률 {_pct(report.win_rate)}  손익비 {_num(report.profit_factor)}"
+        f"승률 {_pct(report.win_rate)}  PF {_num(report.profit_factor)}"
+        f"  손익비 {_num(report.payoff_ratio)}"
         f"  평균보유 {_num(report.avg_holding_days, '일')}"
     )
     print(f"거래 {report.trade_count}건  총거래비용비중 {report.cost_ratio:.2%}")
