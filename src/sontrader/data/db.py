@@ -217,7 +217,12 @@ watchlist_snapshots = Table(
 index_candles_1d = Table(
     "index_candles_1d",
     metadata,
-    Column("code", String(10), primary_key=True, comment="업종코드 (0001=KOSPI, 2001=KOSDAQ)"),
+    Column(
+        "code",
+        String(10),
+        primary_key=True,
+        comment="업종코드 (0001=KOSPI, 1001=KOSDAQ, 2001=KOSPI200)",
+    ),
     Column("date", Date, primary_key=True),
     Column("open", Float),
     Column("high", Float),
