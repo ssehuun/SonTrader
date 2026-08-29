@@ -488,10 +488,17 @@ def _upsert(engine: Engine, rows: list[dict[str, Any]]) -> int:
 
 
 def stored_days(engine: Engine, symbol: str) -> list[date]:
-    """저장된 영업일 목록 — 백테스트의 사이클 날짜 후보."""
+    """저장된 영업일 목록 — 백테스트의 사이클 날짜 후보.
+
+    **`source='rest'`만 센다** (R8). 백테스트가 읽는 것과 같은 집합이어야
+    "봉이 있는 날"과 "재생되는 날"이 어긋나지 않는다. `_last_stored`·
+    `_first_stored`와 같은 규약이다.
+    """
     columns = db.stock_candles_1m.c
     with engine.connect() as conn:
         rows = conn.execute(
-            sa.select(sa.func.date(columns.ts)).where(columns.symbol == symbol).distinct()
+            sa.select(sa.func.date(columns.ts))
+            .where(columns.symbol == symbol, columns.source == "rest")
+            .distinct()
         )
         return sorted(row[0] for row in rows)
