@@ -20,6 +20,8 @@ NEW_TABLES = {
     "stock_candles_1m",
     "market_calendar",
     "watchlist_snapshots",
+    "daytrade_watchlist_snapshots",
+    "index_candles_1d",
     "cycle_log",
 }
 

@@ -35,6 +35,9 @@ _TR_IDS = {
     "intraday": ("FHKST03010230", ""),
     # 국내휴장일조회. 모의투자 미지원. docs/api/국내휴장일조회[국내주식-040].xlsx
     "holidays": ("CTCA0903R", ""),
+    # 국내업종 일자별지수 (R22). **모의투자 지원**(2026-08-27 실측 rt_cd=0).
+    # 응답은 요청 구간과 무관하게 **최신 50건 상한**이라 페이징이 필요하다.
+    "index_daily": ("FHKUP03500100", "FHKUP03500100"),
 }
 
 ORDER_DVSN_LIMIT = "00"  # 지정가
@@ -136,6 +139,32 @@ class KisClient:
             },
         )
         return [row for row in data["output2"] if row.get("stck_bsop_date")]
+
+    def get_index_daily_candles(self, code: str, start: date, end: date) -> list[dict[str, Any]]:
+        """국내업종 일자별지수 (`FHKUP03500100`). 시각 오름차순으로 돌려준다.
+
+        **응답은 최신 50건 상한**이다 — 요청 구간이 그보다 길면 **뒤쪽(최신)
+        50건만** 온다. 앞쪽을 받으려면 `end`를 뒤로 물려 다시 부른다
+        (페이징은 호출자 몫 — `get_daily_candles`와 같은 규약).
+
+        지수값은 **소수점을 갖는다**(6912.37). 정수로 캐스팅하지 말 것.
+        """
+        data = self._request(
+            "GET",
+            "/uapi/domestic-stock/v1/quotations/inquire-daily-indexchartprice",
+            tr="index_daily",
+            params={
+                # "U" = 업종. 종목 조회의 "J"(주식)와 다르다.
+                "FID_COND_MRKT_DIV_CODE": "U",
+                "FID_INPUT_ISCD": code,
+                "FID_INPUT_DATE_1": start.strftime("%Y%m%d"),
+                "FID_INPUT_DATE_2": end.strftime("%Y%m%d"),
+                "FID_PERIOD_DIV_CODE": "D",
+            },
+        )
+        rows = [row for row in (data.get("output2") or []) if row.get("stck_bsop_date")]
+        rows.sort(key=lambda r: r["stck_bsop_date"])
+        return rows
 
     def get_market_holidays(self, reference: date) -> list[dict[str, Any]]:
         """국내휴장일조회 — ``reference``부터 몇 주치 영업일 정보를 한 번에 돌려준다.

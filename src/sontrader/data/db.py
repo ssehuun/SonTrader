@@ -205,6 +205,46 @@ watchlist_snapshots = Table(
     Column("rank", Integer, nullable=False, comment="전체 후보 중 순위 (1이 최고)"),
 )
 
+# 업종/지수 일봉 (R22). **`stock_candles_1d`와 별 테이블이다** — 두 가지 이유다:
+#
+# 1. 섞으면 유니버스 필터가 지수를 종목으로 오인한다. 거래대금 상위를 뽑는
+#    쿼리에 KOSPI 지수가 1위로 들어오는 식이다.
+# 2. **지수는 소수점을 갖는다** (6912.37). `stock_candles_1d`의 가격 컬럼은
+#    Integer라 애초에 담기지 않는다.
+#
+# 용도는 상대 우위 판정(G3)이다 — 전략 수익률을 시장 수익률과 비교하려면
+# 시장 쪽 시계열이 있어야 한다 (01문서 §5.1 규칙 3).
+index_candles_1d = Table(
+    "index_candles_1d",
+    metadata,
+    Column("code", String(10), primary_key=True, comment="업종코드 (0001=KOSPI, 2001=KOSDAQ)"),
+    Column("date", Date, primary_key=True),
+    Column("open", Float),
+    Column("high", Float),
+    Column("low", Float),
+    Column("close", Float, nullable=False),
+    Column("volume", BigInteger),
+    Column("trade_value", BigInteger),
+)
+
+# 데이트레이딩 감시 대상 스냅샷 (R31). `watchlist_snapshots`와 **별 테이블이다** —
+# 저것은 12개월 모멘텀 스윙 유니버스이고 이것은 D-1 거래량 상위다. 선정 규칙도
+# 사용처도 다른데 한 테이블에 섞으면 어느 규칙으로 뽑힌 행인지 알 수 없게 된다.
+#
+# **그날 뽑은 것을 그대로 남긴다. 사후 재계산 금지** (01문서 §5.2 규약, 리서처 R19).
+# 재계산하면 그날 몰랐던 정보가 섞인다 — 감시 대상 선정은 D-1 데이터로만 하는데,
+# 나중에 다시 계산하면 그 사이 수정주가로 소급 변경된 값이 들어온다.
+daytrade_watchlist_snapshots = Table(
+    "daytrade_watchlist_snapshots",
+    metadata,
+    Column("date", Date, primary_key=True, comment="이 감시 대상을 쓸 거래일"),
+    Column("symbol", String(20), primary_key=True),
+    Column("rank", Integer, nullable=False, comment="D-1 거래량 순위 (1이 최대)"),
+    Column("volume", BigInteger, nullable=False, comment="선정 근거가 된 D-1 거래량"),
+    Column("trade_value", BigInteger, comment="D-1 거래대금 — 유동성 하한 판정 근거"),
+    Column("source_date", Date, nullable=False, comment="근거로 쓴 D-1 날짜"),
+)
+
 # 일봉. 수정주가로 수집한다 (0단계에서 확인한 레거시 수집기의 원주가 문제 대응).
 # 기업행위 발생 시 과거분이 소급 수정되므로 수집기가 겹침 구간을 대조해
 # 불일치 시 전체 재수집한다 (data/prices.py). 레거시 kis_trading DB를 쓰는

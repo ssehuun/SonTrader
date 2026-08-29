@@ -214,6 +214,117 @@ def _minute_symbols(engine, symbols_arg: str | None, from_watchlist: bool) -> li
         return [row.symbol for row in rows]
 
 
+def _run_collect_index(codes_arg: str, earliest_str: str | None) -> int:
+    """지수 일봉 수집 (R22) — 상대 우위 판정(G3)의 입력.
+
+    **소급 수집이 된다** (2026-08-27 실측: 2019년 구간도 받힌다). 분봉과 달리
+    보관 한계가 가깝지 않으므로 서두를 이유가 없지만, 없으면 G3를 아예 못
+    재므로 먼저 채워 둔다.
+    """
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from sontrader.data.db import migrate
+    from sontrader.data.index_prices import collect_index
+
+    try:
+        settings = load_settings()
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    try:
+        earliest = _parse_date_arg(earliest_str) if earliest_str else None
+    except ValueError:
+        print("error: --earliest must be YYYYMMDD", file=sys.stderr)
+        return 2
+
+    codes = [c.strip() for c in codes_arg.split(",") if c.strip()]
+    engine = _open_engine()
+    if engine is None:
+        return 2
+    try:
+        for action in migrate(engine):
+            print(action)
+        end = _now_kst().date()
+        pace = _default_pace(settings)
+        print(f"지수 수집 시작: {codes}, {end}부터 과거로{f' {earliest}까지' if earliest else ''}")
+        with KisClient(settings) as client:
+            for code in codes:
+                result = collect_index(
+                    engine, client, code, end=end, earliest=earliest, pace_seconds=pace
+                )
+                print(
+                    f"  {code}: {result.rows:,}건 ({result.oldest} ~ {result.newest},"
+                    f" 호출 {result.pages}회)"
+                )
+        return 0
+    except (KisError, SQLAlchemyError) as exc:
+        print(f"error: {_first_line(exc)}", file=sys.stderr)
+        return 2
+    finally:
+        engine.dispose()
+
+
+def _run_daytrade_universe(
+    date_str: str | None, min_trade_value: int | None, top_n: int | None
+) -> int:
+    """데이트레이딩 감시 대상 (R31) — D-1 거래량 상위. **장전 1회 실행 전제.**"""
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from sontrader.data.daytrade_universe import (
+        DEFAULT_MIN_TRADE_VALUE,
+        DEFAULT_TOP_N,
+        RESERVED_FOR_POSITIONS,
+        WS_SUBSCRIBE_LIMIT,
+        DaytradeUniverseError,
+        build_snapshot,
+    )
+    from sontrader.data.db import migrate
+    from sontrader.data.master import load_names
+
+    try:
+        as_of = _parse_date_arg(date_str) if date_str else _now_kst().date()
+    except ValueError:
+        print("error: --date must be YYYYMMDD", file=sys.stderr)
+        return 2
+
+    engine = _open_engine()
+    if engine is None:
+        return 2
+    try:
+        for action in migrate(engine):
+            print(action)
+        floor = min_trade_value if min_trade_value is not None else DEFAULT_MIN_TRADE_VALUE
+        count = top_n if top_n is not None else DEFAULT_TOP_N
+        snapshot = build_snapshot(engine, as_of=as_of, min_trade_value=floor, top_n=count)
+        names = load_names(engine, list(snapshot.symbols))
+
+        print(
+            f"{as_of} 감시 대상 {len(snapshot.entries)}종목 "
+            f"(근거 D-1 {snapshot.source_date}, 거래대금 {floor / 1e8:,.0f}억 이상, 상위 {count})"
+        )
+        # 36이라는 숫자가 어디서 왔는지를 출력에 남긴다 — 나중에 이 로그만 보는
+        # 사람이 "왜 36인가"를 되짚을 수 있어야 한다.
+        if count == DEFAULT_TOP_N:
+            print(
+                f"  (상위 {count} = 웹소켓 한도 {WS_SUBSCRIBE_LIMIT}"
+                f" − 보유분 {RESERVED_FOR_POSITIONS})"
+            )
+        for e in snapshot.entries:
+            name = names.get(e.symbol, "")
+            value = f"{e.trade_value / 1e8:,.0f}억" if e.trade_value else "-"
+            label = _pad(f"{e.symbol} {name}", 22)
+            print(f"  {e.rank:>3} {label} 거래량 {e.volume:>12,}  거래대금 {value:>9}")
+        return 0
+    except DaytradeUniverseError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except SQLAlchemyError as exc:
+        print(f"error: DB access failed: {_first_line(exc)}", file=sys.stderr)
+        return 2
+    finally:
+        engine.dispose()
+
+
 def _open_engine():
     """Load DATABASE_URL and build an engine; print + return None on failure.
 
@@ -777,12 +888,25 @@ def _build_cycle_config(
     entry_trigger: str,
     cooldown_days: int | None,
     stop_basis: str = "close",
+    max_hold_bars: int | None = None,
+    eod_exit_bars: int | None = None,
+    exit_history_bars: int | None = None,
 ):
-    """진입 트리거와 쿨다운만 바꾼 사이클 설정.
+    """진입 트리거·쿨다운·청산 파라미터만 바꾼 사이클 설정.
 
     워치리스트 모드는 event_id가 없어 게이트의 동일이벤트 차단이 걸리지
     않는다 — 청산 직후 같은 종목이 여전히 상위면 바로 재진입한다. 그래서
     이 모드의 유일한 제동은 쿨다운이고, 값을 명시할 수 있게 열어둔다.
+
+    **`--cooldown-days 1`이 곧 "같은 날 재진입 금지"다** (리서처 R14).
+    `(now.date() - last_exit.date()).days < 1`이므로 청산한 날의 나머지
+    사이클이 전부 막히고 다음 거래일에 풀린다. 봉 단위 손잡이를 따로 두지
+    않은 이유가 이것이다 — 같은 것을 두 번 표현하면 어느 쪽이 이기는지를
+    나중에 되짚어야 한다.
+
+    `max_hold_bars`·`eod_exit_bars`는 **기본값을 두지 않는다.** 몇 봉인지는
+    백테스트가 정할 파라미터이고(01문서 §8), 근거 없는 숫자를 기본값에 넣으면
+    그게 곧 은닉된 전략 결정이 된다.
     """
     from sontrader.core.gate import GateConfig
     from sontrader.core.strategy import EntryTrigger, StrategyConfig
@@ -792,12 +916,21 @@ def _build_cycle_config(
     trigger = EntryTrigger.WATCHLIST_RANK if entry_trigger == "watchlist" else EntryTrigger.EVENT
     # 워치리스트 모드 진입에 붙일 청산 조건. EVENT 모드는 LLM이 규칙을 실어
     # 보내므로 여기서 정하지 않는다.
-    config = CycleConfig(
-        strategy=StrategyConfig(
-            entry_trigger=trigger,
-            exit_rule=ExitRule(stop_basis=StopBasis(stop_basis)),
-        )
+    exit_rule = ExitRule(
+        stop_basis=StopBasis(stop_basis),
+        max_hold_bars=max_hold_bars,
+        eod_exit_bars=eod_exit_bars,
     )
+    strategy_kwargs = {"entry_trigger": trigger, "exit_rule": exit_rule}
+    if exit_history_bars is not None:
+        strategy_kwargs["exit_history_bars"] = exit_history_bars
+    elif max_hold_bars is not None:
+        # 보유 봉 수는 넘긴 창 안에서만 셀 수 있다. 창을 안 키우면
+        # StrategyConfig가 거부하므로, 명시하지 않았으면 딱 맞게 늘려 준다.
+        strategy_kwargs["exit_history_bars"] = max(
+            StrategyConfig().exit_history_bars, max_hold_bars
+        )
+    config = CycleConfig(strategy=StrategyConfig(**strategy_kwargs))
     if cooldown_days is not None:
         config = replace(config, gate=GateConfig(cooldown_days=cooldown_days))
     return config
@@ -813,11 +946,22 @@ def _run_backtest(
     cooldown_days: int | None,
     slippage_bps: float | None = None,
     stop_basis: str = "close",
+    interval: str = "1d",
+    symbols_arg: str | None = None,
+    max_hold_bars: int | None = None,
+    eod_exit_bars: int | None = None,
+    exit_history_bars: int | None = None,
 ) -> int:
     from sqlalchemy.exc import SQLAlchemyError
 
     from sontrader.adapters.broker_sim import SimBrokerConfig
-    from sontrader.apps.backtest import BacktestError, run_backtest
+    from sontrader.apps.backtest import (
+        BacktestError,
+        BarInterval,
+        exit_reason_breakdown,
+        partition_trades,
+        run_backtest,
+    )
     from sontrader.apps.report import build_report
     from sontrader.data.db import migrate
 
@@ -829,6 +973,20 @@ def _run_backtest(
         return 2
     if start > end:
         print("error: --start must be <= --end", file=sys.stderr)
+        return 2
+    bar_interval = BarInterval(interval)
+    symbols = [t.strip().zfill(6) for t in (symbols_arg or "").split(",") if t.strip()]
+    if bar_interval is BarInterval.MINUTE and not symbols:
+        # 분봉 유니버스는 watchlist_snapshots에서 나오지 않는다 (모멘텀 스윙
+        # 유니버스다). 조용히 그걸 쓰면 분봉이 없는 종목을 재생하게 된다.
+        print(
+            "error: --interval 1m 은 --symbols 로 유니버스를 명시해야 합니다 "
+            "(워치리스트 스냅샷은 스윙 유니버스라 분봉 재생에 쓰지 않습니다).",
+            file=sys.stderr,
+        )
+        return 2
+    if bar_interval is BarInterval.DAILY and symbols:
+        print("error: --symbols 는 --interval 1m 에서만 씁니다.", file=sys.stderr)
         return 2
     if use_llm and entry_trigger != "event":
         # 조용히 무시하면 "LLM을 켠 결과"라고 믿고 해석하게 된다.
@@ -850,9 +1008,29 @@ def _run_backtest(
         misses = None
         if use_llm:
             judge, misses = _build_cached_judge(engine, llm_model)
-        cycle_config = _build_cycle_config(entry_trigger, cooldown_days, stop_basis)
+        cycle_config = _build_cycle_config(
+            entry_trigger,
+            cooldown_days,
+            stop_basis,
+            max_hold_bars,
+            eod_exit_bars,
+            exit_history_bars,
+        )
         if stop_basis != "close":
             print(f"스톱 판정 기준: 봉 {stop_basis} (기본 close)")
+        if max_hold_bars is not None or eod_exit_bars is not None:
+            print(
+                f"당일 청산: max_hold_bars={max_hold_bars} eod_exit_bars={eod_exit_bars}"
+                f" (보유 판정 창 {cycle_config.strategy.exit_history_bars}봉)"
+            )
+        if bar_interval is BarInterval.DAILY and eod_exit_bars is not None:
+            # 일봉에는 세션 개념이 없어 session_bars_remaining이 늘 None이다.
+            # 조용히 무시하면 "EOD를 켠 결과"라고 믿고 해석하게 된다.
+            print(
+                "주의: --eod-exit-bars 는 --interval 1m 에서만 발동합니다 "
+                "(일봉은 세션 잔여 봉을 알 수 없습니다).",
+                file=sys.stderr,
+            )
         if entry_trigger == "watchlist":
             print("진입 트리거: 워치리스트 순위 (이벤트·LLM 미사용)")
         elif judge is None:
@@ -874,9 +1052,14 @@ def _run_backtest(
             judge=judge,
             broker_config=broker_config,
             cycle_config=cycle_config,
+            interval=bar_interval,
+            symbols=symbols or None,
         )
         final_equity = result.equity_curve[-1][1] if result.equity_curve else initial_cash
-        print(f"{start} ~ {end}: 사이클 {len(result.equity_curve)}일, 체결 {len(result.fills)}건")
+        print(
+            f"{start} ~ {end}: {len(result.equity_curve)}일 / 사이클 {result.cycles:,}회"
+            f" ({bar_interval.value}), 체결 {len(result.fills)}건"
+        )
         print(
             f"최종 현금 {result.final_cash:,}원, 보유 {len(result.final_positions)}종목,"
             f" 최종 평가자산 {final_equity:,}원"
@@ -890,6 +1073,27 @@ def _run_backtest(
                 f"주의: 저장된 판단이 없는 이벤트 {misses['n']}건 — 그만큼 진입 후보에서"
                 f" 빠졌습니다 (model={llm_model})."
             )
+
+        if result.halted_days:
+            # T23. 정지일은 당일 청산 전제가 깨지는 날이고 하락일에 몰려 있다 —
+            # 성과를 통째로 보면 그 표본이 결론을 끌고 간다.
+            _, affected = partition_trades(result)
+            print(
+                f"시장 정지일 {len(result.halted_days)}일"
+                f" (연속거래 구간 안의 결손 5분 이상) / 그 날에 걸친 거래 {len(affected)}건"
+            )
+            # 서킷브레이커는 시장별로 발동한다 — 합쳐서 세면 KOSPI가 멎은 날
+            # 거래된 KOSDAQ 종목이 정지 표본으로 잘못 섞인다.
+            for market, days in sorted(result.halted_by_market.items()):
+                shown = ", ".join(str(d) for d in days[:10])
+                print(f"  {market} {len(days)}일: {shown}" + (" …" if len(days) > 10 else ""))
+
+        breakdown = exit_reason_breakdown(result.closed_trades)
+        if breakdown:
+            # 사유별 분해 (R16). 총합만 보면 무엇이 성과를 만들었는지 알 수 없다.
+            print("청산 사유별 (비용 전 총수익 기준):")
+            for reason, (count, win_rate, avg) in breakdown.items():
+                print(f"  {reason:<10} {count:>5}건  승률 {win_rate:6.1%}  평균 {avg:+7.3%}")
 
         report = build_report(result, initial_cash=initial_cash)
         _print_report(report)
@@ -1034,6 +1238,37 @@ def main(argv: list[str] | None = None) -> int:
         help="저장분을 무시하고 구간 전체를 다시 받는다 (구멍 메우기 / 과거 확장)",
     )
 
+    index = sub.add_parser(
+        "collect-index",
+        help="업종/지수 일봉 수집 (상대 우위 판정 G3의 입력)",
+    )
+    index.add_argument(
+        "--codes",
+        default="0001,1001",
+        help="업종코드 쉼표 구분 (기본 0001=KOSPI, 1001=KOSDAQ; 2001은 KOSPI200)",
+    )
+    index.add_argument(
+        "--earliest", default=None, help="이 날짜(YYYYMMDD)까지만 소급. 생략하면 서버가 주는 만큼"
+    )
+
+    daytrade = sub.add_parser(
+        "daytrade-universe",
+        help="데이트레이딩 감시 대상 (D-1 거래량 상위) — 장전 1회 실행",
+    )
+    daytrade.add_argument("--date", default=None, help="감시 대상을 쓸 거래일 YYYYMMDD (기본 오늘)")
+    daytrade.add_argument(
+        "--min-trade-value",
+        type=int,
+        default=None,
+        help="D-1 거래대금 하한 원 (기본 10억). 저가 대량 거래가 슬롯을 먹는 것을 막는다",
+    )
+    daytrade.add_argument(
+        "--top-n",
+        type=int,
+        default=None,
+        help="상위 N종목 (기본 36 = 웹소켓 한도 41 − 최대보유 5)",
+    )
+
     backfill = sub.add_parser(
         "backfill-prices",
         help="일봉을 과거 방향으로 채운다 (collect-prices는 앞으로만 간다)",
@@ -1105,6 +1340,39 @@ def main(argv: list[str] | None = None) -> int:
         "실측치가 없어 결론이 이 값에 얼마나 민감한지 재는 용도 (docs/system/02)",
     )
     backtest.add_argument(
+        "--max-hold-bars",
+        type=int,
+        default=None,
+        help="보유 상한을 **봉 개수**로 (T24/R13). max-hold-days와 함께 걸리고 "
+        "먼저 닿는 쪽이 이긴다. 값은 백테스트가 정한다 — 기본값 없음",
+    )
+    backtest.add_argument(
+        "--eod-exit-bars",
+        type=int,
+        default=None,
+        help="세션 종료 N봉 전에 전량 청산 (R12, ExitReason.EOD). --interval 1m 전용. "
+        "세션 경계는 그날 실제 봉에서 유도한다 — 시각을 박지 않는다",
+    )
+    backtest.add_argument(
+        "--exit-history-bars",
+        type=int,
+        default=None,
+        help="청산 판정에 넘길 봉 개수 (기본 300). max-hold-bars보다 커야 한다",
+    )
+    backtest.add_argument(
+        "--interval",
+        choices=["1d", "1m"],
+        default="1d",
+        help="재생 봉 주기. 1d=일봉(기본), 1m=분봉. 분봉은 --symbols 필수이고 "
+        "KIS 보관 한계로 약 1년만 가능하다 (docs/system/00-개발-지시서.md R2c)",
+    )
+    backtest.add_argument(
+        "--symbols",
+        default=None,
+        help="분봉 재생 유니버스 (쉼표 구분, 넘긴 순서가 곧 워치리스트 순위). "
+        "--interval 1m 에서만 쓴다",
+    )
+    backtest.add_argument(
         "--stop-basis",
         choices=["close", "low"],
         default="close",
@@ -1138,6 +1406,10 @@ def main(argv: list[str] | None = None) -> int:
         return _run_collect_minutes(
             args.symbols, args.from_watchlist, args.days, args.pace, args.limit, args.refetch
         )
+    if args.command == "collect-index":
+        return _run_collect_index(args.codes, args.earliest)
+    if args.command == "daytrade-universe":
+        return _run_daytrade_universe(args.date, args.min_trade_value, args.top_n)
     if args.command == "collect-prices":
         return _run_collect_prices(args.limit, args.pace, args.lookback_days)
     if args.command == "backfill-prices":
@@ -1163,6 +1435,11 @@ def main(argv: list[str] | None = None) -> int:
             args.cooldown_days,
             args.slippage_bps,
             args.stop_basis,
+            args.interval,
+            args.symbols,
+            args.max_hold_bars,
+            args.eod_exit_bars,
+            args.exit_history_bars,
         )
     if args.command == "slippage":
         return _run_slippage(args.since)
