@@ -16,8 +16,30 @@ from dotenv import load_dotenv
 REAL_BASE_URL = "https://openapi.koreainvestment.com:9443"
 PAPER_BASE_URL = "https://openapivts.koreainvestment.com:29443"
 
-DEFAULT_TOKEN_CACHE = Path.home() / ".cache" / "sontrader" / "token.json"
-DEFAULT_APPROVAL_KEY_CACHE = Path.home() / ".cache" / "sontrader" / "approval_key.json"
+_CACHE_DIR = Path.home() / ".cache" / "sontrader"
+
+# 캐시 경로는 **모드별로 갈린다** (T31). 예전에는 파일 하나를 모의·실전이
+# 함께 썼는데, 캐시가 발급 도메인을 함께 적으므로 모드가 다르면 매번 미스가
+# 나고 재발급을 시도한다. 그리고 KIS는 **재발급 시 이전 토큰을 무효화**하고
+# 발급 자체가 1분당 1회다.
+#
+# 실제로 겪었다 — 몇 시간짜리 실전 백필이 도는 중에 모의 명령을 돌리자
+# 두 프로세스가 파일 하나를 서로 덮으며 `EGW00133`을 반복했다. 우회책
+# (`SONTRADER_TOKEN_CACHE`를 손으로 분리)이 있었지만, **사람이 매번 기억해야
+# 하는 규약은 이 저장소에서 반복해 실패했다** — 한 번 빠뜨리면 조용히
+# 토큰을 뺏긴다. 그래서 기본값이 스스로 갈리게 한다.
+DEFAULT_TOKEN_CACHE = _CACHE_DIR / "token.json"
+DEFAULT_APPROVAL_KEY_CACHE = _CACHE_DIR / "approval_key.json"
+
+
+def default_token_cache(paper: bool) -> Path:
+    """모드별 기본 토큰 캐시 경로."""
+    return _CACHE_DIR / f"token-{'paper' if paper else 'real'}.json"
+
+
+def default_approval_key_cache(paper: bool) -> Path:
+    """모드별 기본 접속키 캐시 경로 (토큰과 같은 이유)."""
+    return _CACHE_DIR / f"approval_key-{'paper' if paper else 'real'}.json"
 
 
 @dataclass(frozen=True)
@@ -145,6 +167,16 @@ def _load_credentials(paper: bool) -> tuple[str, str, str, str]:
     return values[0], values[1], values[2], used[2]
 
 
+def _cache_path(env_name: str, fallback: Path) -> Path:
+    """명시한 경로가 있으면 그것, 없으면 모드별 기본값.
+
+    빈 문자열은 미설정으로 본다 — `.env`에 `SONTRADER_TOKEN_CACHE=`만 남겨
+    두는 흔한 실수가 캐시를 현재 디렉토리로 보내는 것을 막는다.
+    """
+    raw = os.environ.get(env_name)
+    return Path(raw).expanduser() if raw else fallback
+
+
 def load_settings() -> Settings:
     load_dotenv()
     paper = os.environ.get("KIS_PAPER", "true").strip().lower() not in ("false", "0", "no")
@@ -157,10 +189,14 @@ def load_settings() -> Settings:
         )
     # expanduser: .env의 "~/..."가 확장되지 않으면 리포지토리 안에 "~" 디렉토리가
     # 생겨 토큰이 저장소에 커밋될 뻔한 사고가 실제로 있었다.
-    token_cache = Path(os.environ.get("SONTRADER_TOKEN_CACHE", DEFAULT_TOKEN_CACHE)).expanduser()
-    approval_key_cache = Path(
-        os.environ.get("SONTRADER_APPROVAL_KEY_CACHE", DEFAULT_APPROVAL_KEY_CACHE)
-    ).expanduser()
+    #
+    # **명시한 경로가 우선한다.** 우회책으로 경로를 직접 넘기던 스크립트를
+    # 깨뜨리지 않기 위해서다. 다만 그때는 모드 분리가 호출자 몫이 된다 —
+    # 두 모드에 같은 경로를 주면 T31의 사고가 그대로 재현된다.
+    token_cache = _cache_path("SONTRADER_TOKEN_CACHE", default_token_cache(paper))
+    approval_key_cache = _cache_path(
+        "SONTRADER_APPROVAL_KEY_CACHE", default_approval_key_cache(paper)
+    )
     return Settings(
         app_key=app_key,
         app_secret=app_secret,

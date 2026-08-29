@@ -169,3 +169,61 @@ def test_error_names_the_variable_that_is_actually_used(env):
 
     with pytest.raises(RuntimeError, match="KIS_ACCOUNT_PAPER_NO"):
         load_settings()
+
+
+# --- 토큰 캐시 모드 분리 (T31) ------------------------------------------------
+
+
+def test_the_token_cache_path_differs_between_paper_and_real(monkeypatch):
+    """파일 하나를 두 모드가 함께 쓰면 매번 캐시 미스가 나고, 재발급은
+    1분당 1회 제한에 걸린다. 게다가 KIS는 재발급 시 이전 토큰을 무효화하므로
+    몇 시간짜리 수집이 도는 중에 다른 모드를 돌리면 그 토큰이 죽는다."""
+    from sontrader.config import default_approval_key_cache, default_token_cache
+
+    assert default_token_cache(paper=True) != default_token_cache(paper=False)
+    assert default_approval_key_cache(paper=True) != default_approval_key_cache(paper=False)
+    assert "paper" in default_token_cache(paper=True).name
+    assert "real" in default_token_cache(paper=False).name
+
+
+def test_load_settings_picks_the_cache_by_mode(monkeypatch, tmp_path):
+    # 빈 값으로 덮는다. `load_dotenv()`는 이미 있는 환경변수를 덮지 않으므로
+    # 이것이 `.env`의 값을 무력화하는 방법이다 — `delenv`로는 안 된다
+    # (`load_settings()` 안에서 dotenv가 다시 채운다).
+    monkeypatch.setenv("SONTRADER_TOKEN_CACHE", "")
+    monkeypatch.setenv("SONTRADER_APPROVAL_KEY_CACHE", "")
+    monkeypatch.setenv("KIS_APP_KEY", "k")
+    monkeypatch.setenv("KIS_APP_SECRET", "s")
+    monkeypatch.setenv("KIS_ACCOUNT_NO", "12345678-01")
+
+    monkeypatch.setenv("KIS_PAPER", "true")
+    paper = load_settings()
+    monkeypatch.setenv("KIS_PAPER", "false")
+    real = load_settings()
+
+    assert paper.token_cache != real.token_cache
+
+
+def test_an_explicit_cache_path_still_wins(monkeypatch, tmp_path):
+    """우회책으로 경로를 직접 넘기던 스크립트를 깨뜨리지 않는다."""
+    monkeypatch.setenv("KIS_APP_KEY", "k")
+    monkeypatch.setenv("KIS_APP_SECRET", "s")
+    monkeypatch.setenv("KIS_ACCOUNT_NO", "12345678-01")
+    explicit = tmp_path / "mine.json"
+    monkeypatch.setenv("SONTRADER_TOKEN_CACHE", str(explicit))
+
+    assert load_settings().token_cache == explicit
+
+
+def test_an_empty_cache_env_var_falls_back_to_the_default(monkeypatch):
+    """`.env`에 `SONTRADER_TOKEN_CACHE=`만 남겨 두는 흔한 실수가 캐시를
+    현재 디렉토리로 보내면 안 된다."""
+    monkeypatch.setenv("KIS_APP_KEY", "k")
+    monkeypatch.setenv("KIS_APP_SECRET", "s")
+    monkeypatch.setenv("KIS_ACCOUNT_NO", "12345678-01")
+    monkeypatch.setenv("KIS_PAPER", "true")
+    monkeypatch.setenv("SONTRADER_TOKEN_CACHE", "")
+
+    from sontrader.config import default_token_cache
+
+    assert load_settings().token_cache == default_token_cache(paper=True)
