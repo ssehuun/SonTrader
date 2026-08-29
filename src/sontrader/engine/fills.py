@@ -52,7 +52,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from sontrader.adapters.broker import OrderResult
-from sontrader.core.types import ExitRule, OrderStatus, Side
+from sontrader.core.types import ExitReason, ExitRule, OrderStatus, Side
 
 
 @dataclass(frozen=True)
@@ -75,6 +75,9 @@ class Closed:
     exited_at: datetime
     exit_price: int
     qty: int
+    # 왜 팔았는가. 주문이 실어 온 값을 그대로 쓴다 — 여기서 다시 판정하지
+    # 않는다(R16). 목표에서 그냥 빠져 나간 청산은 None이다.
+    exit_reason: ExitReason | None = None
 
 
 def position_changes(
@@ -138,6 +141,7 @@ def position_changes(
                     exited_at=fill.ts,
                     exit_price=fill.price,
                     qty=filled,
+                    exit_reason=order.exit_reason,
                 )
             )
 

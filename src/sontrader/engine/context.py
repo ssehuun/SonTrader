@@ -61,15 +61,28 @@ class InMemoryBarView:
     def history(self, symbol: str, count: int) -> list[Bar]:
         if count <= 0:
             return []
-        return self._visible(symbol)[-count:]
+        end = self._visible_end(symbol)
+        return self._bars[symbol][max(0, end - count) : end] if end else []
 
     def latest(self, symbol: str) -> Bar | None:
-        visible = self._visible(symbol)
-        return visible[-1] if visible else None
+        end = self._visible_end(symbol)
+        return self._bars[symbol][end - 1] if end else None
 
-    def _visible(self, symbol: str) -> list[Bar]:
+    def _visible_end(self, symbol: str) -> int:
+        """`now`까지 보이는 봉의 개수 (= 슬라이스 끝 인덱스).
+
+        **인덱스만 돌려주고 리스트를 만들지 않는다.** 예전에는 `_visible()`이
+        `bars[:idx]`로 보이는 구간 전체를 복사해 돌려줬고, `history()`가 거기서
+        다시 뒤 `count`개를 잘랐다 — 일봉(종목당 약 2천 봉)에서는 눈에 띄지
+        않았지만 분봉에서는 종목당 약 95,000봉이라 사이클마다 그 복사가 돈다.
+        1년 분봉 재생은 약 95,000사이클 × 보유종목이라, 그대로 두면 재생 시간이
+        분 단위가 아니라 시간 단위가 된다(실측: 이 변경으로 3종목 1년 재생이
+        약 30배 빨라졌다).
+
+        결과는 이전과 완전히 같다 — `now` 시각의 봉은 포함하고(bisect_right),
+        그 이후는 애초에 시야에 없다.
+        """
         timestamps = self._timestamps.get(symbol)
         if not timestamps:
-            return []
-        idx = bisect.bisect_right(timestamps, self.now)
-        return self._bars[symbol][:idx]
+            return 0
+        return bisect.bisect_right(timestamps, self.now)

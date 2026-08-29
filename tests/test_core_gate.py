@@ -327,3 +327,26 @@ def test_rejection_order_follows_input_order():
 def test_invalid_config_is_rejected(kwargs):
     with pytest.raises(ValueError):
         GateConfig(**kwargs)
+
+
+def test_cooldown_days_one_is_exactly_the_same_day_reentry_block():
+    """**R14는 새 손잡이가 필요 없다.**
+
+    분봉에서 "같은 날 1회"를 표현할 수 없다는 것이 R14의 전제였는데,
+    `cooldown_days=1`이 정확히 그것이다 — `(now.date() - last_exit.date()).days
+    < 1`이므로 청산한 날의 나머지 사이클이 전부 막히고 다음 거래일에 풀린다.
+
+    봉 단위 손잡이를 따로 두면 같은 것을 두 번 표현하게 되고, 어느 쪽이
+    이기는지를 나중에 되짚어야 한다.
+    """
+    exited = NOW.replace(hour=10, minute=0)
+
+    same_day = make_ctx(now=exited.replace(hour=15, minute=19), last_exit_at={"100": exited})
+    blocked = apply(Target((entry("100"),)), same_day, GateConfig(cooldown_days=1))
+    assert len(blocked.target) == 0
+    assert blocked.rejections[0].reason is RejectReason.COOLDOWN
+
+    next_day = make_ctx(
+        now=(exited + timedelta(days=1)).replace(hour=9, minute=0), last_exit_at={"100": exited}
+    )
+    assert len(apply(Target((entry("100"),)), next_day, GateConfig(cooldown_days=1)).target) == 1

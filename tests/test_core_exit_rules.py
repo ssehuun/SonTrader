@@ -330,3 +330,116 @@ def test_old_stored_rules_without_a_stop_basis_default_to_close():
     payload = {k: v for k, v in ExitRule().to_dict().items() if k != "stop_basis"}
 
     assert ExitRule.from_dict(payload).stop_basis is StopBasis.CLOSE
+
+
+# --- 봉 개수 보유 상한 (T24 선택지 B / R13) -----------------------------------
+#
+# 달력일로는 "오늘 안에 닫는다"를 표현할 수 없다 — 최소 단위가 1일이고
+# `max_hold_days=1`은 "다음 날 첫 사이클", 0은 `__post_init__`이 거부한다.
+
+
+def test_max_hold_bars_fires_on_bar_count_not_on_the_calendar():
+    rule = ExitRule(max_hold_bars=3)
+    position = make_position(rule)
+    # 진입 봉 포함 3봉째에 발동. 같은 날 안이라 max_hold_days(30)는 걸리지 않는다.
+    bars = make_series([10_000, 10_010, 10_020])
+
+    signal = evaluate(position, bars, now=bars[-1].ts)
+
+    assert signal is not None
+    assert signal.reason is ExitReason.MAX_HOLD
+
+
+def test_max_hold_bars_does_not_fire_one_bar_early():
+    position = make_position(ExitRule(max_hold_bars=3))
+    bars = make_series([10_000, 10_010])
+
+    assert evaluate(position, bars, now=bars[-1].ts) is None
+
+
+def test_max_hold_bars_is_off_by_default():
+    """기본값 None = 스윙 동작 그대로. 기준선이 움직이면 안 된다."""
+    assert ExitRule().max_hold_bars is None
+    position = make_position()
+    bars = make_series([10_000] * 50)
+
+    assert evaluate(position, bars, now=bars[-1].ts) is None
+
+
+def test_bars_before_entry_are_not_counted_toward_the_hold_cap():
+    """ATR 창을 채우려고 진입 이전 봉을 함께 넘긴다 — 그것까지 세면 안 된다."""
+    position = make_position(ExitRule(max_hold_bars=3), entered_at=ENTRY_TS + timedelta(minutes=5))
+    bars = make_series([10_000] * 6)  # 진입 이후 봉은 1개(index 5)뿐
+
+    assert evaluate(position, bars, now=bars[-1].ts) is None
+
+
+def test_calendar_and_bar_caps_both_apply_and_the_first_one_wins():
+    """둘을 함께 걸 수 있다. 스윙 규칙을 유지한 채 봉 상한만 얹는 경우."""
+    position = make_position(ExitRule(max_hold_days=1, max_hold_bars=10_000))
+    bars = make_series([10_000, 10_010])
+
+    signal = evaluate(position, bars, now=ENTRY_TS + timedelta(days=1))
+
+    assert signal is not None
+    assert signal.reason is ExitReason.MAX_HOLD  # 봉은 2개뿐인데 달력일이 먼저 걸렸다
+
+
+# --- 세션 종료 청산 (R12) -----------------------------------------------------
+
+
+def test_eod_fires_when_the_session_is_about_to_end():
+    position = make_position(ExitRule(eod_exit_bars=20))
+    bars = make_series([10_000, 10_010])
+
+    signal = evaluate(position, bars, now=bars[-1].ts, session_bars_remaining=20)
+
+    assert signal is not None
+    assert signal.reason is ExitReason.EOD
+
+
+def test_eod_does_not_fire_while_the_session_still_has_room():
+    position = make_position(ExitRule(eod_exit_bars=20))
+    bars = make_series([10_000, 10_010])
+
+    assert evaluate(position, bars, now=bars[-1].ts, session_bars_remaining=21) is None
+
+
+def test_eod_never_fires_when_the_remaining_bar_count_is_unknown():
+    """일봉 재생에는 세션 개념이 없어 늘 None이다. 여기서 발동하면 **매 사이클**
+    청산하게 되고 일봉 기준선이 통째로 무너진다."""
+    position = make_position(ExitRule(eod_exit_bars=20))
+    bars = make_series([10_000, 10_010])
+
+    assert evaluate(position, bars, now=bars[-1].ts, session_bars_remaining=None) is None
+
+
+def test_a_stop_breach_outranks_the_session_ending():
+    """사유 분해(R16)가 의미를 가지려면 순서가 고정돼야 한다."""
+    position = make_position(ExitRule(eod_exit_bars=20))
+    bars = make_series([10_000, 9_000])  # 고정 손절(-5%) 이탈
+
+    signal = evaluate(position, bars, now=bars[-1].ts, session_bars_remaining=0)
+
+    assert signal is not None
+    assert signal.reason is ExitReason.STOP
+
+
+def test_exit_rule_rejects_nonsense_bar_caps():
+    with pytest.raises(ValueError, match="max_hold_bars"):
+        ExitRule(max_hold_bars=0)
+    with pytest.raises(ValueError, match="eod_exit_bars"):
+        ExitRule(eod_exit_bars=-1)
+
+
+def test_the_new_fields_survive_a_round_trip_through_storage():
+    """`positions.exit_rule_json`에 실려 나갔다 돌아와도 같아야 한다 —
+    아니면 재시작 후 그 포지션만 다른 규칙으로 판정된다."""
+    rule = ExitRule(max_hold_bars=380, eod_exit_bars=20)
+    assert ExitRule.from_dict(rule.to_dict()) == rule
+    # None도 살아남아야 한다. `int(None)`은 터진다.
+    plain = ExitRule()
+    assert ExitRule.from_dict(plain.to_dict()) == plain
+    # 예전에 저장된(이 필드가 없는) 레코드도 읽혀야 한다.
+    legacy = {"technical": "atr_trailing", "max_hold_days": 30}
+    assert ExitRule.from_dict(legacy).max_hold_bars is None

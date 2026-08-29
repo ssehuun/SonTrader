@@ -42,6 +42,15 @@ high_water를 올리면 스톱이 그만큼 타이트해져 같은 노이즈가 
 
 봉의 주기(1분/1일)는 이 모듈이 알지 않는다. `atr_period`는 개수일 뿐이고,
 어떤 봉을 넣을지는 주입하는 쪽이 정한다 (설계 8절 — 백테스트로 확정).
+
+**4. 시각을 알지 않는다 — 세션 경계도 주입된다.**
+데이트레이딩의 "장 마감 전 전량 정리"는 `eod_exit_bars`(세션 종료 N봉 전)로
+표현하고, **남은 봉 수는 `evaluate()`의 인자로 들어온다.** 여기서 "15:20"을
+계산하지 않는다: 실측 251거래일 중 11일이 09:00~15:30이 아니고(10:00 개장,
+16:30 마감, 15:32 지연 단일가 등) 시각을 박으면 4.4%의 날에서 깨진다.
+보유 상한도 같은 이유로 달력일(`max_hold_days`) 옆에 **봉 개수**
+(`max_hold_bars`)를 뒀다 — 정지일에 자동으로 느슨해지고, 그게 T23 규약과
+방향이 같다.
 """
 
 from __future__ import annotations
@@ -49,19 +58,33 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from enum import Enum
 
-from sontrader.core.types import Bar, ExitRule, Position, StopBasis, TechnicalExit
+from sontrader.core.types import (
+    Bar,
+    ExitReason,
+    ExitRule,
+    Position,
+    StopBasis,
+    TechnicalExit,
+)
+
+# `ExitReason`은 `core/types.py`에 있다 — `Order`가 실어 나르려면 거기 있어야
+# 순환 import가 안 생긴다. 여기서 다시 내보내 기존 호출부를 안 깨뜨린다.
+__all__ = [
+    "ExitReason",
+    "ExitSignal",
+    "average_true_range",
+    "bars_held",
+    "evaluate",
+    "stop_level",
+    "trailing_stop",
+    "true_ranges",
+]
 
 # 본전 이동 문턱은 `ExitRule.breakeven_trigger`로 옮겼다 — 다른 스톱
 # 파라미터(stop_loss_pct·atr_k·atr_period)가 전부 거기 있는데 이것만 모듈
 # 상수라 주입할 수 없었고, 포지션에 함께 저장되지 않아 전역 값을 바꾸면
 # 과거 포지션의 스톱 레벨이 재현되지 않았다.
-
-
-class ExitReason(str, Enum):
-    STOP = "stop"  # 스톱 레벨 이탈 (고정 손절 / 본전 / ATR 트레일링)
-    MAX_HOLD = "max_hold"  # 최대 보유기간 상한 — 스톱과 무관하게 별도 강제
 
 
 @dataclass(frozen=True)
@@ -132,11 +155,17 @@ def evaluate(
     bars: Sequence[Bar],
     *,
     now: datetime,
+    session_bars_remaining: int | None = None,
 ) -> ExitSignal | None:
     """청산 발동 여부. 발동하지 않으면 None.
 
-    스톱을 먼저 본다 — 둘 다 해당하면 더 구체적인 사유를 남기는 편이 낫다
-    (집행은 어느 쪽이든 시장가 즉시 청산으로 동일하다).
+    판정 순서는 **스톱 → 보유 상한 → 세션 종료**다. 둘 이상 해당하면 더
+    구체적인 사유를 남기는 편이 낫다 — 집행은 어느 쪽이든 시장가 즉시 청산으로
+    동일하므로 순서가 성과를 바꾸지 않고, 사유별 분해(리서처 R16)만 달라진다.
+
+    `session_bars_remaining`은 **주입된다**. 이 함수는 장 마감 시각을 모르고,
+    알아서도 안 된다(구조 원칙 1) — 실측 251거래일 중 11일이 09:00~15:30이
+    아니라 시각을 박으면 4.4%의 날에서 깨진다.
     """
     rule = position.exit_rule
     if rule.technical is not TechnicalExit.ATR_TRAILING:
@@ -154,17 +183,40 @@ def evaluate(
             position.symbol, ExitReason.STOP, level, _stop_price(last, rule.stop_basis)
         )
 
+    fallback_price = last.close if last is not None else None
+
     # 거래일이 아니라 **달력일**이다 — core는 휴장일 캘린더를 알지 않는다
     # (구조 원칙 1). LLM이 출력하는 "최대보유일"도 달력일 감각에 가깝다.
     held_days = (now.date() - position.entered_at.date()).days
     if held_days >= rule.max_hold_days:
-        return ExitSignal(
-            position.symbol,
-            ExitReason.MAX_HOLD,
-            level,
-            last.close if last is not None else None,
-        )
+        return ExitSignal(position.symbol, ExitReason.MAX_HOLD, level, fallback_price)
+
+    # 봉 개수 상한 (T24 선택지 B). 달력일과 **함께** 걸리고 먼저 닿는 쪽이 이긴다.
+    if rule.max_hold_bars is not None and bars_held(position, bars) >= rule.max_hold_bars:
+        return ExitSignal(position.symbol, ExitReason.MAX_HOLD, level, fallback_price)
+
+    # 세션 종료 임박 (R12). 남은 봉 수를 모르면(None) 발동하지 않는다 —
+    # 일봉 재생처럼 세션 개념이 없는 경로에서 조용히 매일 청산하지 않기 위해서다.
+    if (
+        rule.eod_exit_bars is not None
+        and session_bars_remaining is not None
+        and session_bars_remaining <= rule.eod_exit_bars
+    ):
+        return ExitSignal(position.symbol, ExitReason.EOD, level, fallback_price)
+
     return None
+
+
+def bars_held(position: Position, bars: Sequence[Bar]) -> int:
+    """진입 시각 이후(포함) 봉 개수.
+
+    **`bars`가 잘려 있으면 과소 계산된다.** 호출자가 넘기는 창은
+    `StrategyConfig.exit_history_bars`(기본 300)이므로, `max_hold_bars`를
+    그보다 크게 잡으면 상한이 영영 안 걸린다. 분봉 세션이 약 380봉이라
+    데이트레이딩에서는 창을 함께 키워야 한다 — `StrategyConfig.__post_init__`이
+    그 조합을 막는다.
+    """
+    return sum(1 for bar in bars if bar.ts >= position.entered_at)
 
 
 def _stop_price(bar: Bar, basis: StopBasis) -> int:

@@ -60,6 +60,7 @@ from datetime import datetime
 
 from sontrader.core.types import (
     Context,
+    ExitReason,
     ExitRule,
     Order,
     OrderType,
@@ -127,6 +128,9 @@ def to_orders(target: Target, ctx: Context, config: DiffConfig | None = None) ->
                 urgency=urgency,
                 now=ctx.now,
                 event_id=pos.event_id,
+                # 전략이 판정한 청산 사유. 목표에서 그냥 빠진 종목(item is None)은
+                # 사유가 없다 — 그건 청산 규칙이 아니라 리밸런싱이다.
+                exit_reason=item.exit_reason if item is not None else None,
                 ref_price=exit_bar.close if exit_bar is not None else None,
             )
         )
@@ -201,6 +205,7 @@ def _order(
     now: datetime,
     event_id: str | None,
     exit_rule: ExitRule | None = None,
+    exit_reason: ExitReason | None = None,
     ref_price: int | None = None,
 ) -> Order:
     # 진입도 청산도 시장가다. 차이는 타이밍(urgency)뿐이며, 그 해석은 집행기가
@@ -215,5 +220,6 @@ def _order(
         ts=now,
         event_id=event_id,
         exit_rule=exit_rule,
+        exit_reason=exit_reason,
         ref_price=ref_price,
     )

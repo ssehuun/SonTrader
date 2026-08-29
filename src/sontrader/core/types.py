@@ -38,6 +38,21 @@ class Urgency(str, Enum):
     NEXT_OPEN = "NEXT_OPEN"  # 진입 — 다음 개장 시가
 
 
+class ExitReason(str, Enum):
+    """왜 팔았는가. **`core/exit_rules.py`가 판정하지만 타입은 여기 둔다** —
+    `Order`가 이 값을 싣고 다녀야 하는데(리서처 R16), 타입이 exit_rules에
+    있으면 types ← exit_rules ← types 순환이 된다.
+
+    사유를 주문에 실어 보내는 이유는 `exit_rule`과 같다 — 실전은 체결에 시차가
+    있어서, 체결을 확인하는 사이클에는 판정 근거가 이미 사라져 있다. 사후에
+    다시 계산하면 그때의 봉으로 재판정하게 되어 원래 사유와 갈릴 수 있다.
+    """
+
+    STOP = "stop"  # 스톱 레벨 이탈 (고정 손절 / 본전 / ATR 트레일링)
+    MAX_HOLD = "max_hold"  # 최대 보유기간 상한 (달력일 또는 봉 개수)
+    EOD = "eod"  # 세션 종료 임박 — 오버나이트 금지 (데이트레이딩)
+
+
 class Side(str, Enum):
     BUY = "buy"
     SELL = "sell"
@@ -148,6 +163,26 @@ class ExitRule:
 
     technical: TechnicalExit = TechnicalExit.ATR_TRAILING
     max_hold_days: int = 30
+    # 보유 상한을 **봉 개수**로도 건다 (T24 선택지 B / 리서처 R13). None이면 미사용.
+    #
+    # `max_hold_days`와 함께 적용되고 **먼저 걸리는 쪽이 이긴다.** 데이트레이딩은
+    # 하루 안에 닫아야 하는데 달력일 최소 단위가 1이라 그것으로는 표현할 수
+    # 없었다 — `max_hold_days=1`은 "다음 날 첫 사이클"이고 0은 거부된다.
+    #
+    # **왜 시각이 아니라 개수인가**: core는 장 마감 시각을 알지 않는다(구조 원칙
+    # 1). 시각을 넣으면 "15:20"이 상수로 박히는데, 실측 251거래일 중 11일이
+    # 09:00~15:30이 아니다(`docs/system/02-매매-정교화.md` T23). 개수로 두면
+    # 정지일에 자동으로 느슨해지고, 그게 T23 규약과 방향이 같다.
+    #
+    # **값은 백테스트가 정한다** (01문서 §8). 기본 None = 스윙 동작 그대로.
+    max_hold_bars: int | None = None
+    # 세션 종료 N봉 전에 청산 신호를 낸다 (`ExitReason.EOD` / 리서처 R12).
+    # None이면 미사용. 남은 봉 수는 **주입된다**(`Context.session_bars_remaining`)
+    # — core가 세션 경계를 계산하지 않는다는 뜻이다.
+    #
+    # **값은 백테스트가 정한다.** 리서처 설계는 20봉을 예시로 들었지만 그것도
+    # 확정값이 아니다 (04-ORB-설계 §8.1).
+    eod_exit_bars: int | None = None
     stop_loss_pct: float = -0.05  # 진입가 대비 고정 손절 (음수)
     atr_period: int = 14  # 봉 개수. 봉 주기는 주입하는 쪽이 정한다
     atr_k: float = 2.0
@@ -164,6 +199,10 @@ class ExitRule:
     def __post_init__(self) -> None:
         if self.max_hold_days <= 0:
             raise ValueError(f"max_hold_days must be positive: {self.max_hold_days}")
+        if self.max_hold_bars is not None and self.max_hold_bars < 1:
+            raise ValueError(f"max_hold_bars must be >= 1 or None: {self.max_hold_bars}")
+        if self.eod_exit_bars is not None and self.eod_exit_bars < 0:
+            raise ValueError(f"eod_exit_bars must be >= 0 or None: {self.eod_exit_bars}")
         if not -1.0 < self.stop_loss_pct < 0.0:
             raise ValueError(f"stop_loss_pct must be in (-1, 0): {self.stop_loss_pct}")
         if self.atr_period < 1:
@@ -178,6 +217,8 @@ class ExitRule:
         return {
             "technical": self.technical.value,
             "max_hold_days": self.max_hold_days,
+            "max_hold_bars": self.max_hold_bars,
+            "eod_exit_bars": self.eod_exit_bars,
             "stop_loss_pct": self.stop_loss_pct,
             "atr_period": self.atr_period,
             "atr_k": self.atr_k,
@@ -208,12 +249,19 @@ class ExitRule:
         return cls(
             technical=technical,
             max_hold_days=int(payload.get("max_hold_days", defaults.max_hold_days)),
+            max_hold_bars=_optional_int(payload.get("max_hold_bars", defaults.max_hold_bars)),
+            eod_exit_bars=_optional_int(payload.get("eod_exit_bars", defaults.eod_exit_bars)),
             stop_loss_pct=float(payload.get("stop_loss_pct", defaults.stop_loss_pct)),
             atr_period=int(payload.get("atr_period", defaults.atr_period)),
             atr_k=float(payload.get("atr_k", defaults.atr_k)),
             breakeven_trigger=float(payload.get("breakeven_trigger", defaults.breakeven_trigger)),
             stop_basis=stop_basis,
         )
+
+
+def _optional_int(value: Any) -> int | None:
+    """저장된 JSON의 `None`을 살려서 읽는다 — `int(None)`은 터진다."""
+    return None if value is None else int(value)
 
 
 @dataclass(frozen=True)
@@ -243,6 +291,9 @@ class TargetItem:
     urgency: Urgency
     exit_rule: ExitRule | None = None  # 신규 진입에만 존재
     event_id: str | None = None
+    # 청산 항목(weight=0)에만 존재. 왜 팔기로 했는지를 주문까지 실어 보낸다
+    # (R16) — 없으면 성과를 만든 것이 스톱인지 EOD인지 나중에 못 가른다.
+    exit_reason: ExitReason | None = None
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.weight <= 1.0:
@@ -300,6 +351,12 @@ class Order:
     종목이 이미 없을 수 있다. 그러면 청산 조건을 복원할 방법이 사라지고,
     포지션이 스톱 없이 방치된다. 백테스트는 즉시 체결이라 이 문제를 겪지 않아
     `CycleResult.target`에서 꺼내 써 왔지만, 그 방식은 실전에서 성립하지 않는다.
+
+    `exit_reason`은 **왜 파는가**다(매도만; 매수는 None). 같은 이유로 주문이
+    들고 간다 — 체결을 확인하는 사이클에는 판정 근거가 된 봉이 이미 지나가
+    있어서, 사후에 다시 계산하면 그때의 봉으로 재판정하게 되고 원래 사유와
+    갈릴 수 있다. 이게 없으면 성과를 만든 것이 스톱인지 EOD인지 못 가른다
+    (리서처 R16).
     """
 
     idempotency_key: str
@@ -313,6 +370,8 @@ class Order:
     event_id: str | None = None
     order_id: str | None = None
     exit_rule: ExitRule | None = None
+    # 왜 파는가 (매도만). 위 docstring 참고 — 성과 분해(R16)의 유일한 근거다.
+    exit_reason: ExitReason | None = None
     # 이 주문을 만들 때 본 가격 — 마지막 완성 봉의 종가(`core/diff.py`).
     # 집행에는 쓰이지 않는다(시장가다). 오직 **사후 측정**을 위해 실어 나른다:
     # 체결가 − 이 값 = 의사결정 시점부터 체결까지 실제로 잃은 가격이고, 그
@@ -429,6 +488,15 @@ class Context:
     # (예: 37종목인데 최대 rank 42). 위치+1을 쓰면 그건 저장된 순위가 아니라
     # 재계산한 순위이고, 01문서 §5.2의 "재계산 금지"를 어긴다.
     watchlist_ranks: Mapping[str, int] = field(default_factory=dict)
+    # 이 세션에 **남은 연속거래 봉 수** (`now` 이후, 마감 단일가 봉 제외).
+    # `ExitRule.eod_exit_bars` 판정의 유일한 입력이다. None이면 모른다는 뜻이고
+    # EOD 청산은 발동하지 않는다 — 일봉 재생과 세션 정보가 없는 실전 경로가 그렇다.
+    #
+    # **core가 세션 경계를 계산하지 않는 이유가 이 필드다.** 실측 251거래일 중
+    # 11일이 09:00~15:30이 아니라(10:00 개장, 16:30 마감, 15:32 지연 단일가 등)
+    # 시각을 박으면 4.4%의 날에서 깨진다. 그날의 실제 봉에서 유도한 값을
+    # 어댑터가 넣어 준다 (`apps/backtest.py`의 `SessionShape`).
+    session_bars_remaining: int | None = None
 
     def position(self, symbol: str) -> Position | None:
         for pos in self.positions:

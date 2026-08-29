@@ -52,6 +52,10 @@
 20% 상한과 5슬롯 개념이 무의미해진다. 재진입은 청산 후에만 가능하고, 그마저도
 게이트의 쿨다운·동일이벤트 규칙이 막을 수 있다.
 
+**4-b. `max_hold_bars`를 쓰면 `exit_history_bars`가 그보다 커야 한다.**
+보유 봉 수는 넘긴 창 안에서만 셀 수 있다. 창이 짧으면 상한이 영영 안 걸리고
+조용히 무시되므로 `__post_init__`이 그 조합을 거부한다.
+
 **4. `exit_history_bars`는 봉 주기를 모른 채로 넘기는 개수다.**
 `core/exit_rules.py`와 같은 이유로 이 모듈도 봉 주기(1분/1일)를 알지 않는다.
 기본값 300은 일봉 기준(ATR 창 + 최대보유일 여유)이며, 분봉을 주입하는 호출자는
@@ -92,11 +96,25 @@ class StrategyConfig:
     # 있고(CycleConfig.strategy → build_target), (b) "진입에 어떤 청산 조건을
     # 붙일지"가 전략의 결정이기 때문이다. 파라미터 스윕의 주입 지점이 된다.
     exit_rule: ExitRule = field(default_factory=ExitRule)
+
     def __post_init__(self) -> None:
         if not 0.0 < self.entry_weight <= 1.0:
             raise ValueError(f"entry_weight must be in (0, 1]: {self.entry_weight}")
         if self.exit_history_bars < 1:
             raise ValueError(f"exit_history_bars must be >= 1: {self.exit_history_bars}")
+        # `max_hold_bars`는 이 창 안에서만 셀 수 있다 (`exit_rules.bars_held`).
+        # 창이 더 짧으면 상한이 **영영 안 걸리고** 조용히 무시된다 — 분봉
+        # 세션이 약 380봉이라 기본값 300으로는 세션 하나도 못 담는다.
+        # 여기서 막지 않으면 "왜 max_hold가 안 걸리지"를 나중에 되짚어야 한다.
+        if (
+            self.exit_rule.max_hold_bars is not None
+            and self.exit_rule.max_hold_bars > self.exit_history_bars
+        ):
+            raise ValueError(
+                f"exit_history_bars({self.exit_history_bars}) must be >= "
+                f"max_hold_bars({self.exit_rule.max_hold_bars}) — "
+                "otherwise the bar-count cap can never be reached"
+            )
 
 
 def build_target(ctx: Context, config: StrategyConfig | None = None) -> Target:
@@ -129,10 +147,18 @@ def build_target(ctx: Context, config: StrategyConfig | None = None) -> Target:
 
 def _held_item(pos: Position, ctx: Context, cfg: StrategyConfig) -> TargetItem:
     bars = ctx.bars.history(pos.symbol, cfg.exit_history_bars)
-    signal = exit_rules.evaluate(pos, bars, now=ctx.now)
+    signal = exit_rules.evaluate(
+        pos, bars, now=ctx.now, session_bars_remaining=ctx.session_bars_remaining
+    )
     if signal is not None:
         return TargetItem(
-            symbol=pos.symbol, weight=0.0, urgency=Urgency.IMMEDIATE, event_id=pos.event_id
+            symbol=pos.symbol,
+            weight=0.0,
+            urgency=Urgency.IMMEDIATE,
+            event_id=pos.event_id,
+            # 판정한 자리에서 사유를 실어 보낸다 (R16). 사후에 다시 계산하면
+            # 그때의 봉으로 재판정하게 되어 원래 사유와 갈릴 수 있다.
+            exit_reason=signal.reason,
         )
     return TargetItem(
         symbol=pos.symbol,
