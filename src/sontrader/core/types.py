@@ -51,6 +51,10 @@ class ExitReason(str, Enum):
     STOP = "stop"  # 스톱 레벨 이탈 (고정 손절 / 본전 / ATR 트레일링)
     MAX_HOLD = "max_hold"  # 최대 보유기간 상한 (달력일 또는 봉 개수)
     EOD = "eod"  # 세션 종료 임박 — 오버나이트 금지 (데이트레이딩)
+    # 진입 신호가 사라졌다 — 목표(워치리스트)에서 빠졌다는 뜻이다.
+    # 스톱과 성격이 다르다: 손실이 나서가 아니라 **살 이유가 없어져서** 판다.
+    # `StrategyConfig.exit_when_dropped`가 켜져 있을 때만 나온다.
+    SIGNAL = "signal"
 
 
 class Side(str, Enum):

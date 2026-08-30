@@ -68,7 +68,15 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from sontrader.core import exit_rules
-from sontrader.core.types import Context, ExitRule, Position, Target, TargetItem, Urgency
+from sontrader.core.types import (
+    Context,
+    ExitReason,
+    ExitRule,
+    Position,
+    Target,
+    TargetItem,
+    Urgency,
+)
 
 
 class EntryTrigger(Enum):
@@ -96,6 +104,19 @@ class StrategyConfig:
     # 있고(CycleConfig.strategy → build_target), (b) "진입에 어떤 청산 조건을
     # 붙일지"가 전략의 결정이기 때문이다. 파라미터 스윕의 주입 지점이 된다.
     exit_rule: ExitRule = field(default_factory=ExitRule)
+    # **목표에서 빠진 보유 종목을 청산하는가.** 기본은 아니오 — 모멘텀
+    # 워치리스트는 매일 흔들려서, 켜면 순위가 하루 출렁일 때마다 사고판다.
+    #
+    # 켜야 하는 전략도 있다. 지수 추세 필터처럼 **"신호가 있는 동안만 보유"**가
+    # 규칙 자체인 경우다(`종가 > SMA(N)`이면 보유, 아니면 현금). 그런 규칙은
+    # 스톱으로 표현할 수 없다 — 손실이 나서 파는 게 아니라 **살 이유가
+    # 없어져서** 판다.
+    #
+    # `core/diff.py`는 이미 "목표에서 빠졌거나 비중 0인 보유 종목 → 전량
+    # 청산"을 하고 있었다. 안 일어난 이유는 `build_target()`이 보유 종목을
+    # **무조건 목표에 다시 넣기** 때문이다. 이 손잡이는 그 재추가를 끄는 것이지
+    # 새 집행 경로를 만드는 것이 아니다.
+    exit_when_dropped: bool = False
 
     def __post_init__(self) -> None:
         if not 0.0 < self.entry_weight <= 1.0:
@@ -159,6 +180,16 @@ def _held_item(pos: Position, ctx: Context, cfg: StrategyConfig) -> TargetItem:
             # 판정한 자리에서 사유를 실어 보낸다 (R16). 사후에 다시 계산하면
             # 그때의 봉으로 재판정하게 되어 원래 사유와 갈릴 수 있다.
             exit_reason=signal.reason,
+        )
+    # 신호 소멸 청산. **스톱보다 뒤에 본다** — 둘 다 해당하면 더 구체적인
+    # 사유(스톱)를 남기는 편이 사유별 분해(T28)에 유용하다.
+    if cfg.exit_when_dropped and pos.symbol not in ctx.watchlist:
+        return TargetItem(
+            symbol=pos.symbol,
+            weight=0.0,
+            urgency=Urgency.IMMEDIATE,
+            event_id=pos.event_id,
+            exit_reason=ExitReason.SIGNAL,
         )
     return TargetItem(
         symbol=pos.symbol,

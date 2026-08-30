@@ -325,6 +325,103 @@ def _run_daytrade_universe(
         engine.dispose()
 
 
+def _pct(value: float | None) -> str:
+    """지표는 표본이 모자라면 None이다 — 0.0으로 찍으면 "쟀는데 0"으로 읽힌다."""
+    return "n/a" if value is None else f"{value:+.2%}"
+
+
+def _num(value: float | None, digits: int = 2) -> str:
+    return "n/a" if value is None else f"{value:.{digits}f}"
+
+
+def _run_index_trend(
+    code: str,
+    start_str: str,
+    end_str: str,
+    initial_cash: int,
+    csv_path: str | None,
+    cost_multiple: float = 1.0,
+) -> int:
+    """지수 이평 추세 필터 (S1) — **하네스 교정**. `apps/index_trend.py` 참고."""
+    from dataclasses import replace as _replace
+
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from sontrader.apps.index_trend import ETF_COST, N_GRID, equity_rows, load_index_bars, sweep
+    from sontrader.apps.report import build_report
+
+    try:
+        start = _parse_date_arg(start_str)
+        end = _parse_date_arg(end_str)
+    except ValueError:
+        print("error: --start/--end must be YYYYMMDD", file=sys.stderr)
+        return 2
+
+    engine = _open_engine()
+    if engine is None:
+        return 2
+    try:
+        bars = load_index_bars(engine, code, start, end)
+        if len(bars) <= max(N_GRID):
+            print(
+                f"error: 봉이 {len(bars)}개뿐이라 SMA({max(N_GRID)}) 워밍업을 못 채운다",
+                file=sys.stderr,
+            )
+            return 2
+        print(f"{code} {bars[0].ts.date()} ~ {bars[-1].ts.date()} · 봉 {len(bars):,}개")
+        print(f"워밍업 {max(N_GRID) - 1}봉을 격자 전체에 통일 (창을 맞춰야 단조성 비교가 성립)")
+
+        # 반증 ④b — 비용 가정이 틀려도 결론이 살아남는지 본다. 시장충격
+        # 0.02%가 미실측이라 이 확인이 진짜 방어다(규약 §2 "구성요소별로").
+        cost = ETF_COST
+        if cost_multiple != 1.0:
+            cost = _replace(
+                ETF_COST,
+                commission_rate=ETF_COST.commission_rate * cost_multiple,
+                slippage_bps=ETF_COST.slippage_bps * cost_multiple,
+            )
+            round_trip = 2 * (cost.commission_rate + cost.slippage_bps / 10_000) * 100
+            print(f"비용 {cost_multiple}배 — 왕복 {round_trip:.3f}%")
+
+        s0, runs = sweep(bars, initial_cash=initial_cash, broker_config=cost)
+        s0_report = build_report(s0.result, initial_cash=initial_cash)
+        print(
+            f"\nS0 매수보유: CAGR {_pct(s0_report.cagr)} · MDD {s0_report.mdd:.2%}"
+            f" · 최장무수익 {s0_report.longest_underwater_days}일"
+            f" · 거래 {len(s0.result.closed_trades)}건 · {s0.years:.1f}년"
+        )
+        print(
+            f"\n{'N':>4} {'CAGR':>9} {'MDD':>8} {'무수익일':>8} {'샤프':>7}"
+            f" {'소르티노':>8} {'칼마':>7} {'연왕복':>7} {'보유비중':>8}"
+        )
+        for r in runs:
+            rep = build_report(r.result, initial_cash=initial_cash)
+            print(
+                f"{r.n:>4} {_pct(rep.cagr):>9} {rep.mdd:>8.2%}"
+                f" {rep.longest_underwater_days or 0:>8,} {_num(rep.sharpe):>7}"
+                f" {_num(rep.sortino):>8} {_num(rep.calmar, 3):>7}"
+                f" {r.round_trips_per_year:>7.2f} {r.in_market_ratio:>8.1%}"
+            )
+
+        if csv_path:
+            best = max(
+                runs,
+                key=lambda r: build_report(r.result, initial_cash=initial_cash).calmar or -1e9,
+            )
+            rows = equity_rows(s0, best)
+            with open(csv_path, "w", encoding="utf-8") as fh:
+                fh.write("date,s0_equity,s1_equity,in_market\n")
+                for day, s0_eq, s1_eq, held in rows:
+                    fh.write(f"{day},{s0_eq},{s1_eq},{held}\n")
+            print(f"\n자산곡선 CSV: {csv_path} ({len(rows)}행, S1은 칼마 최적 N={best.n})")
+        return 0
+    except SQLAlchemyError as exc:
+        print(f"error: DB access failed: {_first_line(exc)}", file=sys.stderr)
+        return 2
+    finally:
+        engine.dispose()
+
+
 def _open_engine():
     """Load DATABASE_URL and build an engine; print + return None on failure.
 
@@ -1256,6 +1353,22 @@ def main(argv: list[str] | None = None) -> int:
         "--earliest", default=None, help="이 날짜(YYYYMMDD)까지만 소급. 생략하면 서버가 주는 만큼"
     )
 
+    trend = sub.add_parser(
+        "index-trend",
+        help="지수 이평 추세 필터 스윕 (S1 하네스 교정) — 채택 후보 아님",
+    )
+    trend.add_argument("--code", default="2001", help="업종코드 (기본 2001=KOSPI200)")
+    trend.add_argument("--start", required=True, help="시작일 YYYYMMDD")
+    trend.add_argument("--end", required=True, help="종료일 YYYYMMDD")
+    trend.add_argument("--initial-cash", type=int, default=10_000_000)
+    trend.add_argument("--csv", default=None, help="자산곡선 CSV 경로 (S0 vs 최적 N)")
+    trend.add_argument(
+        "--cost-multiple",
+        type=float,
+        default=1.0,
+        help="왕복비용 배수 (반증 ④b: 2를 주면 0.30%%에서도 결론이 유지되는지 본다)",
+    )
+
     daytrade = sub.add_parser(
         "daytrade-universe",
         help="데이트레이딩 감시 대상 (D-1 거래량 상위) — 장전 1회 실행",
@@ -1413,6 +1526,10 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.command == "collect-index":
         return _run_collect_index(args.codes, args.earliest)
+    if args.command == "index-trend":
+        return _run_index_trend(
+            args.code, args.start, args.end, args.initial_cash, args.csv, args.cost_multiple
+        )
     if args.command == "daytrade-universe":
         return _run_daytrade_universe(args.date, args.min_trade_value, args.top_n)
     if args.command == "collect-prices":
