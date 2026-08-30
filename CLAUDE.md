@@ -1,77 +1,126 @@
-# CLAUDE.md
+# SonTrader 작업 규약
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+이 파일은 세션마다 자동으로 읽히는 **짧은 작업 규약**이다. 매 세션 필요한
+불변 규칙만 둔다. 현재 상태와 상세 근거는 `docs/`와 코드·테스트가 소유한다.
 
-## Project
+## 자동 참조
 
-SonTrader is a Korean stock trading bot built on the Korea Investment & Securities (KIS) open
-REST API (https://apiportal.koreainvestment.com). Python, managed with uv, src layout.
+현재 진행 상황은 아래 문서를 매 세션 자동으로 불러온다.
 
-## Commands
+@docs/research/00-현황.md
+
+이 파일은 50줄 안팎의 상태 요약만 자동 import한다. 설계·리서치·운영 문서는
+모두 `@`로 가져오면 매 세션 토큰을 차지하므로, 작업별 문서 라우팅에 따라 필요한
+절만 읽는다. 경로를 안내만 할 때는 백틱으로 감싼다.
+
+## 작업 시작 — 기억 복원 순서
+
+코드·전략·운영 작업에서 아래 순서를 따른다. 단순 질의는 관련 파일만 확인한다.
+
+1. 자동 import된 현황에서 활성 전략·검정 횟수·다음을 확인한다.
+2. 코드·테스트에서 실제 현재 동작을 먼저 확인한다.
+3. 작업과 직접 관련된 문서만 추가로 읽는다. `docs/` 전체를 한꺼번에 읽지 않는다.
+4. 전략·백테스트·운영 변경이면 `docs/system/00-개발-지시서.md`도 확인한다.
+5. 문서와 코드가 다르면 조용히 추측하지 말고 차이를 보고한다. 필요하면 `git log --oneline -20`과 관련 커밋을 읽는다.
+
+### 작업별 문서 라우팅
+
+| 작업 | 먼저 읽을 문서 |
+|---|---|
+| 요구사항·거래 생애주기 | `docs/design/01-요구사항-설계-확정.md` |
+| 모듈 경계·인터페이스·구현 순서 | `docs/design/02-코드-구조.md` |
+| 기존 코드 이관 이력 | `docs/design/05-기존레포-이관계획.md` |
+| 전략 구현·파라미터·판정 | `docs/research/02-전략.md` |
+| 비용·표본·백테스트 판정 | `docs/research/01-규약.md` |
+| 이미 확인된 실측·폐기 근거 | `docs/research/03-측정.md` |
+| 개발·백테스트 공통 지시 | `docs/system/00-개발-지시서.md` |
+| 실전 안전 | `docs/system/01-실전-차단.md` |
+| 체결·백테스트 정합성 | `docs/system/02-매매-정교화.md` |
+| 운영·데이터·복구 | `docs/system/03-운영.md` |
+
+문서에서 필요한 절만 찾을 때는 `rg -n '^#{1,4} |🔴|🔬|✅|미착수|완료' docs/...`를
+먼저 사용한다. 시스템 백로그 형식과 완료 처리 규칙은
+`docs/system/00-개발-지시서.md`를 따른다.
+
+## 프로젝트 요약
+
+SonTrader는 KIS Open API 기반 국내 주식 자동매매 시스템이다. Python 3.10+, `uv`,
+`src/` 레이아웃, PostgreSQL 운영 DB를 사용하며 테스트 DB는 SQLite 인메모리다.
+기본은 모의투자이고 실전은 `KIS_PAPER=false`를 명시해야 한다.
+
+| 영역 | 책임 |
+|---|---|
+| `core/` | 전략·게이트·청산·목표→주문 변환. 순수 함수와 데이터 클래스만 둔다 |
+| `adapters/` | KIS·시계·시뮬레이터·텔레그램·웹소켓 등 외부 접점 |
+| `data/` | DB 스키마, 시세·공시·마스터·워치리스트·주문·체결·포지션 저장 |
+| `engine/` | 공용 사이클, 실전 Context, reconcile, 체결 반영, 킬 스위치 |
+| `apps/` | CLI·수집·백테스트·라이브·리포트 진입점 |
+| `llm/` | 제공자 어댑터, 판단, 캐시, 버전별 프롬프트 |
+
+## 절대 지켜야 할 설계 불변식
+
+- **북극성**: 백테스트와 실전은 동일한 전략·게이트 코드를 실행한다. 차이는 시계와 집행기다.
+- `core/`는 DB·네트워크·파일·로깅·`datetime.now()`를 직접 사용하지 않는다. 값과 시각은 인자로 주입한다.
+- 상태 변경은 `engine/`과 저장 계층의 명시적 경로에서만 한다. 전략·게이트는 목표를 반환할 뿐 포지션·주문을 변경하지 않는다.
+- `BarView`는 현재 시각 이후 봉을 구조적으로 노출하지 않는다. look-ahead를 규율이 아니라 인터페이스로 차단한다.
+- `engine/loop.py`의 공용 사이클을 유지한다. 실전용 로직을 `apps/backtest.py`에 복제하거나 반대로 하지 않는다.
+- LLM은 실전 이벤트 판단에서만 API를 호출한다. 백테스트는 `llm_judgments`에 저장된 판단만 읽으며 API를 호출하지 않는다.
+- 진입은 기본적으로 다음 개장 시가, 청산은 즉시다. 킬 스위치는 신규 진입만 막고 청산은 계속한다.
+- 보유 중 워치리스트 이탈은 자동 청산 사유가 아니다. 진입 조건과 청산 조건을 섞지 않는다.
+- 모르는 파라미터를 임의로 고르지 않는다. 전략 문서의 탐색 범위와 반증 조건을 코드·측정에 반영한다.
+
+## 핵심 도메인 규칙
+
+- 최대 보유 5종목, 종목당 목표 비중 20%.
+- 기본 진입 트리거는 `watchlist`; `event`는 공시와 저장된 LLM 판단을 사용한다.
+- `S0`은 KOSPI200 지수 매수보유 기준선이다. 모든 전략은 S0과 비교한다. 활성 전략과 열린 T 항목은 자동 import 문서와 관련 `docs/system/` 문서가 최신이다.
+- 진입은 기본적으로 다음 개장 시가, 청산은 즉시다. 킬 스위치는 신규 진입만 막고 청산은 계속한다.
+- 비용·표본·백테스트 기준선은 `docs/research/01-규약.md`를 따른다. 기준선 변경 시 기존 결과를 덮어쓰지 않는다.
+
+## 전략·리서치 규약
+
+- `docs/research/02-전략.md`에 등록된 `S번호`만 구현한다. 등록 형식은 입력, 촉발 조건, 행동, 파라미터/탐색 범위, 반증 조건이다.
+- 전략 하나를 끝내고 판정하기 전 다음 전략을 붙이지 않는다.
+- 진입 시점 이후에만 알 수 있는 값으로 세그먼트·유니버스를 나누지 않는다. 결과로 만든 구간은 정보가 아니다(M002).
+- 사전 확정된 IS/OOS 분할을 지키고, OOS를 보고 파라미터를 다시 고르지 않는다.
+- 최소 30건 미만의 결과는 신뢰하지 않는다. CAGR 단일값이 아니라 비용·회전·MDD·산포와 함께 본다.
+- 시간 기반 양은 봉 개수가 아니라 실제 시각·달력 경과일로 계산한다.
+- `symbol_master`를 직접 사용하지 말고 종목성 필터가 필요하면 `core/filters.py` 경로를 사용한다.
+- 결과가 나빠도 먼저 전략을 고치지 않는다. 하네스·look-ahead·체결·비용·표본 편향을 먼저 점검한다.
+
+## 개발·검증 절차
+
+1. 작업 범위를 하나의 기능 단위로 쪼개고, 관련 문서의 완료 기준을 확인한다.
+2. 실제 코드·테스트·최근 이력을 읽은 뒤 최소 변경으로 구현한다.
+3. 변경 경계에 테스트를 추가한다. 네트워크 호출은 `httpx.MockTransport`로 대체하고 DB 스키마 테스트는 SQLite 인메모리로 한다.
+4. 먼저 관련 테스트를 실행하고, 끝에 전체 테스트와 린트를 실행한다.
+5. 보고할 때 변경 내용, 실행한 검증, 기준선 영향, 새로 들어간 근사, 남은 차단 요소를 함께 기록한다.
+6. 구현 중 발견한 전략 아이디어는 코드에 몰래 넣지 말고 `docs/research/02-전략.md` 제안으로 남긴다.
 
 ```sh
-uv sync                                        # install deps (incl. dev group) into .venv
-uv run pytest                                  # run all tests
-uv run pytest tests/test_client.py::test_get_quote   # run a single test
-uv run ruff check .                            # lint
-uv run ruff format .                           # format
-uv run sontrader quote 005930                  # CLI (needs .env with KIS credentials)
-uv run sontrader migrate                       # create/extend trading-state DB schema (needs DATABASE_URL)
-uv run sontrader collect-dart                  # ingest today's DART disclosures (needs DART_API_KEY too)
-uv run sontrader collect-master                # KOSPI/KOSDAQ symbol master → symbol_master
-uv run sontrader collect-prices                # daily candles, 수정주가 (incremental + self-healing)
-uv run sontrader build-universe                # momentum watchlist + daily snapshot (hysteresis 30/42)
+uv sync
+uv run pytest
+uv run pytest tests/test_client.py::test_get_quote
+uv run ruff check .
+uv run ruff format --check .
 ```
 
-## Architecture
+포맷 수정은 필요한 파일에만 한다. CLI·수집·백테스트 명령은 `README.md`를 기준으로
+한다. DB·KIS·실전 라이브 실행은 자격증명과 외부 상태를 사용하므로 사용자가 요청한
+경우에만 실행한다.
 
-Three layers, each in one module under `src/sontrader/`:
+## 보안·운영 금지사항
 
-- `config.py` — `Settings` frozen dataclass built from env vars / `.env` (`load_settings()`).
-  Selects the API base URL: paper trading (모의투자, `openapivts...:29443`) vs real
-  (`openapi...:9443`). **Paper is the default**; real trading requires `KIS_PAPER=false`.
-- `auth.py` — `TokenManager` issues the 24h OAuth token and caches it on disk
-  (`~/.cache/sontrader/token.json` by default). Caching matters: KIS invalidates the previous
-  token on re-issue and rate-limits issuance. The cache records the issuing base URL because
-  paper and real tokens are not interchangeable.
-- `client.py` — `KisClient` wraps the REST endpoints (quote, balance, cash orders). Every KIS
-  call needs a `tr_id` header that differs between real and paper environments; the mapping is
-  the `_TR_IDS` table — add new endpoints there. API-level failures (`rt_cd != "0"`) raise
-  `KisError`; HTTP failures raise `httpx.HTTPStatusError`.
-- `cli.py` — argparse CLI (`sontrader` entry point) over the client.
-- `data/db.py` — SQLAlchemy Core schema + `migrate()` for the trading-state tables (events,
-  llm_judgments, orders, fills, positions, kill_switch) in the PostgreSQL DB shared with the
-  legacy kis_trading collectors (`DATABASE_URL`). Also adds adjusted-price columns to the
-  legacy `stock_candles_1d`. Schema tests run on SQLite in-memory — no DB server needed.
-- `data/dart.py` — OpenDART 공시 수집기: `DartClient.list_disclosures()` (list.json, paginated,
-  유가/코스닥 only) + `ingest()` (append-only into `events`, idempotent via ON CONFLICT,
-  dual timestamps published_at/ingested_at, `norm_key` strips 정정 prefixes). CLI:
-  `sontrader collect-dart [--date YYYYMMDD] [--interval N]`.
-- `data/master.py` — KOSPI/KOSDAQ .mst 종목 마스터 다운로드·고정폭 파싱 (kis_trading 명세
-  포팅, pandas 없이) → `symbol_master` upsert. Flags stay raw ('Y'/'N') — 해석은 core 필터.
-- `data/prices.py` — 일봉 수집기: 수정주가(FID_ORG_ADJ_PRC="0"), 100일 창 페이징, 증분 수집,
-  겹침 구간 종가 대조로 기업행위 감지 시 종목 전체 재수집 (자가치유), 일시 오류 재시도.
-- `data/universe.py` — 워치리스트 스냅샷 빌더: 마스터 필터 → 유동성(20일 평균 거래대금) →
-  모멘텀 → 히스테리시스 → `watchlist_snapshots` (같은 날 재실행 시 동일 결과).
-- `core/` — 순수 함수만, 부작용 없음 (momentum.py, watchlist.py 히스테리시스 30/42,
-  filters.py 방어 필터). DB/네트워크/시각 접근 금지 — 백테스트와 실전이 같은 코드를 쓰는 전제.
+- `.env`, 토큰 캐시, `DATABASE_URL`, 앱키·시크릿·계좌번호·텔레그램 토큰을 출력하거나 커밋하지 않는다. 비밀 확인이 필요하면 값 대신 변수명·마스킹된 상태만 본다.
+- 실전 기본값을 만들지 않는다. 모의·실전 자격증명을 섞지 않으며 토큰 캐시의 모드 분리를 보존한다.
+- 주문 취소·삭제·데이터 덮어쓰기·스키마 변경처럼 되돌리기 어려운 작업은 대상과 영향 확인 후 수행한다.
+- 테스트에서 실제 네트워크·실제 주문·현재 시각 의존을 허용하지 않는다.
+- `print`와 로그를 섞지 않는다. 사용자에게 보여줄 CLI 결과는 `print`, 애플리케이션 운영 로그는 표준 `logging`을 사용한다.
 
-KIS API responses put data in `output` / `output1` / `output2` keys with all values as strings
-(e.g. prices come back as `"71000"`).
+## 문서·기억 관리
 
-## Testing conventions
-
-No network in tests: `KisClient` and `TokenManager` accept an injected httpx transport, and
-tests use `httpx.MockTransport` handlers that also answer `/oauth2/tokenP` (see
-`make_client` in `tests/test_client.py`). Shared fixtures (`settings`, `TOKEN_RESPONSE`) live
-in `tests/conftest.py`; `settings` points the token cache at `tmp_path`.
-
-## Credentials
-
-Live in `.env` (gitignored); `env.example` is the template. KIS app keys are issued per
-environment — a 모의투자 key only works against the paper domain.
-
-## 구현 계획
-
-- @~/Downloads/01-요구사항-설계-확정.md, @~/Downloads/02-코드-구조.md, @~/Downloads/03-아키텍처-데이터흐름.svg, @~/Downloads/04-매매-생애주기.svg, @~/Downloads/05-기존레포-이관계획.md 파일들이 구현 계획서니까 이대로 구현을 해야해
-- 모든 구현은은 내가 리뷰를 할 수 있게 한꺼번에 구현하지 말고 기능단위로 구현을 하고 구현후에 리뷰를 하면서 보안, 구조적, 논리적으로 오류가 있는지 검토해
+- `docs/research/00-현황.md`는 “지금 무엇을 하는가”의 단일 요약이다. 전략 번호는 재사용하지 않는다.
+- `docs/research/03-측정.md`는 전략이 폐기돼도 남기는 실측 사실이다. 폐기 전략을 조용히 삭제하지 않는다.
+- `docs/system/` 백로그는 관측된 문제를 4필드 형식으로 남긴다. 완료 항목은 삭제하지 않고 완료 절로 옮기며 커밋 해시를 남긴다.
+- 시스템 백로그와 전략 문서에 중간 `R번호`를 새로 만들지 않는다. 전략 요구는 `S번호`, 운영·배관 문제는 `T번호`로 관리한다.
+- 상태·결정·실측이 바뀐 작업은 종료 전에 현재 상태·다음 작업·미해결 위험을 해당 문서에 남긴다. 채팅에만 남은 결정은 다음 세션의 기억으로 간주하지 않는다.

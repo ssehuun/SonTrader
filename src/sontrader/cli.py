@@ -342,7 +342,7 @@ def _run_index_trend(
     csv_path: str | None,
     cost_multiple: float = 1.0,
 ) -> int:
-    """지수 이평 추세 필터 (S1) — **하네스 교정**. `apps/index_trend.py` 참고."""
+    """지수 이평 추세 필터 (S1) — **백테스트 교정**. `apps/index_trend.py` 참고."""
     from dataclasses import replace as _replace
 
     from sqlalchemy.exc import SQLAlchemyError
@@ -1355,7 +1355,7 @@ def main(argv: list[str] | None = None) -> int:
 
     trend = sub.add_parser(
         "index-trend",
-        help="지수 이평 추세 필터 스윕 (S1 하네스 교정) — 채택 후보 아님",
+        help="지수 이평 추세 필터 스윕 (S1 백테스트 교정) — 채택 후보 아님",
     )
     trend.add_argument("--code", default="2001", help="업종코드 (기본 2001=KOSPI200)")
     trend.add_argument("--start", required=True, help="시작일 YYYYMMDD")
