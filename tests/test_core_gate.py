@@ -49,6 +49,12 @@ def make_position(symbol: str, *, event_id: str | None = None) -> Position:
     )
 
 
+# 기본값을 직접 읽는다. 증거금 제약 때문에 바뀌는 값이라(`core/gate.py`),
+# 숫자를 박으면 정책이 바뀔 때마다 무관한 테스트가 깨진다.
+SLOTS = GateConfig().max_positions
+CAP = GateConfig().max_weight
+
+
 def entry(symbol: str, weight: float = 0.2, *, event_id: str | None = None) -> TargetItem:
     return TargetItem(
         symbol=symbol,
@@ -67,7 +73,7 @@ def exit_item(symbol: str) -> TargetItem:
 
 
 def test_exit_passes_through_even_when_slots_are_full():
-    held = [make_position(f"00{i}") for i in range(5)]
+    held = [make_position(f"00{i}") for i in range(SLOTS)]
     ctx = make_ctx(positions=tuple(held))
     # 5슬롯이 모두 차 있고, 그 중 하나가 청산 대상이다.
     target = Target((exit_item("000"), *[entry(p.symbol) for p in held[1:]]))
@@ -82,7 +88,7 @@ def test_exit_passes_through_even_when_slots_are_full():
 
 
 def test_exit_frees_a_slot_for_a_new_entry_in_the_same_cycle():
-    held = [make_position(f"00{i}") for i in range(5)]
+    held = [make_position(f"00{i}") for i in range(SLOTS)]
     ctx = make_ctx(positions=tuple(held))
     target = Target((exit_item("000"), *[entry(p.symbol) for p in held[1:]], entry("999")))
 
@@ -121,27 +127,22 @@ def test_new_entries_beyond_the_slot_limit_are_skipped_not_swapped():
 
 
 def test_slot_limit_counts_admitted_entries_within_one_cycle():
-    ctx = make_ctx(positions=(make_position("000"), make_position("001")))
-    target = Target(
-        (
-            entry("000"),
-            entry("001"),
-            entry("100"),
-            entry("101"),
-            entry("102"),
-            entry("103"),
-        )
-    )
+    held = [make_position(f"00{i}") for i in range(2)]
+    ctx = make_ctx(positions=tuple(held))
+    # 보유 2 + 신규 (슬롯 − 2) + 초과 1건
+    news = [f"10{i}" for i in range(SLOTS - 2 + 1)]
+    target = Target((*[entry(p.symbol) for p in held], *[entry(s) for s in news]))
 
     result = apply(target, ctx)
 
-    assert len(result.target) == 5
-    assert [r.symbol for r in result.rejections] == ["103"]
+    assert len(result.target) == SLOTS
+    assert [r.symbol for r in result.rejections] == [news[-1]]
 
 
 def test_input_order_decides_which_signal_wins_a_contested_slot():
-    ctx = make_ctx(positions=tuple(make_position(f"00{i}") for i in range(4)))
-    held = [entry(f"00{i}") for i in range(4)]
+    # 슬롯을 하나만 남긴다 — 그 하나를 A와 B가 다툰다.
+    ctx = make_ctx(positions=tuple(make_position(f"00{i}") for i in range(SLOTS - 1)))
+    held = [entry(f"00{i}") for i in range(SLOTS - 1)]
 
     first = apply(Target((*held, entry("A"), entry("B"))), ctx)
     second = apply(Target((*held, entry("B"), entry("A"))), ctx)
@@ -160,7 +161,7 @@ def test_weight_is_clamped_to_the_per_symbol_cap():
 
     item = result.target.get("100")
     assert item is not None
-    assert item.weight == pytest.approx(0.20)
+    assert item.weight == pytest.approx(CAP)
 
 
 def test_clamping_preserves_the_rest_of_the_item():
@@ -193,7 +194,7 @@ def test_held_position_over_the_cap_is_clamped_down():
     item = apply(Target((entry("000", weight=0.4),)), ctx).target.get("000")
 
     assert item is not None
-    assert item.weight == pytest.approx(0.20)
+    assert item.weight == pytest.approx(CAP)
 
 
 def test_total_weight_never_exceeds_one():
@@ -202,7 +203,10 @@ def test_total_weight_never_exceeds_one():
 
     result = apply(target, ctx)
 
-    assert sum(item.weight for item in result.target) == pytest.approx(1.0)
+    total = sum(item.weight for item in result.target)
+    assert total <= 1.0
+    # 상한이 두 번 걸린다 — 슬롯 수와 종목당 비중.
+    assert total == pytest.approx(SLOTS * CAP)
 
 
 # --- 동일 이벤트 재진입 금지 --------------------------------------------------

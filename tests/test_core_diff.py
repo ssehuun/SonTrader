@@ -47,7 +47,9 @@ class StubBars:
 
 
 def make_ctx(*, closes: dict[str, int] | None = None, equity: int = EQUITY, **overrides) -> Context:
-    base = dict(now=NOW, bars=StubBars(closes), watchlist=(), equity=equity)
+    # cash 기본값을 equity와 같게 둔다 — 포지션 없는 계좌의 정상 상태이고,
+    # 매수 수량이 증거금(현금 기준)에 걸리는 것을 보려면 현금이 있어야 한다.
+    base = dict(now=NOW, bars=StubBars(closes), watchlist=(), equity=equity, cash=equity)
     return Context(**{**base, **overrides})
 
 
@@ -281,6 +283,7 @@ def test_a_later_cycle_gets_a_different_key():
         bars=later.bars,
         watchlist=(),
         equity=EQUITY,
+        cash=EQUITY,
     )
 
     assert to_orders(target, later)[0].idempotency_key != first.idempotency_key
@@ -425,3 +428,107 @@ def test_exit_without_a_bar_still_goes_out_with_no_reference_price():
 
     assert order.qty == 100
     assert order.ref_price is None
+
+
+# --- 증거금 상한 (KIS 매수가능수량) -------------------------------------------
+
+
+def test_buy_qty_is_capped_by_the_margin_unit_price():
+    """수량이 현재가가 아니라 **현재가 × 1.30**으로 잘린다.
+
+    2026-08-31 실전 실측 재현 — 현금 9,447,178원 / 삼성전자 257,000원이면
+    산수로는 36주지만 KIS 시장가 주문은 계산단가 334,000원 기준이라 28주다.
+    """
+    ctx = make_ctx(closes={"100": 257_000}, equity=9_447_178, cash=9_447_178)
+
+    orders = to_orders(Target((entry("100", 1.0),)), ctx)
+
+    assert len(orders) == 1
+    assert orders[0].qty == 9_447_178 // (int(257_000 * 1.30) + 1)
+    assert orders[0].qty == 28  # 자금이 닿는 36주가 아니다
+
+
+def test_enough_cash_leaves_the_target_quantity_untouched():
+    """상한에 안 걸리면 기존 동작 그대로다 — 이 수정이 평소 경로를 안 바꾼다."""
+    ctx = make_ctx(closes={"100": 10_000}, equity=EQUITY, cash=EQUITY * 10)
+
+    orders = to_orders(Target((entry("100", 0.2),)), ctx)
+
+    assert orders[0].qty == int(EQUITY * 0.2) // 10_000
+
+
+def test_a_capped_buy_ignores_the_band_and_minimum():
+    """증거금에 걸려 줄어든 주문은 두 하한을 건너뛴다.
+
+    적용하면 마지막 몇 %가 영구히 안 채워진다 — 밴드는 **가격이 움직여 생긴
+    부스러기**를 막는 장치이지 사려다 못 산 잔량을 막는 장치가 아니다.
+    """
+    # 현금이 1주치뿐이라 잘린다. 주문 금액은 밴드·최소금액을 한참 밑돈다.
+    ctx = make_ctx(closes={"100": 10_000}, equity=EQUITY, cash=13_001)
+
+    orders = to_orders(
+        Target((entry("100", 0.2),)),
+        ctx,
+        DiffConfig(no_trade_band=0.5, min_order_value=100_000_000),
+    )
+
+    assert [o.qty for o in orders] == [1]
+
+
+def test_no_buy_without_cash():
+    ctx = make_ctx(closes={"100": 10_000}, equity=EQUITY, cash=0)
+
+    assert to_orders(Target((entry("100", 0.2),)), ctx) == []
+
+
+def test_selling_is_not_constrained_by_margin():
+    """매도는 현금을 쓰지 않는다. 현금 0에서도 청산이 나가야 한다 —
+    시세나 잔고 사정이 노출 축소를 막는 경로를 남기지 않는다."""
+    ctx = make_ctx(
+        closes={"100": 10_000},
+        equity=EQUITY,
+        cash=0,
+        positions=(make_position("100", 100),),
+    )
+
+    orders = to_orders(Target((TargetItem("100", 0.0, Urgency.IMMEDIATE),)), ctx)
+
+    assert [(o.side, o.qty) for o in orders] == [(Side.SELL, 100)]
+
+
+def test_cash_is_spent_down_across_symbols_in_one_cycle():
+    """한 사이클의 매수들은 체결 전에 모두 접수되므로 증거금이 동시에 잡힌다.
+    종목마다 전체 현금과 비교하면 합계가 현금을 넘는다."""
+    ctx = make_ctx(
+        closes={"100": 10_000, "200": 10_000, "300": 10_000},
+        equity=EQUITY,
+        cash=30_000,  # 계산단가 13,001원 기준 2주치뿐이다
+    )
+
+    orders = to_orders(Target((entry("100", 0.2), entry("200", 0.2), entry("300", 0.2))), ctx)
+
+    unit = int(10_000 * 1.30) + 1
+    assert sum(o.qty for o in orders) * unit <= 30_000
+
+
+def test_the_next_cycle_buys_the_remainder():
+    """잘린 잔량은 다음 사이클이 채운다. 별도의 재시도 장치가 필요 없는 이유다 —
+    `target_qty`가 그대로라 diff가 남은 만큼을 다시 낸다."""
+    target = Target((entry("100", 1.0),))
+    first = to_orders(target, make_ctx(closes={"100": 10_000}, equity=EQUITY, cash=EQUITY))
+    bought = first[0].qty
+
+    # 1회차 체결 후: 현금이 줄고 포지션이 생겼다.
+    spent = bought * 10_000
+    second = to_orders(
+        target,
+        make_ctx(
+            closes={"100": 10_000},
+            equity=EQUITY,
+            cash=EQUITY - spent,
+            positions=(make_position("100", bought),),
+        ),
+    )
+
+    assert second and second[0].qty > 0
+    assert bought + second[0].qty > bought  # 목표에 더 가까워진다

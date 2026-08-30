@@ -24,7 +24,7 @@ from sontrader.apps.backtest import (
     replay,
     run_backtest,
 )
-from sontrader.core.gate import RejectReason
+from sontrader.core.gate import GateConfig, RejectReason
 from sontrader.core.strategy import EntryTrigger, StrategyConfig
 from sontrader.core.types import Bar, Event, ExitReason, ExitRule, Judgment
 from sontrader.data import db
@@ -36,6 +36,12 @@ DAY1 = date(2026, 3, 3)
 DAY2 = date(2026, 3, 4)
 DAY3 = date(2026, 3, 5)
 ZERO_COST = SimBrokerConfig(commission_rate=0.0, tax_rate=0.0, slippage_bps=0.0)
+
+
+# 진입 수량은 설정에서 유도한다 — `entry_weight`가 증거금 제약 때문에 바뀌는
+# 값이라(`core/gate.py`), 숫자를 박으면 정책이 바뀔 때마다 무관한 테스트가 깨진다.
+# 자본 10,000,000 · 신호봉 종가 10,000 기준.
+ENTRY_QTY = int(10_000_000 * StrategyConfig().entry_weight) // 10_000
 
 
 def make_bar(symbol: str, day: date, *, open: int, close: int) -> Bar:  # noqa: A002
@@ -106,17 +112,17 @@ def test_full_loop_from_entry_through_stop_exit():
 
     assert len(result.fills) == 2
     buy, sell = result.fills
-    assert buy.price == 10_500 and buy.qty == 200
-    assert sell.price == 8_500 and sell.qty == 200
+    assert buy.price == 10_500 and buy.qty == ENTRY_QTY
+    assert sell.price == 8_500 and sell.qty == ENTRY_QTY
     assert result.final_positions == ()
-    assert result.final_cash == 10_000_000 - 10_500 * 200  # 매도 대금은 아직 정산 전
+    assert result.final_cash == 10_000_000 - 10_500 * ENTRY_QTY  # 매도 대금은 아직 정산 전
 
     assert len(result.closed_trades) == 1
     trade = result.closed_trades[0]
     assert trade.symbol == SYMBOL
     assert trade.entry_price == 10_500
     assert trade.exit_price == 8_500
-    assert trade.qty == 200
+    assert trade.qty == ENTRY_QTY
     assert trade.entered_at == datetime.combine(DAY1, time.min)
     assert trade.exit_at == datetime.combine(DAY3, time.min)
     assert result.total_costs == 0  # ZERO_COST 설정
@@ -145,16 +151,24 @@ def test_equity_curve_tracks_cash_plus_mark_to_market_plus_pending_settlement():
 
     curve = dict(result.equity_curve)
     assert curve[DAY0] == 10_000_000  # 아직 미체결
-    assert curve[DAY1] == 7_900_000 + 200 * 10_600  # 진입 완료, 종가로 평가
-    assert curve[DAY2] == 7_900_000 + 200 * 9_000  # 급락, 청산은 아직 이 사이클 처리 중
-    assert curve[DAY3] == 7_900_000 + 200 * 8_500  # 매도 대금은 정산 대기, 시가로 평가한 값과 같다
+    assert (
+        curve[DAY1] == 10_000_000 - 10_500 * ENTRY_QTY + ENTRY_QTY * 10_600
+    )  # 진입 완료, 종가로 평가
+    assert (
+        curve[DAY2] == 10_000_000 - 10_500 * ENTRY_QTY + ENTRY_QTY * 9_000
+    )  # 급락, 청산은 아직 이 사이클 처리 중
+    assert (
+        curve[DAY3] == 10_000_000 - 10_500 * ENTRY_QTY + ENTRY_QTY * 8_500
+    )  # 매도 대금은 정산 대기, 시가로 평가한 값과 같다
 
 
 # --- 게이트 거부 --------------------------------------------------------------
 
 
 def test_rejections_are_recorded_with_their_date():
-    held_symbols = [f"00{i}" for i in range(5)]
+    # 슬롯을 정확히 채운다 — 하나라도 남으면 "999"가 거부되지 않고,
+    # 초과하면 거부가 두 건이 되어 이 테스트가 재는 것이 흐려진다.
+    held_symbols = [f"00{i}" for i in range(GateConfig().max_positions)]
     bars = {
         symbol: [make_bar(symbol, day, open=10_000, close=10_000) for day in (DAY0, DAY1)]
         for symbol in held_symbols
@@ -163,7 +177,7 @@ def test_rejections_are_recorded_with_their_date():
     watchlists = {DAY0: [*held_symbols, "999"], DAY1: held_symbols}
 
     # 백테스트는 flat 시작이라 "이미 보유 중"을 만들 수 없으므로, 대신 같은 날
-    # 동시 진입 5건(먼저 슬롯을 채움) + 신규 1건으로 슬롯 경합을 만든다.
+    # 슬롯을 채우는 동시 진입 + 신규 1건으로 슬롯 경합을 만든다.
     all_events = {
         DAY0: [
             *(make_event(f"H{i}", s, DAY0) for i, s in enumerate(held_symbols)),

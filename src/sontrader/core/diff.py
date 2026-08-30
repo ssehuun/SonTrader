@@ -14,9 +14,33 @@
 두 규칙 모두 **전량 청산에는 적용하지 않는다.** 노출을 없애는 주문을 금액이
 작다는 이유로 생략하면 리스크가 남는다. 설계 1.3절의 집행 비대칭과 같은 논리다.
 
-D+2 결제 제약과 가용 현금은 여기서 보지 않는다. `ctx.cash`가 있긴 하지만
-매도 대금의 결제일 반영은 캘린더가 필요하고(구조 원칙 1), 현금 부족은 주문을
-줄이는 게 아니라 미루는 문제라 엔진의 몫이다.
+D+2 결제 제약은 여기서 보지 않는다 — 매도 대금의 결제일 반영은 캘린더가
+필요하다(구조 원칙 1).
+
+## 🔴 증거금 — 매수 수량의 상한
+
+**KIS는 시장가 매수 수량을 현재가 × 1.30으로 계산한다.** 현금이 9,447,178원이고
+삼성전자가 257,000원이면 산수로는 36주지만 **시장가 주문은 28주가 상한**이다
+(= 현금 ÷ 334,000). 넘겨서 내면 **부분 체결이 아니라 주문 전체가 거부된다**
+(T17 — 실전이 그렇게 동작해서 백테스트도 맞췄다).
+
+**이 상한을 안 지키면 체결 표본이 편향된다.** 예전에는 `현금 ÷ 종가`로 수량을
+잡았는데, 다음 봉 시가가 조금이라도 높으면 거부되고 다음 사이클이 같은 계산을
+반복했다. 결과: **진입 153건이 전부 갭하락일에 체결**됐다(기준선 47.4%).
+미래를 엿본 것은 아니지만 **유리한 시가를 기다린 것과 같다.**
+
+**가격제한폭이 곧 최대 갭이므로 이 상한을 지키면 거부가 원천적으로 불가능하다.**
+같은 규칙이 제약이자 해법이다.
+
+## 🔴 한 사이클 투입 상한은 76.9%다
+
+한 사이클의 매수 주문은 **체결 전에 모두 접수**되므로 증거금 예약이 동시에 잡힌다.
+n종목을 각각 비중 `w`로 사면:
+
+    n × (w × 1.30) ≤ 1     →     총 투입 = n×w = 1/1.30 = 76.9%
+
+**종목 수와 무관하다.** 4종목 × 20% = 80%도 넘는다. 그래서 기본값이
+**4종목 × 19% = 76%**다 (`GateConfig.max_positions`, `StrategyConfig.entry_weight`).
 
 ## 가격과 수량
 
@@ -77,12 +101,62 @@ class DiffConfig:
     # 목표 비중과 현재 비중의 차(비중 포인트). 0.02 = 자산의 2%.
     no_trade_band: float = 0.02
     min_order_value: int = 100_000  # 원
+    # 가격제한폭. 시장가 매수 수량의 상한을 정한다 — 아래 "증거금" 절 참고.
+    # 2015-06-15부터 30%. 그 이전 구간을 재생할 때만 시대값으로 바꾼다.
+    price_limit: float = 0.30
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.no_trade_band < 1.0:
             raise ValueError(f"no_trade_band must be in [0, 1): {self.no_trade_band}")
         if self.min_order_value < 0:
             raise ValueError(f"min_order_value must be >= 0: {self.min_order_value}")
+        if self.price_limit < 0.0:
+            raise ValueError(f"price_limit must be >= 0: {self.price_limit}")
+
+
+def _margin_unit_price(base_price: int, price_limit: float) -> int:
+    """시장가 매수의 **가능수량계산단가** = 현재가 × (1 + 가격제한폭).
+
+    KIS 매수가능조회(`inquire-psbl-order`, `v1_국내주식-007`)가
+    `psbl_qty_calc_unpr`로 돌려주는 값이다. **공식 문서에 산식은 없다** —
+    문서가 말하는 것은 *"00:지정가는 증거금율이 반영되지 않으므로, 증거금율이
+    반영되는 01:시장가로 조회"* 까지다. 아래 배수는 실측이다.
+
+    ## 실측 (2026-08-31, 읽기 전용 GET)
+
+    | | 계산단가 | 기준 |
+    |---|---|---|
+    | **실전** 005930 (현재가 257,000) | **334,000** | 현재가 × 1.2996 |
+    | **실전** 069500 (현재가 107,180) | **139,330** | 현재가 × 1.3000 |
+    | 모의 005930 (기준가 266,000) | 345,500 | **전일 종가** × 1.30 |
+    | 모의 069500 (기준가 109,135) | 141,875 | 전일 종가 × 1.30 |
+
+    **실전과 모의의 기준 가격이 다르다.** 배수는 둘 다 1.30이고 호가단위 내림이
+    들어간다(334,100 → 334,000). **실전 규칙을 쓴다** — 주문 시점의 마지막 완성
+    봉 종가가 곧 "현재가"이므로 `bar.close`가 그 값이다.
+
+    수량 산식 `floor(주문가능현금 ÷ 계산단가)`는 **모의에서만 확인했다**
+    (`nrcvb_buy_qty` 27주 / 66주와 정확히 일치). ⚠️ **실전은 계좌 현금이
+    1,070원뿐이라 검증하지 못했다.**
+
+    ## 왜 이 상한이 편향까지 없애나
+
+    **가격제한폭이 곧 하루 최대 갭이다.** 다음 봉 시가는 이 값을 넘을 수 없으므로
+    **현금 부족 거부가 원리적으로 불가능**해진다. 같은 규칙이 제약이자 보증이다.
+
+    ## 넣지 않은 것
+
+    **호가단위 내림.** 실제 계산단가는 틱 내림이 들어가 이 값보다 조금 작으므로
+    여기 값은 **약간 보수적**이다(수량이 1주 덜 나올 수 있다). 남는 현금은 다음
+    사이클이 채운다. 대신 **지수처럼 호가단위가 없는 계열에도 같은 코드가 쓰인다.**
+
+    **거래비용.** 시가가 정확히 상한가인 날(상한가 시초가)에는 비용만큼 모자라
+    거부될 수 있다. `+1`원 여유뿐이다. 드물고 다음 사이클이 처리하므로 손잡이를
+    늘리지 않았다.
+
+    ⚠️ 실전 증거금률이 다르면 **이 함수 하나만** 고치면 된다.
+    """
+    return int(base_price * (1.0 + price_limit)) + 1
 
 
 def floor_to_trading_unit(qty: int, unit: int) -> int:
@@ -141,6 +215,11 @@ def to_orders(target: Target, ctx: Context, config: DiffConfig | None = None) ->
     if ctx.equity <= 0:
         return exits
 
+    # 한 사이클의 매수 주문들은 **체결 전에 모두 접수**되므로 증거금 예약이
+    # 동시에 잡힌다. 종목마다 `ctx.cash`를 그대로 보면 n개가 각각 통과해
+    # 합계가 현금을 넘는다 — 잔여를 들고 차감한다.
+    remaining_cash = ctx.cash
+
     for item in target:
         if item.weight <= 0.0:
             continue
@@ -162,6 +241,19 @@ def to_orders(target: Target, ctx: Context, config: DiffConfig | None = None) ->
         if delta == 0:
             continue
 
+        # 매수는 KIS가 받아주는 수량을 넘지 않는다 (아래 "증거금" 절).
+        # 넘겨서 내면 주문이 **통째로** 거부되고, 다음 사이클에 같은 계산을
+        # 반복하므로 값이 내린 날에만 체결된다 — 체결 표본이 편향된다.
+        capped = False
+        margin_unit = _margin_unit_price(price, cfg.price_limit)
+        if delta > 0:
+            affordable = remaining_cash // margin_unit
+            if affordable <= 0:
+                continue
+            if affordable < delta:
+                delta = affordable
+                capped = True
+
         # 매매수량단위에 맞춰 내림한다. band·최소금액 판정보다 **먼저** 해야
         # 한다 — 통과시킨 뒤에 줄이면 실제로 나가는 주문이 두 하한을 밑돌 수
         # 있고, 그러면 두 게이트가 걸러내려던 부스러기 주문이 그대로 나간다.
@@ -170,12 +262,20 @@ def to_orders(target: Target, ctx: Context, config: DiffConfig | None = None) ->
             continue
 
         value = qty * price
-        if value < cfg.min_order_value:
-            continue
-        if value / ctx.equity < cfg.no_trade_band:
-            continue
+        # 증거금에 걸려 줄인 주문에는 두 하한을 적용하지 않는다. 이 둘은
+        # **가격이 움직여 생긴 부스러기**를 막는 장치이지, 사려다 못 산 잔량을
+        # 막는 장치가 아니다. 적용하면 마지막 몇 %가 영구히 안 채워진다.
+        if not capped:
+            if value < cfg.min_order_value:
+                continue
+            if value / ctx.equity < cfg.no_trade_band:
+                continue
 
         side = Side.BUY if delta > 0 else Side.SELL
+        if side is Side.BUY:
+            # 체결가가 아니라 **증거금 단가**로 차감한다. 접수 시점에
+            # 잡히는 금액이 그것이고, 체결 후 차액은 풀린다.
+            remaining_cash -= qty * margin_unit
         rest.append(
             _order(
                 symbol=item.symbol,

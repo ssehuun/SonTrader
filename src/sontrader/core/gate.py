@@ -46,8 +46,12 @@ from sontrader.core.types import Context, Target, TargetItem
 class GateConfig:
     """게이트 파라미터. core는 설정 파일을 읽지 않으므로 주입받는다."""
 
-    max_positions: int = 5
-    max_weight: float = 0.20
+    # 4로 둔 것은 분산 판단이 아니라 **증거금 제약**이다 — `entry_weight`
+    # 독스트링 참고. 늘리려면 `n × w × 1.30 ≤ 1`을 지키도록 비중도 함께 줄인다.
+    max_positions: int = 4
+    # `entry_weight`와 같은 값으로 둔다. 게이트가 더 큰 비중을 허용하면
+    # 자금을 댈 수 없는 배분을 통과시킨다 — 4 × 0.20 = 0.80 > 0.769.
+    max_weight: float = 0.19
     # 청산 후 같은 종목에 재진입하기까지의 최소 간격(달력일). 0이면 비활성.
     # 거래일이 아니라 달력일인 것은 `core/exit_rules.py`의 max_hold_days와 같은
     # 이유다 — core는 휴장일 캘린더를 알지 않는다.

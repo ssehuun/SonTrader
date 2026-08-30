@@ -96,7 +96,11 @@ class EntryTrigger(Enum):
 
 @dataclass(frozen=True)
 class StrategyConfig:
-    entry_weight: float = 0.20  # 신규 진입 목표 비중 (설계 1.2절 "5종목 균등 20%")
+    # 신규 진입 목표 비중. 설계 1.2절은 "5종목 균등 20%"였으나 **증거금 규칙에
+    # 걸려 성립하지 않는다** — 한 사이클에 넣을 수 있는 총액이 `1/1.30 = 76.9%`로
+    # 고정이고 종목 수와 무관하다(`core/diff.py`의 「증거금」 절). 4종목 × 19% =
+    # 76%가 그 안에 들어가는 조합이다. `max_positions`와 함께 바꿔야 한다.
+    entry_weight: float = 0.19
     exit_history_bars: int = 300  # 청산 판정에 넘길 봉 개수 (ATR 창 + 보유기간 여유)
     entry_trigger: EntryTrigger = EntryTrigger.EVENT
     # WATCHLIST_RANK 모드에서 신규 진입에 붙일 청산 조건. EVENT 모드는 LLM이

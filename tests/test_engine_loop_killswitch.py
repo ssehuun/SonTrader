@@ -106,7 +106,7 @@ def make_judgment(event_id: str, *, confidence: float = 0.8) -> Judgment:
 
 
 def make_ctx(**overrides) -> Context:
-    base = dict(now=NOW, bars=StubBars(), watchlist=(), equity=10_000_000)
+    base = dict(now=NOW, bars=StubBars(), watchlist=(), equity=10_000_000, cash=10_000_000)
     return Context(**{**base, **overrides})
 
 
