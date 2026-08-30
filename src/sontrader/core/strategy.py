@@ -205,12 +205,30 @@ def _held_item(pos: Position, ctx: Context, cfg: StrategyConfig) -> TargetItem:
 
 
 def _current_weight(pos: Position, ctx: Context, cfg: StrategyConfig) -> float:
+    """보유 종목의 목표 비중 = **max(현재 비중, 목표 비중)**.
+
+    현재 비중만 돌려주면 diff의 델타가 0이 되어 **덜 채워진 진입이 영구히 덜
+    채워진 채로 남는다.** 증거금 상한 때문에 한 사이클에 목표를 다 못 사는
+    경우가 있는데(`core/diff.py`의 「증거금」 절), 그때 잔량을 채울 길이 없다.
+    실제로 S0(지수 매수보유)이 체결 1건으로 끝나 자본의 22.5%가 영구히 놀았다
+    — CAGR −0.70%p.
+
+    **`max`인 이유**: 위쪽은 그대로 둔다. 오른 종목을 목표 비중으로 깎으면
+    ATR 트레일링이 "수익 종목을 계속 태우는" 것과 충돌하고 회전율도 올라간다
+    (이 모듈 서두 1번). 아래쪽만 되돌린다.
+
+    **손실 종목을 물타기하지 않나** — 실질적으로 안 한다. no-trade band(기본
+    2%)를 넘으려면 비중이 목표보다 2%p 넘게 빠져야 하는데, 그 전에 손절(−5%)이
+    먼저 걸린다. 되돌림이 실제로 발동하는 것은 **진입 직후 덜 채워진 경우**뿐이고
+    그때는 격차가 커서 밴드를 넘는다.
+    """
     if ctx.equity <= 0:
         return cfg.entry_weight
     bar = ctx.bars.latest(pos.symbol)
     if bar is None or bar.close <= 0:
         return cfg.entry_weight
-    return min(max(pos.qty * bar.close / ctx.equity, 0.0), 1.0)
+    current = min(max(pos.qty * bar.close / ctx.equity, 0.0), 1.0)
+    return max(current, cfg.entry_weight)
 
 
 def _watchlist_entries(

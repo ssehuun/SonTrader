@@ -149,15 +149,33 @@ def test_max_hold_signal_liquidates_even_without_bars():
 
 
 def test_held_position_targets_its_current_mark_to_market_weight():
-    position = make_position(qty=100)  # 청산 신호 없음
+    """오른 종목은 목표 비중으로 깎지 않는다 — ATR 트레일링과 충돌한다."""
+    position = make_position(qty=250)  # 청산 신호 없음. 25.25% > entry_weight
     bars = make_bars(SYMBOL, [10_000, 10_100])  # 스톱 위, 종가 10,100
     ctx = make_ctx(series={SYMBOL: bars}, positions=(position,), equity=10_000_000)
 
     item = build_target(ctx).get(SYMBOL)
 
     assert item is not None
-    assert item.weight == pytest.approx(100 * 10_100 / 10_000_000)
+    assert item.weight == pytest.approx(250 * 10_100 / 10_000_000)
+    assert item.weight > StrategyConfig().entry_weight
     assert item.urgency is Urgency.NEXT_OPEN
+
+
+def test_an_underfilled_position_targets_the_entry_weight_again():
+    """덜 채워진 진입은 되돌린다.
+
+    현재 비중만 목표로 두면 증거금 상한에 걸려 덜 산 잔량을 채울 길이 없다 —
+    S0(지수 매수보유)이 체결 1건으로 끝나 자본의 22.5%가 영구히 놀았다.
+    """
+    position = make_position(qty=100)  # 10.1% — entry_weight(19%) 아래
+    bars = make_bars(SYMBOL, [10_000, 10_100])
+    ctx = make_ctx(series={SYMBOL: bars}, positions=(position,), equity=10_000_000)
+
+    item = build_target(ctx).get(SYMBOL)
+
+    assert item is not None
+    assert item.weight == pytest.approx(StrategyConfig().entry_weight)
 
 
 def test_held_position_keeps_its_own_exit_rule_unchanged():
