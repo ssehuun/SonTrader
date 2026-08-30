@@ -227,7 +227,13 @@ def _current_weight(pos: Position, ctx: Context, cfg: StrategyConfig) -> float:
     bar = ctx.bars.latest(pos.symbol)
     if bar is None or bar.close <= 0:
         return cfg.entry_weight
-    current = min(max(pos.qty * bar.close / ctx.equity, 0.0), 1.0)
+    # 1주치를 더해 올려 잡는다. diff가 `int(equity × weight) // price`로 되돌리는데,
+    # 그냥 `qty × close / equity`를 주면 부동소수점 오차로 `int()`가 1을 깎아
+    # **델타가 −1이 되고 1주짜리 매도가 나간다.** 고가 종목일수록 1주가 커서
+    # no-trade band를 넘어 실제로 주문이 나갔다 — 실측에서 NAVER·SK하이닉스에
+    # 8.6년간 12건. 여유를 더하면 되돌린 값이 정확히 `pos.qty`가 된다
+    # (한 주가 더 나오지는 않는다 — `(qty+1)×close − 1`을 넘지 않기 때문이다).
+    current = min(max((pos.qty * bar.close + bar.close - 1) / ctx.equity, 0.0), 1.0)
     return max(current, cfg.entry_weight)
 
 

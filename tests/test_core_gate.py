@@ -187,11 +187,26 @@ def test_clamping_preserves_the_rest_of_the_item():
     assert item.urgency is Urgency.NEXT_OPEN
 
 
-def test_held_position_over_the_cap_is_clamped_down():
-    # 상한 초과 축소는 노출을 줄이는 방향이라 보유 종목에도 적용한다.
+def test_held_position_is_not_clamped_down():
+    """보유 종목에는 비중 상한을 걸지 않는다.
+
+    걸면 전략의 설계가 무효화된다 — `core/strategy.py`가 수익 종목을 깎지
+    않으려고 현재 비중을 목표로 돌려주는데 게이트가 다시 깎아버린다. 실측에서
+    매수보유 재생이 체결 236건으로 번지고 −37.2%가 됐다(`core/gate.py` 주석).
+    """
     ctx = make_ctx(positions=(make_position("000"),))
 
     item = apply(Target((entry("000", weight=0.4),)), ctx).target.get("000")
+
+    assert item is not None
+    assert item.weight == pytest.approx(0.4)
+
+
+def test_a_new_entry_is_still_clamped_to_the_cap():
+    """진입 시점의 상한은 그대로다 — 첫 배분이 커지는 것은 막는다."""
+    ctx = make_ctx()
+
+    item = apply(Target((entry("100", weight=0.4),)), ctx).target.get("100")
 
     assert item is not None
     assert item.weight == pytest.approx(CAP)

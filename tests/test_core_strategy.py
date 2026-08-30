@@ -157,7 +157,8 @@ def test_held_position_targets_its_current_mark_to_market_weight():
     item = build_target(ctx).get(SYMBOL)
 
     assert item is not None
-    assert item.weight == pytest.approx(250 * 10_100 / 10_000_000)
+    # 1주치 여유가 더해진다 — diff가 되돌릴 때 델타가 −1로 새지 않게 한다.
+    assert item.weight == pytest.approx((250 * 10_100 + 10_099) / 10_000_000)
     assert item.weight > StrategyConfig().entry_weight
     assert item.urgency is Urgency.NEXT_OPEN
 
@@ -500,3 +501,21 @@ def test_event_mode_ignores_the_config_exit_rule():
     (item,) = build_target(ctx, cfg)
 
     assert item.exit_rule == llm_rule
+
+
+def test_the_held_weight_round_trips_back_to_the_same_quantity():
+    """비중 → 수량 왕복이 원래 수량을 돌려줘야 한다.
+
+    안 그러면 델타가 −1이 되어 **아무 이유 없이 1주가 팔린다.** 고가 종목은
+    1주가 no-trade band를 넘어 실제 주문으로 나갔다 — 실측 8.6년간 12건.
+    """
+    equity = 10_000_000
+    for qty, close in [(250, 10_100), (37, 214_500), (4, 2_008_000), (1, 999_999)]:
+        position = make_position(qty=qty)
+        ctx = make_ctx(
+            series={SYMBOL: make_bars(SYMBOL, [close, close])},
+            positions=(position,),
+            equity=equity,
+        )
+        w = build_target(ctx).get(SYMBOL).weight
+        assert int(equity * w) // close == qty, f"{qty}주 @ {close:,}에서 왕복 실패"
