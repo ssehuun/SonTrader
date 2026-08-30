@@ -269,3 +269,76 @@ def test_no_sample_warning_at_minimum():
 def test_nonpositive_initial_cash_is_rejected():
     with pytest.raises(ValueError):
         build_report(make_result(), initial_cash=0)
+
+
+# --- 소르티노 / 칼마 / 최장 무수익 기간 -----------------------------------------
+
+
+def test_sortino_is_none_without_losing_days():
+    """손실일이 없으면 하방편차가 0이라 비율이 정의되지 않는다 — 무한대를 흉내내지 않는다."""
+    curve = [(date(2025, 1, i + 1), 10_000_000 + i * 100_000) for i in range(5)]
+    report = build_report(make_result(equity_curve=curve), initial_cash=10_000_000)
+    assert report.sortino is None
+
+
+def test_sortino_exceeds_sharpe_when_upside_is_volatile():
+    """샤프는 상방 변동에도 벌점을 준다. 큰 상승 하나가 섞이면 둘이 갈린다.
+
+    이 갈림이 소르티노를 넣은 이유다 — 추세 추종처럼 수익 분포가 비대칭인
+    전략에서 샤프만 보면 실제 위험과 무관한 벌점을 읽게 된다.
+    """
+    values = [10_000_000, 10_100_000, 10_050_000, 10_150_000, 13_000_000]
+    curve = [(date(2025, 1, i + 1), v) for i, v in enumerate(values)]
+    report = build_report(make_result(equity_curve=curve), initial_cash=10_000_000)
+    assert report.sortino > report.sharpe
+
+
+def test_calmar_is_cagr_over_mdd():
+    curve = [
+        (date(2025, 1, 1), 10_000_000),
+        (date(2025, 7, 1), 8_000_000),  # 고점 대비 −20%
+        (date(2026, 1, 1), 12_000_000),
+    ]
+    report = build_report(make_result(equity_curve=curve), initial_cash=10_000_000)
+    assert report.mdd == pytest.approx(0.2)
+    assert report.calmar == pytest.approx(report.cagr / 0.2)
+
+
+def test_calmar_is_none_without_a_drawdown():
+    """MDD가 0이면 나눌 수 없다."""
+    curve = [(date(2025, 1, 1), 10_000_000), (date(2026, 1, 1), 12_000_000)]
+    report = build_report(make_result(equity_curve=curve), initial_cash=10_000_000)
+    assert report.mdd == 0.0
+    assert report.calmar is None
+
+
+def test_longest_underwater_counts_calendar_days_to_recovery():
+    curve = [
+        (date(2025, 1, 1), 10_000_000),  # 전고점
+        (date(2025, 3, 1), 9_000_000),
+        (date(2025, 6, 1), 9_500_000),
+        (date(2025, 7, 1), 10_000_000),  # 회복 (1/1 이후 181일)
+        (date(2025, 8, 1), 11_000_000),
+    ]
+    report = build_report(make_result(equity_curve=curve), initial_cash=10_000_000)
+    assert report.longest_underwater_days == 181
+
+
+def test_longest_underwater_includes_an_unrecovered_tail():
+    """곡선이 끝날 때까지 회복 못 한 구간도 센다.
+
+    빼면 지표가 낙관 쪽으로 치우친다 — 진행 중인 낙폭이 대개 가장 길다.
+    """
+    curve = [
+        (date(2025, 1, 1), 10_000_000),
+        (date(2025, 2, 1), 9_000_000),
+        (date(2026, 1, 1), 9_500_000),  # 끝까지 미회복 (365일)
+    ]
+    report = build_report(make_result(equity_curve=curve), initial_cash=10_000_000)
+    assert report.longest_underwater_days == 365
+
+
+def test_longest_underwater_is_zero_for_a_monotonic_curve():
+    curve = [(date(2025, 1, i + 1), 10_000_000 + i * 100_000) for i in range(5)]
+    report = build_report(make_result(equity_curve=curve), initial_cash=10_000_000)
+    assert report.longest_underwater_days == 0

@@ -1171,7 +1171,12 @@ def _num(value: float | None, suffix: str = "") -> str:
 def _print_report(report) -> None:
     from sontrader.apps.report import MIN_TRADE_SAMPLE
 
-    print(f"CAGR {_pct(report.cagr)}  샤프 {_num(report.sharpe)}  MDD {report.mdd:.2%}")
+    uw = report.longest_underwater_days
+    print(f"CAGR {_pct(report.cagr)}  MDD {report.mdd:.2%}  칼마 {_num(report.calmar)}")
+    print(
+        f"샤프 {_num(report.sharpe)}  소르티노 {_num(report.sortino)}"
+        f"  최장무수익 {uw if uw is not None else '—'}일"
+    )
     print(
         f"승률 {_pct(report.win_rate)}  PF {_num(report.profit_factor)}"
         f"  손익비 {_num(report.payoff_ratio)}"

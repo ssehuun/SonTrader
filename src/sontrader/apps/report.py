@@ -53,6 +53,9 @@ class PerformanceReport:
     cagr: float | None
     sharpe: float | None
     mdd: float
+    sortino: float | None
+    calmar: float | None
+    longest_underwater_days: int | None
     win_rate: float | None
     profit_factor: float | None
     payoff_ratio: float | None
@@ -72,6 +75,9 @@ def build_report(result: BacktestResult, *, initial_cash: int) -> PerformanceRep
     return PerformanceReport(
         cagr=_cagr(result.equity_curve, initial_cash),
         sharpe=_sharpe(equity_values),
+        sortino=_sortino(equity_values),
+        calmar=_calmar(_cagr(result.equity_curve, initial_cash), _mdd(equity_values, initial_cash)),
+        longest_underwater_days=_longest_underwater_days(result.equity_curve, initial_cash),
         mdd=_mdd(equity_values, initial_cash),
         win_rate=_win_rate(trades),
         profit_factor=_profit_factor(trades),
@@ -113,6 +119,74 @@ def _sharpe(equity_values: list[int]) -> float | None:
         return None
     # 무위험수익률 0 가정. 위 docstring 3번 — 사이클이 거래일 단위이므로 252로 연환산.
     return fmean(returns) / std * math.sqrt(_TRADING_DAYS_PER_YEAR)
+
+
+def _sortino(equity_values: list[int]) -> float | None:
+    """소르티노 = 수익 / **하방** 표준편차. 샤프의 교정이다.
+
+    샤프는 상방 변동성에도 벌점을 준다 — 크게 오른 날이 지표를 깎는다.
+    추세 추종처럼 **수익 분포가 비대칭인** 전략에서 그 벌점이 실제 위험과
+    무관하게 커진다. 소르티노는 음수 수익만 분모에 넣는다.
+
+    둘을 함께 본다. **소르티노가 샤프보다 훨씬 크면 상방 변동이 컸다는 뜻**이고,
+    그건 벌점이 아니라 전략의 성질이다.
+    """
+    returns = _daily_returns(equity_values)
+    if len(returns) < 2:
+        return None
+    downside = [r for r in returns if r < 0]
+    if not downside:
+        return None  # 손실일이 없으면 비율이 정의되지 않는다
+    # 하방편차는 음수 수익만 제곱평균한다 — 표본 표준편차가 아니다
+    dd = math.sqrt(sum(r * r for r in downside) / len(returns))
+    if dd == 0:
+        return None
+    return fmean(returns) / dd * math.sqrt(_TRADING_DAYS_PER_YEAR)
+
+
+def _calmar(cagr: float | None, mdd: float) -> float | None:
+    """칼마 = CAGR / MDD. **"낙폭 1%p당 몇 %의 수익을 벌었나."**
+
+    S1(지수 추세 필터)의 주장이 "MDD는 줄고 CAGR은 유지"인데, 그 맞바꿈을
+    **한 숫자로** 표현한 것이 칼마다. 두 지표를 따로 보면 "CAGR이 조금 줄고
+    MDD도 조금 줄었다"에서 어느 쪽이 이겼는지 판단이 갈린다.
+
+    샤프·소르티노와 달리 **일별 변동이 아니라 최악의 한 사건**을 분모에 쓴다.
+    변동성은 낮지만 한 번 크게 무너지는 전략을 샤프는 잘 잡지 못한다.
+    """
+    if cagr is None or mdd <= 0:
+        return None
+    return cagr / mdd
+
+
+def _longest_underwater_days(equity_curve, initial_cash: int) -> int | None:
+    """전고점을 회복하기까지 걸린 **최장 달력일**.
+
+    MDD는 낙폭의 **깊이**만 말한다. 30% 빠졌다가 3개월에 회복하는 것과 3년이
+    걸리는 것은 완전히 다른 전략인데 MDD로는 구분되지 않는다.
+
+    **곡선이 끝날 때까지 회복 못 한 구간도 센다** — 진행 중인 낙폭이 대개
+    가장 길고, 빼면 지표가 낙관 쪽으로 치우친다.
+    """
+    if not equity_curve:
+        return None
+    peak = initial_cash
+    peak_date = equity_curve[0][0]
+    longest = 0
+    underwater = False
+    for date, equity in equity_curve:
+        if equity >= peak:
+            # 회복한 날까지 센다 — 고점에서 회복까지가 "물속에 있던 기간"이다.
+            # 회복 직전 관측치에서 끊으면 마지막 구간이 빠진다.
+            if underwater:
+                longest = max(longest, (date - peak_date).days)
+            peak = equity
+            peak_date = date
+            underwater = False
+        else:
+            underwater = True
+            longest = max(longest, (date - peak_date).days)
+    return longest
 
 
 def _mdd(equity_values: list[int], initial_cash: int) -> float:
