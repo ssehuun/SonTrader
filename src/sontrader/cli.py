@@ -341,13 +341,21 @@ def _run_index_trend(
     initial_cash: int,
     csv_path: str | None,
     cost_multiple: float = 1.0,
+    n_in: int | None = None,
 ) -> int:
-    """지수 이평 추세 필터 (S1) — **백테스트 교정**. `apps/index_trend.py` 참고."""
+    """지수 이평 추세 필터 (S1). `apps/index_trend.py` 참고."""
     from dataclasses import replace as _replace
 
     from sqlalchemy.exc import SQLAlchemyError
 
-    from sontrader.apps.index_trend import ETF_COST, N_GRID, equity_rows, load_index_bars, sweep
+    from sontrader.apps.index_trend import (
+        ETF_COST,
+        N_GRID,
+        equity_rows,
+        load_index_bars,
+        sweep,
+        sweep_exit,
+    )
     from sontrader.apps.report import build_report
 
     try:
@@ -371,8 +379,8 @@ def _run_index_trend(
         print(f"{code} {bars[0].ts.date()} ~ {bars[-1].ts.date()} · 봉 {len(bars):,}개")
         print(f"워밍업 {max(N_GRID) - 1}봉을 격자 전체에 통일 (창을 맞춰야 단조성 비교가 성립)")
 
-        # 반증 ④b — 비용 가정이 틀려도 결론이 살아남는지 본다. 시장충격
-        # 0.02%가 미실측이라 이 확인이 진짜 방어다(규약 §2 "구성요소별로").
+        # 비용 가정이 틀려도 결론이 살아남는지 본다. 시장충격 0.02%가
+        # 미실측이라 이 확인이 진짜 방어다(규약 §2 "구성요소별로").
         cost = ETF_COST
         if cost_multiple != 1.0:
             cost = _replace(
@@ -383,37 +391,46 @@ def _run_index_trend(
             round_trip = 2 * (cost.commission_rate + cost.slippage_bps / 10_000) * 100
             print(f"비용 {cost_multiple}배 — 왕복 {round_trip:.3f}%")
 
-        s0, runs = sweep(bars, initial_cash=initial_cash, broker_config=cost)
+        if n_in is None:
+            s0, runs = sweep(bars, initial_cash=initial_cash, broker_config=cost)
+        else:
+            print(f"2단계 — 진입 N_in={n_in} 고정, 청산 N_out을 격자 전체로 훑는다")
+            s0, runs = sweep_exit(bars, n_in=n_in, initial_cash=initial_cash, broker_config=cost)
         s0_report = build_report(s0.result, initial_cash=initial_cash)
         print(
             f"\nS0 매수보유: CAGR {_pct(s0_report.cagr)} · MDD {s0_report.mdd:.2%}"
             f" · 최장무수익 {s0_report.longest_underwater_days}일"
             f" · 거래 {len(s0.result.closed_trades)}건 · {s0.years:.1f}년"
         )
+        label = "N_out" if n_in is not None else "N"
         print(
-            f"\n{'N':>4} {'CAGR':>9} {'MDD':>8} {'무수익일':>8} {'샤프':>7}"
+            f"\n{label:>5} {'CAGR':>9} {'MDD':>8} {'무수익일':>8} {'샤프':>7}"
             f" {'소르티노':>8} {'칼마':>7} {'연왕복':>7} {'보유비중':>8}"
         )
         for r in runs:
             rep = build_report(r.result, initial_cash=initial_cash)
+            knob = r.n_out if n_in is not None else r.n
             print(
-                f"{r.n:>4} {_pct(rep.cagr):>9} {rep.mdd:>8.2%}"
+                f"{knob:>5} {_pct(rep.cagr):>9} {rep.mdd:>8.2%}"
                 f" {rep.longest_underwater_days or 0:>8,} {_num(rep.sharpe):>7}"
                 f" {_num(rep.sortino):>8} {_num(rep.calmar, 3):>7}"
                 f" {r.round_trips_per_year:>7.2f} {r.in_market_ratio:>8.1%}"
             )
 
         if csv_path:
+            # 위 표를 소르티노로 읽으므로 곡선도 **같은 기준**으로 뽑는다.
+            # 칼마로 뽑던 때는 표에서 고른 N과 그림의 N이 달라, 판정한 것과
+            # 다른 곡선을 보게 됐다.
             best = max(
                 runs,
-                key=lambda r: build_report(r.result, initial_cash=initial_cash).calmar or -1e9,
+                key=lambda r: build_report(r.result, initial_cash=initial_cash).sortino or -1e9,
             )
             rows = equity_rows(s0, best)
             with open(csv_path, "w", encoding="utf-8") as fh:
                 fh.write("date,s0_equity,s1_equity,in_market\n")
                 for day, s0_eq, s1_eq, held in rows:
                     fh.write(f"{day},{s0_eq},{s1_eq},{held}\n")
-            print(f"\n자산곡선 CSV: {csv_path} ({len(rows)}행, S1은 칼마 최적 N={best.n})")
+            print(f"\n자산곡선 CSV: {csv_path} ({len(rows)}행, S1은 소르티노 최적 {best.label})")
         return 0
     except SQLAlchemyError as exc:
         print(f"error: DB access failed: {_first_line(exc)}", file=sys.stderr)
@@ -1366,7 +1383,13 @@ def main(argv: list[str] | None = None) -> int:
         "--cost-multiple",
         type=float,
         default=1.0,
-        help="왕복비용 배수 (반증 ④b: 2를 주면 0.30%%에서도 결론이 유지되는지 본다)",
+        help="왕복비용 배수 (2를 주면 왕복 0.30%%에서도 결론이 유지되는지 본다)",
+    )
+    trend.add_argument(
+        "--n-in",
+        type=int,
+        default=None,
+        help="2단계: 진입 이평을 이 값에 고정하고 청산 이평을 격자 전체로 훑는다",
     )
 
     daytrade = sub.add_parser(
@@ -1528,7 +1551,13 @@ def main(argv: list[str] | None = None) -> int:
         return _run_collect_index(args.codes, args.earliest)
     if args.command == "index-trend":
         return _run_index_trend(
-            args.code, args.start, args.end, args.initial_cash, args.csv, args.cost_multiple
+            args.code,
+            args.start,
+            args.end,
+            args.initial_cash,
+            args.csv,
+            args.cost_multiple,
+            args.n_in,
         )
     if args.command == "daytrade-universe":
         return _run_daytrade_universe(args.date, args.min_trade_value, args.top_n)

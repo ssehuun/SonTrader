@@ -1,18 +1,15 @@
-"""지수 이동평균 추세 필터 (S1) — **백테스트 교정용**.
+"""지수 이동평균 추세 필터 (S1).
 
-## 이건 전략 채택 후보가 아니다
+## 재는 것은 둘뿐이다
 
-우리는 백테스트를 **알려진 정답으로 맞춰본 적이 한 번도 없다.** 지금까지 잰
-것은 전부 "이 전략이 지는가"였고 전부 졌는데, **백테스트가 고장 나 있어도
-똑같이 진다.** 기준선 v1·v2가 부기 버그로 통째로 무효였던 전례가 정확히
-그것이다.
+| | 무엇 | 함수 |
+|---|---|---|
+| **1단계** | 진입·청산 이평이 **같을 때**(`N`) 수익률 | `sweep()` |
+| **2단계** | 진입·청산 이평을 **다르게** 했을 때(`N_in`·`N_out`) 수익률 | `sweep_exit()` |
 
-지수 추세추종은 수십 개 시장에서 문서화된 효과다. **재현이 안 되면 효과가
-없는 게 아니라 배관이 새는 것**이라고 읽을 수 있다는 점이 이 전략을 고른
-이유다. 통과해도 실전에 올리지 않는다 — 나오는 것은 KODEX 200을 사고파는
-봇이지 종목을 고르는 봇이 아니다.
+**둘 다 S0(매수보유)과 나란히 놓는다.** 그 밖의 검사는 두지 않는다.
 
-## 그래서 별도 계산이면 무의미하다
+## 별도 계산이면 무의미하다
 
 이평을 구해 수익률을 내는 것은 짧은 스크립트로 되지만 **그건 백테스트를 안
 건드린다.** 이 모듈은 반드시 `apps/backtest.py`의 `replay()`를 통과한다 —
@@ -32,27 +29,29 @@
 없다. 각 `N`이 자기 워밍업 뒤부터 시작하면 **창이 달라져 단조성 비교가
 무의미해진다.** 그래서 격자에서 가장 긴 `N`에 맞춰 **전체 시작일을 통일**한다.
 
-**2. 미래 참조.** `종가 > SMA(N)`의 SMA는 **그 종가를 포함**한다. 판정은 종가
-확정 후이고 체결은 **다음 봉 시가**다. 이 성질은 우연이 아니라 배선으로
-보장된다 — `Context.now`가 그날 봉의 `ts`와 같아서 `InMemoryBarView`는 그날
-종가까지 보여주고(`bisect_right`), `SimBroker._next_bar()`는 `order.ts`
-**이후** 봉을 찾으므로 그날 봉을 건너뛴다.
+**2. 신호와 체결이 같은 종가를 쓴다 — 근사이고, 방향은 유리한 쪽이다.**
+15:20 종가 동시호가에 집행한다고 두었다(`SimBrokerConfig.fill_at_close`).
+실전에서는 15:20에 주문할 때 오늘 종가가 아직 확정되지 않으므로 **15:20
+가격을 종가로 대용**하는 것이고, 일봉에는 15:20 가격이 없다. **여기서 나온
+수치는 그만큼 실전보다 낙관이다 — 판정문에 그대로 옮긴다.**
+
+시가 체결을 쓰지 않는 이유는 그쪽이 더 큰 왜곡을 끌고 왔기 때문이다. 체결가를
+주문 시점에 모르면 수량을 증거금 상한(현재가 × 1.30)으로 잡아야 하고, 거기서
+분할 체결·미투입 현금·진입 첫날 노출 부족이 딸려 나온다. **그 배관 편차가
+재려던 효과보다 컸다** (M007·M008).
 
 **3. 비용은 ETF 기준이다.** 규약의 0.708%는 개별주 값이고 **거래세 0.2%가
-ETF에는 없다.** S1.3이 재산출한 **왕복 0.15%**를 쓴다 — 수수료 0.028% +
-스프레드 0.10% + 충격 0.02%. 가장 불리한 초기 저가 구간 기준이라 최근
-구간에서는 실제로 더 싸다.
+ETF에는 없다.** 왕복 **0.15%**를 쓴다 — 수수료 0.028% + 스프레드 0.10% +
+충격 0.02%. 가장 불리한 초기 저가 구간 기준이라 최근 구간에서는 더 싸다.
 
 ## 한계 — 판정문에 그대로 옮긴다
 
-**백테스트의 일부만 검정한다.** ETF 일봉이 DB에 없어(`069500`·`102110` 둘 다
+**백테스트의 일부만 탄다.** ETF 일봉이 DB에 없어(`069500`·`102110` 둘 다
 0행) **지수로 재생**한다.
 
-| 검정된다 | 안 된다 |
+| 탄다 | 안 탄다 |
 |---|---|
-| 재생 루프 · 청산 · 리포트 지표 | 유니버스 · 필터 · 주문 경로 |
-
-**"백테스트 전체를 검정했다"고 쓰지 않는다. 부분 교정이다.**
+| 재생 루프 · 청산 · 리포트 지표 | 유니버스 · 필터 |
 """
 
 from __future__ import annotations
@@ -67,6 +66,7 @@ from sqlalchemy.engine import Engine
 
 from sontrader.adapters.broker_sim import SimBrokerConfig
 from sontrader.apps.backtest import BacktestResult, replay
+from sontrader.core.diff import DiffConfig
 from sontrader.core.gate import GateConfig
 from sontrader.core.strategy import EntryTrigger, StrategyConfig
 from sontrader.core.types import Bar, ExitRule
@@ -93,7 +93,16 @@ ETF_COST = SimBrokerConfig(
     tax_rate=0.0,  # ETF는 증권거래세 면제
     slippage_bps=6.1,
     settlement_days=2,
+    fill_at_close=True,  # 15:20 종가 동시호가 — 모듈 상단 함정 2
 )
+
+# 종가 동시호가 수량 환산의 여유분. 체결가를 이미 알므로 증거금 상한(1.30)이
+# 필요 없고, **슬리피지 6.1bp + 수수료 1.4bp + 반올림**만 덮으면 된다. 0.2%는
+# 그 합(0.075%)의 2.7배다.
+#
+# 손잡이가 아니다 — 전략이 무엇을 살지 정하는 값이 아니라 집행 계층 상수다.
+# 남는 현금 0.2%가 노는 대가는 CAGR 약 −0.006%p다.
+CLOSE_FILL_BUFFER = 0.002
 
 
 @dataclass(frozen=True)
@@ -105,10 +114,15 @@ class TrendRun:
     round_trips_per_year: float
     in_market_ratio: float  # 사이클 중 포지션을 들고 있던 비율
     years: float
+    n_out: int | None = None  # 청산 이평. `None`이면 진입과 같다(대칭 — 1단계)
 
     @property
     def label(self) -> str:
-        return "S0" if self.n is None else f"S1(N={self.n})"
+        if self.n is None:
+            return "S0"
+        if self.n_out is None or self.n_out == self.n:
+            return f"S1(N={self.n})"
+        return f"S1(N_in={self.n},N_out={self.n_out})"
 
 
 def load_index_bars(engine: Engine, code: str, start: date, end: date) -> list[Bar]:
@@ -147,23 +161,74 @@ def load_index_bars(engine: Engine, code: str, start: date, end: date) -> list[B
     return bars
 
 
-def sma_signals(bars: Sequence[Bar], n: int) -> list[bool]:
-    """`종가 > SMA(N)`. 앞 `n-1`개는 창이 안 차 `False`.
+def sma(bars: Sequence[Bar], n: int) -> list[float | None]:
+    """단순이동평균. 창이 안 찬 앞 `n-1`개는 `None`이다.
 
-    SMA는 **그날 종가를 포함**한다(규칙 그대로). 그래도 look-ahead가 아닌
-    이유는 체결이 다음 봉 시가이기 때문이다 — 모듈 상단 함정 2.
+    `None`으로 두는 것이 0.0으로 두는 것보다 안전하다 — 0과 비교하면 모든
+    종가가 이평 위가 되어 워밍업 구간이 통째로 진입 신호가 된다.
     """
     if n < 1:
         raise ValueError(f"n must be >= 1: {n}")
     closes = [float(bar.close) for bar in bars]
-    out = [False] * len(closes)
+    out: list[float | None] = [None] * len(closes)
     window = 0.0
     for i, close in enumerate(closes):
         window += close
         if i >= n:
             window -= closes[i - n]
         if i >= n - 1:
-            out[i] = close > window / n
+            out[i] = window / n
+    return out
+
+
+def sma_signals(bars: Sequence[Bar], n: int) -> list[bool]:
+    """`종가 > SMA(N)`. 앞 `n-1`개는 창이 안 차 `False`.
+
+    SMA는 **그날 종가를 포함**하고 체결도 그날 종가다 — 모듈 상단 함정 2가
+    말하는 근사다. 미래 봉은 안 본다.
+    """
+    averages = sma(bars, n)
+    return [
+        avg is not None and float(bar.close) > avg for bar, avg in zip(bars, averages, strict=True)
+    ]
+
+
+def trend_signals(bars: Sequence[Bar], *, n_in: int, n_out: int) -> list[bool]:
+    """진입·청산 이평을 따로 두는 보유 상태 (**2단계**).
+
+    규칙은 대칭 버전과 같은 모양이되 창이 둘이다:
+
+    | | |
+    |---|---|
+    | 진입 | 안 들고 있는데 `종가 > SMA(N_in)` |
+    | 청산 | 들고 있는데 `종가 < SMA(N_out)` |
+    | 그 사이 | **상태를 유지한다** |
+
+    🔴 **`sma_signals(n_out)`의 부정이 아니다.** 부정은 `종가 <= SMA`라 같은
+    날에도 판다. 두 부등호를 모두 강부등호로 두어야 `N_in == N_out`일 때
+    대칭 버전과 정확히 같은 계열이 나온다 — 그게 2단계가 1단계를 포함한다는
+    보증이고, 이 함수의 회귀 테스트다.
+
+    앞 `max(N_in, N_out) - 1`개는 두 창 중 하나라도 안 차 있으므로 `False`다.
+    창 하나만 찼을 때 진입시키면 `N_out`이 클수록 다른 시점에 시작하게 되어
+    **격자 비교가 무의미해진다**(모듈 상단 함정 1과 같은 이유).
+    """
+    entry_avg = sma(bars, n_in)
+    exit_avg = sma(bars, n_out)
+    warmup = max(n_in, n_out) - 1
+    out = [False] * len(bars)
+    holding = False
+    for i, bar in enumerate(bars):
+        if i < warmup:
+            holding = False
+            continue
+        close = float(bar.close)
+        if holding:
+            if exit_avg[i] is not None and close < exit_avg[i]:
+                holding = False
+        elif entry_avg[i] is not None and close > entry_avg[i]:
+            holding = True
+        out[i] = holding
     return out
 
 
@@ -174,6 +239,7 @@ def run(
     warmup: int,
     initial_cash: int,
     broker_config: SimBrokerConfig | None = None,
+    n_out: int | None = None,
 ) -> TrendRun:
     """한 조건을 재생한다. **`replay()`를 통과한다 — 별도 계산이 아니다.**
 
@@ -181,12 +247,20 @@ def run(
     워밍업만큼만 건너뛰면 창이 달라져 단조성 비교가 무의미해진다(함정 1).
 
     `n=None`이면 S0 — 워치리스트에 항상 종목이 있어 한 번 사고 끝까지 든다.
+    `n_out`을 주면 청산 이평만 따로 간다(2단계) — `trend_signals` 참고.
     """
     if warmup >= len(bars):
         raise ValueError(f"warmup({warmup}) >= 봉 개수({len(bars)}) — 창이 너무 짧다")
+    if n is None and n_out is not None:
+        raise ValueError("n_out은 n 없이 줄 수 없다 — S0에는 청산 규칙이 없다")
 
     symbol = bars[0].symbol
-    signals = [True] * len(bars) if n is None else sma_signals(bars, n)
+    if n is None:
+        signals = [True] * len(bars)
+    elif n_out is None or n_out == n:
+        signals = sma_signals(bars, n)
+    else:
+        signals = trend_signals(bars, n_in=n, n_out=n_out)
     active = bars[warmup:]
 
     watchlists: dict[date, list[str]] = {}
@@ -216,6 +290,10 @@ def run(
             exit_when_dropped=True,
         ),
         gate=GateConfig(max_positions=1, max_weight=1.0, cooldown_days=0),
+        # 종가 체결이라 체결가를 이미 안다 — 증거금 상한(1.30) 대신 여유분만
+        # 둔다. 그대로 두면 한 사이클 투입 상한이 76.9%가 되어 100% 노출을
+        # 재려던 것이 재지지 않는다.
+        diff=DiffConfig(price_limit=CLOSE_FILL_BUFFER),
         check_killswitch=False,
     )
 
@@ -238,6 +316,7 @@ def run(
         round_trips_per_year=len(result.closed_trades) / years,
         in_market_ratio=in_market,
         years=years,
+        n_out=n_out,
     )
 
 
@@ -261,6 +340,45 @@ def sweep(
     runs = [
         run(bars, n=n, warmup=warmup, initial_cash=initial_cash, broker_config=broker_config)
         for n in grid
+    ]
+    return s0, runs
+
+
+def sweep_exit(
+    bars: Sequence[Bar],
+    *,
+    n_in: int,
+    grid: Sequence[int] = N_GRID,
+    initial_cash: int,
+    broker_config: SimBrokerConfig | None = None,
+) -> tuple[TrendRun, list[TrendRun]]:
+    """**2단계** — 진입 이평을 `n_in`에 고정하고 청산 이평만 훑는다.
+
+    격자 **전체**를 돈다. `n_out < n_in`(청산을 조이는 쪽)도 뺀 적이 있었는데,
+    1차 측정에서 `n_out > n_in`이 오히려 회전을 늘린다는 것이 드러났으므로
+    (M008 §4) 어느 방향이 나은지를 **재서** 답한다.
+
+    워밍업은 1단계와 **같은 값**(격자 최대 −1)으로 둔다. 여기서만 줄이면
+    1·2단계가 다른 창을 재게 되어 "2단계가 나아졌다"를 말할 수 없다.
+    """
+    if n_in < 1:
+        raise ValueError(f"n_in must be >= 1: {n_in}")
+    exits = list(grid)
+    if not exits:
+        raise ValueError("격자가 비어 있다")
+
+    warmup = max(max(grid), n_in) - 1
+    s0 = run(bars, n=None, warmup=warmup, initial_cash=initial_cash, broker_config=broker_config)
+    runs = [
+        run(
+            bars,
+            n=n_in,
+            n_out=n_out,
+            warmup=warmup,
+            initial_cash=initial_cash,
+            broker_config=broker_config,
+        )
+        for n_out in exits
     ]
     return s0, runs
 

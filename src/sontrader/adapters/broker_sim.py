@@ -1,20 +1,38 @@
 """시뮬레이션 체결 (구현 계획 5단계). 02문서 §2: "broker_sim.py — 시뮬레이션
 체결 (슬리피지·거래세·D+2)".
 
-## 체결가는 항상 "다음 봉의 시가"다
+## 체결 시점은 둘이다 — 기본은 "다음 봉의 시가"
 
 01문서 §4.1과 05문서 §4.1이 명시적으로 확정한 것: "백테스트에서 손절은
 반드시 시가 체결로 시뮬레이션한다" + "진입은 다음 개장 시가, 손절은 시가
 체결". `urgency`(IMMEDIATE/NEXT_OPEN)와 무관하게 **모든 주문은 그 주문이
-만들어진 사이클(`order.ts`) 다음 봉의 시가에 체결된다.** 신호가 발생한 봉의
-종가로 즉시 체결하면(레거시 `backtest_manager.py`의 버그, 05문서 §4.1) 그
-종가를 보고 판단한 뒤 같은 종가에 체결하는 셈이라 look-ahead다.
+만들어진 사이클(`order.ts`) 다음 봉의 시가에 체결된다.**
 
 그래서 이 클래스는 `Context.bars`(현재 시각까지만 보이는 제한된 뷰)가 아니라
 **미래를 포함한 전체 시계열**을 생성자에서 따로 받는다. 시뮬레이터는 "시장"
 역할이므로 전체 데이터를 알아도 되고, 오히려 알아야 한다 — 실전에서 내일
 시가가 얼마일지 결정하는 건 거래소지 트레이더가 아니다. `Context.bars`가
 막아야 하는 대상은 전략(strategy/gate/diff)이지 체결 시뮬레이터가 아니다.
+
+## `fill_at_close` — 15:20 종가 동시호가 집행
+
+`fill_at_close=True`면 **신호가 난 그 봉의 종가**에 체결한다. 15:20 종가
+동시호가에 주문을 넣는 집행을 재생하는 모드다.
+
+**왜 필요한가**: 시가 체결은 체결가를 주문 시점에 모른다. 그래서 수량을
+증거금 상한(현재가 × 1.30)으로 잡아야 하고, 거기서 분할 체결·미투입 현금·
+진입 첫날 노출 부족이 줄줄이 딸려 나온다. 그 배관이 전략 효과보다 큰
+편차를 만들었다(`docs/research/03-측정.md` M007·M008). 종가 체결은 체결가를
+주문 시점에 알므로 그 배관이 통째로 사라진다.
+
+⚠️ **대가: 신호와 체결이 같은 가격을 쓴다.** 신호는 `종가 > SMA(N)`이고
+체결도 그 종가다 — 실전에서는 15:20에 주문할 때 오늘 종가가 아직 확정되지
+않았으므로, **일봉으로는 15:20 가격을 종가로 대용**하는 근사다. 방향이 한쪽
+(유리한 쪽)이라 이 모드로 잰 수치는 **실전보다 낙관**이다. 판정문에 그대로
+옮긴다.
+
+**기본값은 여전히 `False`다.** 종목 전략·기준선은 시가 체결로 잰 값이고,
+기본을 바꾸면 그 수치들이 조용히 움직인다.
 
 ## 현금·정산
 
@@ -90,8 +108,11 @@ class SimBrokerConfig:
     # 실제로 구현하기 전까지는 적용 대상이 없다.
     commission_rate: float = 0.0140527 / 100
     tax_rate: float = 0.002  # 매도 시 증권거래세, 코스피·코스닥 공통 0.2%(농특세 등 포함)
-    slippage_bps: float = 10.0  # 시가 기준. 매수는 불리하게 위로, 매도는 아래로
+    slippage_bps: float = 10.0  # 체결 기준가. 매수는 불리하게 위로, 매도는 아래로
     settlement_days: int = 2  # D+2. 캘린더일 근사 (위 docstring 참고)
+    # True면 신호 봉의 **종가**에 체결한다 (15:20 종가 동시호가 집행).
+    # 위 docstring의 `fill_at_close` 절 — 근사와 그 대가가 거기 있다.
+    fill_at_close: bool = False
 
     def __post_init__(self) -> None:
         if self.commission_rate < 0:
@@ -164,16 +185,43 @@ class SimBroker:
         if order.order_type is OrderType.LIMIT:
             raise NotImplementedError("SimBroker only fills market orders")
 
-        next_bar = self._next_bar(order.symbol, order.ts)
-        if next_bar is None:
+        bar = self._fill_bar(order.symbol, order.ts)
+        if bar is None:
             # 이 시점 이후 봉이 없다 — 백테스트 데이터의 끝. 실전의 "접수
             # 불명"과 다루는 이유는 다르지만(API 타임아웃이 아니라 데이터
             # 부재), 체결됐는지 알 방법이 없다는 결과는 같다.
             return OrderResult(order=order, status=OrderStatus.UNKNOWN)
 
         if order.side is Side.BUY:
-            return self._fill_buy(order, next_bar)
-        return self._fill_sell(order, next_bar)
+            return self._fill_buy(order, bar)
+        return self._fill_sell(order, bar)
+
+    def _fill_bar(self, symbol: str, order_ts: datetime) -> Bar | None:
+        """체결이 일어나는 봉. 모드에 따라 신호 봉 자신이거나 다음 봉이다."""
+        if self._config.fill_at_close:
+            return self._bar_at_or_after(symbol, order_ts)
+        return self._next_bar(symbol, order_ts)
+
+    def _fill_price(self, bar: Bar, *, sign: float) -> float:
+        """`sign`은 매수 +1 / 매도 −1 — 슬리피지가 항상 불리한 쪽으로 간다."""
+        base = bar.close if self._config.fill_at_close else bar.open
+        return base * (1.0 + sign * self._config.slippage_bps / 10_000)
+
+    def _bar_at_or_after(self, symbol: str, ts: datetime) -> Bar | None:
+        """`ts` **이상**인 첫 거래 가능한 봉 — 종가 체결 모드의 대상 봉.
+
+        사이클 시각이 그날 봉의 `ts`와 같으므로(일봉은 둘 다 00:00) 보통은
+        그날 봉 자신이다. 거래정지(거래량 0)면 `_next_bar()`와 같은 이유로
+        재개 봉까지 밀린다.
+        """
+        timestamps = self._timestamps.get(symbol, [])
+        bars = self._bars.get(symbol, [])
+        idx = bisect.bisect_left(timestamps, ts)
+        while idx < len(bars):
+            if bars[idx].volume > 0:
+                return bars[idx]
+            idx += 1
+        return None
 
     def _next_bar(self, symbol: str, after: datetime) -> Bar | None:
         """`after` 이후 첫 **거래 가능한** 봉.
@@ -200,7 +248,7 @@ class SimBroker:
         return None
 
     def _fill_buy(self, order: Order, bar: Bar) -> OrderResult:
-        price = bar.open * (1.0 + self._config.slippage_bps / 10_000)
+        price = self._fill_price(bar, sign=+1.0)
         total, commission = _order_cost(price, order.qty, self._config.commission_rate)
 
         if total > self._cash:
@@ -228,7 +276,7 @@ class SimBroker:
                 f"{held.qty if held else 0} for {order.symbol!r}"
             )
 
-        price = bar.open * (1.0 - self._config.slippage_bps / 10_000)
+        price = self._fill_price(bar, sign=-1.0)
         gross = _round(price * order.qty)
         commission = _round(gross * self._config.commission_rate)
         tax = _round(gross * self._config.tax_rate)

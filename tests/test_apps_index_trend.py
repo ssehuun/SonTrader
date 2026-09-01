@@ -19,8 +19,11 @@ from sontrader.apps.index_trend import (
     N_GRID,
     equity_rows,
     run,
+    sma,
     sma_signals,
     sweep,
+    sweep_exit,
+    trend_signals,
 )
 from sontrader.apps.report import build_report
 from sontrader.core.types import Bar, ExitReason
@@ -122,14 +125,13 @@ def test_a_dropped_signal_closes_the_position_with_reason_signal():
 # --- 배선: look-ahead 차단 ----------------------------------------------------
 
 
-def test_entry_fills_at_the_next_bar_open_not_the_signal_close():
-    """신호는 종가로 판정하고 체결은 **다음 봉 시가**다. 같은 봉 종가에
-    체결하면 그 종가를 보고 판단한 뒤 그 가격에 사는 셈이라 look-ahead다."""
-    # 신호 봉의 종가(20)와 다음 봉 시가(15)를 벌려 어느 쪽에 체결됐는지 본다.
-    #
-    # **시가를 종가보다 위로 둘 수 없다.** 수량이 `현금/신호봉 종가`로 잡히는데
-    # 체결가가 그보다 높으면 현금을 넘어 거부된다(`entry_weight=1.0`). 상방 갭에
-    # 진입이 통째로 사라지는 이 성질 자체가 T21이다.
+def test_entry_fills_at_the_signal_bar_close():
+    """15:20 종가 동시호가 집행 — 신호가 난 **그 봉의 종가**에 체결한다.
+
+    다음 봉 시가에 체결하면 체결가를 주문 시점에 모르게 되고, 그때부터 수량을
+    증거금 상한으로 잡아야 해서 분할 체결·미투입 현금이 딸려 온다(M007·M008).
+    """
+    # 신호 봉의 종가(20)와 다음 봉 시가(15)를 크게 벌려 어느 쪽에 체결됐는지 본다.
     closes = [10, 10, 10, 20, 20, 20]
     opens = [9, 9, 9, 9, 15, 15]
     bars = make_bars(closes, opens=opens)
@@ -137,9 +139,25 @@ def test_entry_fills_at_the_next_bar_open_not_the_signal_close():
     result = run(bars, n=3, warmup=3, initial_cash=10_000_000).result
 
     assert result.fills, "진입이 아예 없다"
-    # index 3에서 신호(20 > SMA3=13.3) → index 4 **시가 15**에 체결.
-    # 신호 봉 종가 20에 체결됐다면 look-ahead다.
-    assert 15 <= result.fills[0].price < 20
+    fill = result.fills[0]
+    # index 3에서 신호(20 > SMA3=13.3) → **같은 봉 종가 20**에 체결.
+    assert fill.ts == bars[3].ts
+    assert fill.price == 20  # 다음 봉 시가 15에 체결됐다면 시가 모드다
+
+
+def test_entry_is_not_capped_by_the_margin_rule():
+    """종가 체결이면 체결가를 이미 안다 — 증거금 상한(1.30)을 물 이유가 없다.
+
+    상한을 그대로 두면 한 사이클 투입이 76.9%에서 멈춰 **100% 노출을 재려던
+    것이 재지지 않는다.**
+    """
+    bars = make_bars([100.0] * 8)
+
+    result = run(bars, n=None, warmup=1, initial_cash=10_000_000).result
+
+    # 첫 사이클 한 번으로 99% 넘게 투입된다. 상한 1.30이 살아 있으면 76.9%다.
+    first = result.fills[0]
+    assert first.qty * first.price / 10_000_000 > 0.99
 
 
 # --- 스윕 --------------------------------------------------------------------
@@ -241,3 +259,77 @@ def test_report_metrics_are_computable_from_the_run():
     assert report.longest_underwater_days is not None
     for name in ("cagr", "sharpe", "sortino", "calmar"):
         assert hasattr(report, name)
+
+
+# --- 비대칭 진입/청산 이평 (2단계) -------------------------------------
+
+
+def test_asymmetric_reduces_to_symmetric_when_windows_match():
+    """🔴 2단계가 1단계를 **포함**해야 한다.
+
+    `N_in == N_out`인데 계열이 갈리면 두 단계의 결과를 나란히 놓을 수 없다.
+    두 부등호를 모두 강부등호로 둔 이유가 이것이다.
+    """
+    bars = make_bars([10, 11, 9, 12, 8, 13, 7, 14])
+
+    assert trend_signals(bars, n_in=3, n_out=3) == sma_signals(bars, 3)
+
+
+def test_exit_window_holds_through_a_dip_below_the_entry_average():
+    """긴 청산 창의 존재 이유 — 진입 이평을 깨도 청산 이평 위면 계속 든다."""
+    closes = [10, 12, 14, 16, 18, 20, 22, 24, 26, 21]
+    bars = make_bars(closes)
+
+    tight = trend_signals(bars, n_in=3, n_out=3)
+    loose = trend_signals(bars, n_in=3, n_out=8)
+
+    # 마지막 봉 21: SMA(3)=23.67 아래라 대칭이면 판다. SMA(8)=20.125 위라 든다.
+    assert tight[-1] is False
+    assert loose[-1] is True
+
+
+def test_warmup_follows_the_longer_of_the_two_windows():
+    """짧은 창만 차도 진입시키면 `N_out`마다 시작일이 달라져 격자가 안 맞는다."""
+    bars = make_bars([10 + i for i in range(12)])
+
+    signals = trend_signals(bars, n_in=2, n_out=9)
+
+    assert signals[:8] == [False] * 8  # max(2,9)-1 = 8
+    assert signals[8] is True
+
+
+def test_equality_does_not_trigger_either_side():
+    """진입은 `>`, 청산은 `<`. 평평한 구간에서 둘 다 거짓이라 상태가 유지된다."""
+    bars = make_bars([10, 10, 10, 10])
+
+    assert trend_signals(bars, n_in=2, n_out=2) == [False, False, False, False]
+
+
+def test_sweep_exit_covers_the_whole_grid_both_directions():
+    """청산 창을 **양쪽으로** 훑는다.
+
+    한때 `N_out < N_in`을 뺐는데, 정작 측정해 보니 `N_out > N_in`이 회전을
+    늘리는 쪽이었다(M008 §4). 어느 방향이 나은지는 재서 답한다.
+    """
+    bars = make_bars([100 + (i % 7) * 3 for i in range(40)])
+
+    _, runs = sweep_exit(bars, n_in=10, grid=(5, 10, 20), initial_cash=10_000_000)
+
+    assert [r.n_out for r in runs] == [5, 10, 20]
+    assert all(r.n == 10 for r in runs)
+    assert runs[2].label == "S1(N_in=10,N_out=20)"
+
+
+def test_run_rejects_exit_window_without_entry_window():
+    """S0에는 청산 규칙이 없다. 조용히 무시하면 S0이 아닌 것을 S0이라 부른다."""
+    bars = make_bars([100.0] * 10)
+
+    with pytest.raises(ValueError, match="n_out"):
+        run(bars, n=None, n_out=5, warmup=3, initial_cash=10_000_000)
+
+
+def test_sma_leaves_the_warmup_window_undefined():
+    """0.0으로 채우면 모든 종가가 이평 위가 되어 워밍업이 통째로 진입 신호가 된다."""
+    averages = sma(make_bars([10, 20, 30]), 2)
+
+    assert averages == [None, 15.0, 25.0]

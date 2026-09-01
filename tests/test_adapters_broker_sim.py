@@ -472,3 +472,67 @@ def test_permanent_halt_yields_unknown_and_keeps_the_position():
 
     (result,) = broker.submit([make_order(SYMBOL, Side.BUY, 10, DAY0)], now=DAY0)
     assert result.status is OrderStatus.UNKNOWN
+
+
+# --- 종가 동시호가 체결 (`fill_at_close`) -------------------------------------
+#
+# 15:20 종가 동시호가로 집행하는 모드다. 기본(시가 체결)과 **같은 주문이 다른
+# 봉·다른 가격에 체결**되므로, 여기서 고정하는 것은 "어느 봉인가"와 "어느
+# 가격인가" 둘이다.
+
+CLOSE_FILL = SimBrokerConfig(
+    commission_rate=0.0, tax_rate=0.0, slippage_bps=0.0, fill_at_close=True
+)
+
+
+def test_close_fill_uses_the_signal_bar_itself():
+    """다음 봉이 아니라 **주문이 난 그 봉**의 종가에 체결한다."""
+    bars = {
+        SYMBOL: [
+            make_bar(SYMBOL, 0, open=900, close=1_000),
+            make_bar(SYMBOL, 1, open=1_500, close=1_600),
+        ]
+    }
+    broker = SimBroker(bars=bars, initial_cash=1_000_000, config=CLOSE_FILL)
+
+    (result,) = broker.submit([make_order(SYMBOL, Side.BUY, 10, DAY0)], now=DAY0)
+
+    assert result.status is OrderStatus.FILLED
+    (fill,) = result.fills
+    assert fill.ts == DAY0  # 다음 봉(DAY0+1)이 아니다
+    assert fill.price == 1_000  # 그 봉의 시가 900도, 다음 봉 시가 1,500도 아니다
+
+
+def test_close_fill_keeps_slippage_on_the_unfavorable_side():
+    """슬리피지 기준가만 시가→종가로 바뀐다. 방향은 그대로 불리한 쪽이다."""
+    bars = {SYMBOL: [make_bar(SYMBOL, 0, open=900, close=1_000)]}
+    config = SimBrokerConfig(
+        commission_rate=0.0, tax_rate=0.0, slippage_bps=100.0, fill_at_close=True
+    )
+    broker = SimBroker(bars=bars, initial_cash=1_000_000, config=config)
+
+    (bought,) = broker.submit([make_order(SYMBOL, Side.BUY, 10, DAY0)], now=DAY0)
+    (sold,) = broker.submit([make_order(SYMBOL, Side.SELL, 10, DAY0)], now=DAY0)
+
+    assert bought.fills[0].price == 1_010  # 종가 × 1.01
+    assert sold.fills[0].price == 990  # 종가 × 0.99
+
+
+def test_close_fill_skips_halted_bars_like_the_open_path():
+    """거래정지 봉(거래량 0)에는 체결하지 않는다 — 시가 경로와 같은 규칙이다."""
+    bars = {
+        SYMBOL: [
+            halted_bar(SYMBOL, 0, close=1_000),
+            make_bar(SYMBOL, 1, open=1_100, close=1_200),
+        ]
+    }
+    broker = SimBroker(bars=bars, initial_cash=1_000_000, config=CLOSE_FILL)
+
+    (result,) = broker.submit([make_order(SYMBOL, Side.BUY, 10, DAY0)], now=DAY0)
+
+    assert result.fills[0].price == 1_200  # 재개 봉의 종가
+
+
+def test_open_fill_remains_the_default():
+    """기본값을 바꾸지 않는다 — 종목 전략·기준선이 시가 체결로 잰 값이다."""
+    assert SimBrokerConfig().fill_at_close is False
